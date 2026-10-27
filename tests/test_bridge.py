@@ -201,14 +201,26 @@ class TestQQAdapterLogic(unittest.TestCase):
         self.assertTrue(adapter.is_allowed("GROUP_AT_MESSAGE_CREATE", {"group_openid": "GRP_RESTRICTED", "author": {"user_openid": "MEMBER_1"}}))
         self.assertFalse(adapter.is_allowed("GROUP_AT_MESSAGE_CREATE", {"group_openid": "GRP_RESTRICTED", "author": {"user_openid": "MEMBER_2"}}))
 
-    def test_chat_key_grouping(self):
-        adapter = QQAdapter(
-            config=QQConfig(app_id="123", app_secret="sec"),
-            muse_service=mock.Mock(),
-            deduplicator=mock.Mock(),
-        )
-        self.assertEqual(adapter.chat_key("C2C_MESSAGE_CREATE", {"author": {"user_openid": "U1"}}), ("private", "U1"))
-        self.assertEqual(adapter.chat_key("GROUP_AT_MESSAGE_CREATE", {"group_openid": "G1", "author": {"user_openid": "U1"}}), ("group", "G1"))
+
+class TestRouteManager(unittest.TestCase):
+    def test_register_and_lookup(self):
+        from muse_bridge.adapters.qq.route_manager import RouteManager
+        rm = RouteManager(ttl_s=100)
+        route = rm.register("mid_123", "group", "GRP_1", "msg_qq_1")
+        self.assertEqual(route.user_mid, "mid_123")
+        found = rm.get("mid_123")
+        self.assertIsNotNone(found)
+        self.assertEqual(found.target_type, "group")
+        self.assertEqual(found.target_id, "GRP_1")
+        self.assertEqual(found.msg_id, "msg_qq_1")
+
+    def test_latest_active_route(self):
+        from muse_bridge.adapters.qq.route_manager import RouteManager
+        rm = RouteManager()
+        rm.register("mid_1", "private", "USER_1")
+        latest = rm.get_latest_active(max_age_s=10.0)
+        self.assertIsNotNone(latest)
+        self.assertEqual(latest.user_mid, "mid_1")
 
 
 class TestOneBotClient(unittest.TestCase):

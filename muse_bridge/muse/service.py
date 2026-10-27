@@ -114,6 +114,29 @@ class MuseService:
 
         return inline_images, inline_files, file_refs, appended_text
 
+    def post_message(
+        self,
+        session_id: str,
+        text: str,
+        attachments: Optional[List[Attachment]] = None,
+        threshold_bytes: int = 2 * 1024 * 1024,
+    ) -> str:
+        """Post a user message to Muse and return the message_id immediately without waiting."""
+        with self.create_client() as client:
+            client.connect()
+            atts = attachments or []
+            inline_images, inline_files, file_refs, processed_text = self.process_attachments(
+                client, atts, text, threshold_bytes
+            )
+            sent_mid = client.send_message(
+                session_id=session_id,
+                text=processed_text,
+                images=inline_images or None,
+                files=inline_files or None,
+                file_refs=file_refs or None,
+            )
+            return sent_mid
+
     def send_turn(
         self,
         session_id: str,
