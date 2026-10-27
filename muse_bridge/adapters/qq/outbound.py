@@ -1,10 +1,12 @@
-"""QQ proactive push subsystem.
+"""Unified QQ Outbound message dispatcher.
 
-Subscribes to Muse live event streams, detects assistant messages
-generated from web UI or external turns, and proactively pushes
-them to the configured QQ target (defaults to the first whitelisted private chat).
-
-Fully unified within QQAdapter, sharing the same QQClient and Deduplicator.
+The SOLE exit point for all outbound messages from Muse to QQ.
+Unifies both interactive conversational replies and proactive notifications:
+1. Listens for completed assistant events from the Muse event stream.
+2. Checks RouteManager using the preceding user message ID to determine destination.
+   - If triggered by a QQ user message -> replies to the matching group/private chat.
+   - If unsolicited (e.g. reminder, timer, web turn) -> pushes to the default target.
+3. Completely decouples message sending from generation, eliminating chat blocking.
 """
 
 from __future__ import annotations
@@ -21,6 +23,7 @@ from ...core.deduplicator import MessageDeduplicator
 from ...core.message import chunk_text
 from ...muse.service import MuseService
 from .client import QQClient
+from .route_manager import RouteInfo, RouteManager
 
 _SANDBOX_IMG_RE = re.compile(r"!\[([^\]]*)\]\(sandbox://[^)]+\)")
 
@@ -42,25 +45,24 @@ def _extract_images_from_payload(payload: dict) -> List[dict]:
     return out
 
 
-class QQPushService:
+class QQOutboundPusher:
     def __init__(
         self,
         config: QQConfig,
         client: QQClient,
         muse_service: MuseService,
         deduplicator: MessageDeduplicator,
+        route_manager: RouteManager,
         session_id: str,
-        adapter: Optional[Any] = None,
     ):
         self.config = config
         self.client = client
         self.muse_service = muse_service
         self.deduplicator = deduplicator
+        self.route_manager = route_manager
         self.session_id = session_id
-        self.adapter = adapter
 
         self._running = False
-        self._target_type, self._target_id = self.config.resolve_push_target()
         self._seen_ids: Set[str] = set()
         self._last_seq: int = 0
         self._load_state()
@@ -98,31 +100,26 @@ class QQPushService:
                     pass
 
     async def start(self) -> None:
-        if not self.config.push.enabled:
-            return
-        if not self._target_id:
-            print("[QQPush] Warning: No push target found (no private whitelist or target_id). Push disabled.")
-            return
-
         self._running = True
-        print(f"[QQPush] Started proactive push service -> {self._target_type}:{self._target_id}")
+        default_type, default_id = self.config.resolve_push_target()
+        print(f"[QQOutbound] Started unified outbound dispatcher (Default push target: {default_type}:{default_id})")
 
         while self._running:
             try:
-                await self._run_subscriber_loop()
+                await self._run_loop()
             except asyncio.CancelledError:
                 break
             except Exception as e:
                 if not self._running:
                     break
                 if self.config.debug:
-                    print(f"[QQPush] Subscription error: {e}, reconnecting in 5s...")
+                    print(f"[QQOutbound] Stream error: {e}, reconnecting in 5s...")
                 await asyncio.sleep(self.config.push.reconnect_sleep_s)
 
     async def stop(self) -> None:
         self._running = False
 
-    async def _run_subscriber_loop(self) -> None:
+    async def _run_loop(self) -> None:
         loop = asyncio.get_running_loop()
 
         def _connect_and_subscribe():
@@ -145,9 +142,8 @@ class QQPushService:
                         self._last_seq = seq
                 self._save_state()
 
-            last_periodic = time.monotonic()
+            last_scan = time.monotonic()
             while self._running:
-                # Read chunks from push subscription
                 events = []
                 try:
                     events = await loop.run_in_executor(None, sub.read_events, 2.0)
@@ -155,23 +151,18 @@ class QQPushService:
                     pass
 
                 now = time.monotonic()
-                if events or (now - last_periodic >= 5.0):
-                    last_periodic = now
-                    await self._scan_and_push(client)
+                if events or (now - last_scan >= 3.0):
+                    last_scan = now
+                    await self._scan_and_dispatch(client)
 
-                await asyncio.sleep(0.5)
+                await asyncio.sleep(0.3)
         finally:
             try:
                 client.close()
             except Exception:
                 pass
 
-    async def _scan_and_push(self, client: Any) -> None:
-        if self.adapter and getattr(self.adapter, "is_turn_busy", False):
-            if self.config.debug:
-                print("[QQPush] Adapter is executing an interactive turn; pausing push scan.")
-            return
-
+    async def _scan_and_dispatch(self, client: Any) -> None:
         loop = asyncio.get_running_loop()
         hist = await loop.run_in_executor(None, client.get_history, self.session_id, 20)
         if not hist:
@@ -185,7 +176,6 @@ class QQPushService:
             mid = event.get("message_id")
             seq = event.get("seq", 0)
 
-            # Track user message
             if role == "user":
                 last_user_mid = mid
                 if mid:
@@ -200,95 +190,123 @@ class QQPushService:
             if not mid or mid in self._seen_ids:
                 continue
 
-            # Assistant message: check deduplicator
             if self.deduplicator.is_delivered(mid) or self.deduplicator.is_processing(mid):
-                if self.config.debug:
-                    print(f"[QQPush] Skip {mid}: already delivered or processing")
                 self._seen_ids.add(mid)
                 continue
 
-            # In-flight defer: if this assistant message follows an in-flight user turn, skip it!
-            if last_user_mid and self.deduplicator.is_in_flight(last_user_mid):
-                if self.config.debug:
-                    print(f"[QQPush] Deferring {mid}: follows in-flight user message {last_user_mid}")
-                continue
-
-            # Superseded: if the user message was cancelled by a newer message, skip it!
-            if last_user_mid and self.deduplicator.is_superseded(last_user_mid):
-                if self.config.debug:
-                    print(f"[QQPush] Skip {mid}: follows superseded user message {last_user_mid}")
-                self._seen_ids.add(mid)
-                continue
-
-            # Only push messages that are fully completed!
+            # Only dispatch completed assistant messages (never partial/streaming!)
             payload = event.get("payload") or {}
             status = payload.get("status") or event.get("status")
-            if status is not None and status != "completed":
+            if status != "completed":
                 if self.config.debug:
-                    print(f"[QQPush] Skip {mid}: status is '{status}', not completed yet")
+                    print(f"[QQOutbound] Skip {mid}: generation in progress (status={status})")
                 continue
 
-            # Check if text is ready
             if not event.get("display_text_ready", True):
-                if self.config.debug:
-                    print(f"[QQPush] Skip {mid}: display_text_ready is False")
                 continue
 
             raw_text = event.get("display_text") or ""
             clean_text = _clean_sandbox_images(raw_text)
-
-            # Check attachments
             images = _extract_images_from_payload(payload)
 
             if not clean_text and not images:
+                continue
+
+            # Route resolution: "回给谁？"
+            route = self.route_manager.get(last_user_mid)
+            if route:
+                target_type = route.target_type
+                target_id = route.target_id
+                reply_msg_id = route.msg_id
+                route_type = "interactive_reply"
+            else:
+                # Check recent active conversation in past 60s
+                latest = self.route_manager.get_latest_active(max_age_s=60.0)
+                if latest:
+                    target_type = latest.target_type
+                    target_id = latest.target_id
+                    reply_msg_id = latest.msg_id
+                    route_type = "active_followup"
+                else:
+                    # Default proactive push target
+                    target_type, target_id = self.config.resolve_push_target()
+                    reply_msg_id = None
+                    route_type = "proactive_push"
+
+            if not target_id:
+                if self.config.debug:
+                    print(f"[QQOutbound] No target found for message {mid}, skipping.")
                 continue
 
             # Mark processing
             self.deduplicator.mark_processing([mid])
 
             try:
-                success = await self._push_to_qq(clean_text, images)
+                success = await self._send_to_qq(target_type, target_id, clean_text, images, msg_id=reply_msg_id)
                 if success:
                     self.deduplicator.mark_delivered([mid])
                     self._seen_ids.add(mid)
                     if seq > self._last_seq:
                         self._last_seq = seq
                     self._save_state()
-                    print(f"[QQPush] Proactively pushed message {mid} to {self._target_type}:{self._target_id}")
+                    print(f"[QQOutbound] Dispatched {mid} -> {target_type}:{target_id} [{route_type}]")
                 else:
                     self.deduplicator.rollback_processing([mid])
             except Exception as e:
                 self.deduplicator.rollback_processing([mid])
-                print(f"[QQPush] Push failed for {mid}: {e}")
+                print(f"[QQOutbound] Dispatch error for {mid}: {e}")
 
-    async def _push_to_qq(self, text: str, images: List[dict]) -> bool:
-        target_type, target_id = self.config.resolve_push_target()
-        if not target_id:
-            if self.config.debug:
-                print("[QQPush] No valid push target resolved.")
-            return False
-        return await self._push_to_target(target_type, target_id, text, images)
-
-    async def _push_to_target(self, target_type: str, target_id: str, text: str, images: List[dict]) -> bool:
+    async def _send_to_qq(
+        self,
+        target_type: str,
+        target_id: str,
+        text: str,
+        images: List[dict],
+        msg_id: Optional[str] = None,
+    ) -> bool:
         loop = asyncio.get_running_loop()
         chunks = chunk_text(text, self.config.chunk_chars, self.config.max_chunks) if text else []
+        passive_limit = 4 if target_type == "private" else 5
+        active_budget = self.config.max_active_chunks
+        seq = 1
 
-        # 1. Push text chunks
+        # 1. Send text chunks
         for chunk in chunks:
+            use_passive = bool(msg_id and seq <= passive_limit)
+            curr_msg_id = msg_id if use_passive else None
+            curr_seq = seq if use_passive else None
+
+            if not use_passive:
+                if active_budget <= 0:
+                    break
+                active_budget -= 1
+
             code, body = await loop.run_in_executor(
                 None,
                 self.client.send_message,
                 target_type,
                 target_id,
                 chunk,
-                chunk,  # markdown_content
+                chunk,  # markdown content
+                None,   # media file info
+                curr_msg_id,
+                curr_seq,
             )
-            if not (200 <= code < 300):
-                if self.config.debug:
-                    print(f"[QQPush] Failed sending text to {target_type}:{target_id} ({code}): {body}")
-                return False
 
-        # 2. Push images
+            # Retry as active if passive rejected
+            if use_passive and not (200 <= code < 300) and active_budget > 0:
+                active_budget -= 1
+                await loop.run_in_executor(
+                    None,
+                    self.client.send_message,
+                    target_type,
+                    target_id,
+                    chunk,
+                    chunk,
+                )
+            seq += 1
+
+        # 2. Send images
         for img in images:
             url = img.get("url")
             if not url:
@@ -306,10 +324,19 @@ class QQPushService:
                     target_type,
                     target_id,
                     data,
-                    1,  # image
+                    1,
                     img.get("filename") or "image.jpg",
                 )
-                code, body = await loop.run_in_executor(
+                use_passive = bool(msg_id and seq <= passive_limit)
+                curr_msg_id = msg_id if use_passive else None
+                curr_seq = seq if use_passive else None
+
+                if not use_passive:
+                    if active_budget <= 0:
+                        break
+                    active_budget -= 1
+
+                await loop.run_in_executor(
                     None,
                     self.client.send_message,
                     target_type,
@@ -317,12 +344,11 @@ class QQPushService:
                     None,
                     None,
                     file_info,
+                    curr_msg_id,
+                    curr_seq,
                 )
-                if not (200 <= code < 300):
-                    if self.config.debug:
-                        print(f"[QQPush] Failed sending media to {target_type}:{target_id} ({code}): {body}")
-                    return False
+                seq += 1
             except Exception as e:
-                print(f"[QQPush] Failed to push image {url}: {e}")
+                print(f"[QQOutbound] Failed to send image: {e}")
 
         return True
