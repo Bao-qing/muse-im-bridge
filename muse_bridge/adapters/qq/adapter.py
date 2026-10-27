@@ -61,6 +61,8 @@ class QQAdapter(BaseAdapter):
             debug=self.config.debug,
         )
 
+        self.is_turn_busy = False
+
         # Proactive push subsystem
         self.push_service = QQPushService(
             config=self.config,
@@ -68,6 +70,7 @@ class QQAdapter(BaseAdapter):
             muse_service=self.muse_service,
             deduplicator=self.deduplicator,
             session_id=self.active_session_id,
+            adapter=self,
         )
 
         self._send_locks: Dict[Tuple[str, str], asyncio.Lock] = {}
@@ -229,6 +232,7 @@ class QQAdapter(BaseAdapter):
         lock = self._send_locks.setdefault(key, asyncio.Lock())
         await lock.acquire()
 
+        self.is_turn_busy = True
         cancel_event = asyncio.Event()
         waits = self._pending_waits.setdefault(key, set())
         for old_w in list(waits):
@@ -252,15 +256,29 @@ class QQAdapter(BaseAdapter):
                     except Exception as e:
                         content += f"\n[{att.type}下载失败：{e}]"
 
+            sent_user_mid: Optional[str] = None
+
+            def _on_sent(mid: str):
+                nonlocal sent_user_mid
+                sent_user_mid = mid
+                self.deduplicator.mark_in_flight(mid)
+                if self.config.debug:
+                    print(f"[QQAdapter] User message sent to Muse, marked in-flight: {mid}")
+
+            import functools
+
             # Execute turn on Muse
             turn_result = await loop.run_in_executor(
                 None,
-                self.muse_service.send_turn,
-                self.active_session_id,
-                content,
-                attachments,
-                cancel_event.is_set,
-                self.config.file_ref_threshold_bytes,
+                functools.partial(
+                    self.muse_service.send_turn,
+                    self.active_session_id,
+                    content,
+                    attachments,
+                    cancel_event.is_set,
+                    self.config.file_ref_threshold_bytes,
+                    on_sent=_on_sent,
+                ),
             )
         except Exception as e:
             if cancel_event.is_set():
@@ -268,6 +286,7 @@ class QQAdapter(BaseAdapter):
             await self._send_reply(target_type, target_id, f"转接出错了：{e}", [], msg_id=msg_id)
             return
         finally:
+            self.is_turn_busy = False
             waits.discard(cancel_event)
             lock.release()
 
@@ -277,7 +296,9 @@ class QQAdapter(BaseAdapter):
         # Mark turn messages as delivered so push service will not duplicate
         mids = [m.message_id for m in turn_result.messages if m.message_id]
         if mids:
-            self.deduplicator.mark_processing(mids)
+            self.deduplicator.mark_delivered(mids)
+        if sent_user_mid:
+            self.deduplicator.clear_in_flight(sent_user_mid)
 
         try:
             # Send Muse reply back to QQ

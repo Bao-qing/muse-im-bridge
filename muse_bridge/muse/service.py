@@ -121,6 +121,7 @@ class MuseService:
         attachments: Optional[List[Attachment]] = None,
         should_cancel: Optional[Callable[[], bool]] = None,
         threshold_bytes: int = 2 * 1024 * 1024,
+        on_sent: Optional[Callable[[str], None]] = None,
     ) -> TurnResult:
         """Send a turn to Muse, wait for reply, and mark seen."""
         with self.create_client() as client:
@@ -138,6 +139,12 @@ class MuseService:
                 files=inline_files or None,
                 file_refs=file_refs or None,
             )
+
+            if on_sent and sent_mid:
+                try:
+                    on_sent(sent_mid)
+                except Exception:
+                    pass
 
             if should_cancel and should_cancel():
                 raise TurnCancelled("turn cancelled before wait")

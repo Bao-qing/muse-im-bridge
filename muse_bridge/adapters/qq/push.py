@@ -50,12 +50,14 @@ class QQPushService:
         muse_service: MuseService,
         deduplicator: MessageDeduplicator,
         session_id: str,
+        adapter: Optional[Any] = None,
     ):
         self.config = config
         self.client = client
         self.muse_service = muse_service
         self.deduplicator = deduplicator
         self.session_id = session_id
+        self.adapter = adapter
 
         self._running = False
         self._target_type, self._target_id = self.config.resolve_push_target()
@@ -165,22 +167,29 @@ class QQPushService:
                 pass
 
     async def _scan_and_push(self, client: Any) -> None:
+        if self.adapter and getattr(self.adapter, "is_turn_busy", False):
+            if self.config.debug:
+                print("[QQPush] Adapter is executing an interactive turn; pausing push scan.")
+            return
+
         loop = asyncio.get_running_loop()
         hist = await loop.run_in_executor(None, client.get_history, self.session_id, 20)
         if not hist:
             return
 
-        for event in hist:
+        ordered = sorted(hist, key=lambda e: e.get("seq") or 0)
+        last_user_mid: Optional[str] = None
+
+        for event in ordered:
             role = event.get("role")
             mid = event.get("message_id")
             seq = event.get("seq", 0)
 
-            if not mid or mid in self._seen_ids:
-                continue
-
-            # Skip user messages, but update seq
+            # Track user message
             if role == "user":
-                self._seen_ids.add(mid)
+                last_user_mid = mid
+                if mid:
+                    self._seen_ids.add(mid)
                 if seq > self._last_seq:
                     self._last_seq = seq
                 continue
@@ -188,21 +197,51 @@ class QQPushService:
             if role != "assistant":
                 continue
 
+            if not mid or mid in self._seen_ids:
+                continue
+
             # Assistant message: check deduplicator
             if self.deduplicator.is_delivered(mid) or self.deduplicator.is_processing(mid):
+                if self.config.debug:
+                    print(f"[QQPush] Skip {mid}: already delivered or processing")
                 self._seen_ids.add(mid)
+                continue
+
+            # In-flight defer: if this assistant message follows an in-flight user turn, skip it!
+            if last_user_mid and self.deduplicator.is_in_flight(last_user_mid):
+                if self.config.debug:
+                    print(f"[QQPush] Deferring {mid}: follows in-flight user message {last_user_mid}")
+                continue
+
+            # Superseded: if the user message was cancelled by a newer message, skip it!
+            if last_user_mid and self.deduplicator.is_superseded(last_user_mid):
+                if self.config.debug:
+                    print(f"[QQPush] Skip {mid}: follows superseded user message {last_user_mid}")
+                self._seen_ids.add(mid)
+                continue
+
+            # Only push messages that are fully completed!
+            payload = event.get("payload") or {}
+            status = payload.get("status") or event.get("status")
+            if status is not None and status != "completed":
+                if self.config.debug:
+                    print(f"[QQPush] Skip {mid}: status is '{status}', not completed yet")
                 continue
 
             # Check if text is ready
             if not event.get("display_text_ready", True):
+                if self.config.debug:
+                    print(f"[QQPush] Skip {mid}: display_text_ready is False")
                 continue
 
             raw_text = event.get("display_text") or ""
             clean_text = _clean_sandbox_images(raw_text)
 
             # Check attachments
-            payload = event.get("payload") or {}
             images = _extract_images_from_payload(payload)
+
+            if not clean_text and not images:
+                continue
 
             # Mark processing
             self.deduplicator.mark_processing([mid])
@@ -223,17 +262,12 @@ class QQPushService:
                 print(f"[QQPush] Push failed for {mid}: {e}")
 
     async def _push_to_qq(self, text: str, images: List[dict]) -> bool:
-        candidates = self.config.get_candidate_push_targets()
-        if not candidates:
+        target_type, target_id = self.config.resolve_push_target()
+        if not target_id:
+            if self.config.debug:
+                print("[QQPush] No valid push target resolved.")
             return False
-
-        for t_type, t_id in candidates:
-            success = await self._push_to_target(t_type, t_id, text, images)
-            if success:
-                self._target_type = t_type
-                self._target_id = t_id
-                return True
-        return False
+        return await self._push_to_target(target_type, target_id, text, images)
 
     async def _push_to_target(self, target_type: str, target_id: str, text: str, images: List[dict]) -> bool:
         loop = asyncio.get_running_loop()

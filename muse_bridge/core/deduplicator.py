@@ -159,6 +159,10 @@ class MessageDeduplicator:
         self._in_flight_user_ids[uid] = time.time()
         self._append_record({"in_flight_user_id": uid})
 
+    def clear_in_flight(self, uid: str) -> None:
+        if uid in self._in_flight_user_ids:
+            self._in_flight_user_ids.pop(uid, None)
+
     def mark_superseded(self, uid: str) -> None:
         if not uid:
             return
