@@ -194,8 +194,16 @@ class QQOutboundPusher:
                 self._seen_ids.add(mid)
                 continue
 
-            # Only dispatch completed assistant messages (never partial/streaming!)
+            # Assistant message
             payload = event.get("payload") or {}
+            event_name = event.get("event_name")
+
+            # Ignore web UI widget cards (e.g. HTML timer cards) that have no image/file media
+            if event_name == "delta.presentation" and not payload.get("data", {}).get("image_path"):
+                self._seen_ids.add(mid)
+                continue
+
+            # Only dispatch completed assistant messages (never partial/streaming!)
             status = payload.get("status") or event.get("status")
             if status != "completed":
                 if self.config.debug:
