@@ -18,6 +18,7 @@ cookies.json
 qq_delivered.jsonl*
 qq_push_state.json*
 qq_session.json*
+qq_routes.json*
 .data/
 
 # Python artifacts

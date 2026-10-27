@@ -26,10 +26,13 @@ from .client import QQClient
 from .route_manager import RouteInfo, RouteManager
 
 _SANDBOX_IMG_RE = re.compile(r"!\[([^\]]*)\]\(sandbox://[^)]+\)")
+_WIDGET_RE = re.compile(r"\[\[hatch_widget:[^\]]+\]\]")
 
 
-def _clean_sandbox_images(text: str) -> str:
-    return _SANDBOX_IMG_RE.sub(r"[图片：\1]" if r"\1" else "[图片]", text)
+def _clean_text(text: str) -> str:
+    cleaned = _SANDBOX_IMG_RE.sub(r"[图片：\1]" if r"\1" else "[图片]", text)
+    cleaned = _WIDGET_RE.sub("", cleaned)
+    return cleaned.strip()
 
 
 def _extract_images_from_payload(payload: dict) -> List[dict]:
@@ -113,8 +116,8 @@ class QQOutboundPusher:
                 if not self._running:
                     break
                 if self.config.debug:
-                    print(f"[QQOutbound] Stream error: {e}, reconnecting in 5s...")
-                await asyncio.sleep(self.config.push.reconnect_sleep_s)
+                    print(f"[QQOutbound] Polling error: {e}, retrying in 3s...")
+                await asyncio.sleep(3.0)
 
     async def stop(self) -> None:
         self._running = False
@@ -122,52 +125,35 @@ class QQOutboundPusher:
     async def _run_loop(self) -> None:
         loop = asyncio.get_running_loop()
 
-        def _connect_and_subscribe():
-            client = self.muse_service.create_client()
-            client.connect()
-            sub = client.subscribe(self.session_id, timeout=self.config.push.recheck_sleep_s)
-            return client, sub
-
-        client, sub = await loop.run_in_executor(None, _connect_and_subscribe)
-        try:
-            # Baseline existing history on startup if last_seq is 0
-            if self._last_seq == 0:
-                hist = await loop.run_in_executor(None, client.get_history, self.session_id, 40)
-                for item in hist:
-                    mid = item.get("message_id")
-                    if mid:
-                        self._seen_ids.add(mid)
-                    seq = item.get("seq", 0)
-                    if seq > self._last_seq:
-                        self._last_seq = seq
-                self._save_state()
-
-            last_scan = time.monotonic()
-            while self._running:
-                events = []
-                try:
-                    events = await loop.run_in_executor(None, sub.read_events, 2.0)
-                except Exception:
-                    pass
-
-                now = time.monotonic()
-                if events or (now - last_scan >= 3.0):
-                    last_scan = now
-                    await self._scan_and_dispatch(client)
-
-                await asyncio.sleep(0.3)
-        finally:
+        while self._running:
             try:
-                client.close()
-            except Exception:
-                pass
+                def _fetch():
+                    with self.muse_service.create_client() as client:
+                        client.connect()
+                        return client.get_history(self.session_id, 25)
 
-    async def _scan_and_dispatch(self, client: Any) -> None:
-        loop = asyncio.get_running_loop()
-        hist = await loop.run_in_executor(None, client.get_history, self.session_id, 20)
-        if not hist:
-            return
+                hist = await loop.run_in_executor(None, _fetch)
+                if hist:
+                    # Baseline on initial run if last_seq is 0
+                    if self._last_seq == 0:
+                        for item in hist:
+                            mid = item.get("message_id")
+                            if mid:
+                                self._seen_ids.add(mid)
+                            seq = item.get("seq", 0)
+                            if seq > self._last_seq:
+                                self._last_seq = seq
+                        self._save_state()
+                    else:
+                        await self._scan_and_dispatch(hist)
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                if self.config.debug:
+                    print(f"[QQOutbound] Scan tick error: {e}")
+            await asyncio.sleep(1.0)
 
+    async def _scan_and_dispatch(self, hist: List[dict]) -> None:
         ordered = sorted(hist, key=lambda e: e.get("seq") or 0)
         last_user_mid: Optional[str] = None
 
@@ -214,7 +200,7 @@ class QQOutboundPusher:
                 continue
 
             raw_text = event.get("display_text") or ""
-            clean_text = _clean_sandbox_images(raw_text)
+            clean_text = _clean_text(raw_text)
             images = _extract_images_from_payload(payload)
 
             if not clean_text and not images:
