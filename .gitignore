@@ -41,3 +41,4 @@ ENV/
 .DS_Store
 Thumbs.db
 *.tmp
+uv.lock
