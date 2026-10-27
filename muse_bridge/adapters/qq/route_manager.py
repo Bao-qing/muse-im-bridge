@@ -1,8 +1,9 @@
 """Route manager for asynchronous user message routing.
 
 Maps Muse user message IDs to QQ outbound destinations (group/private and msg_id).
-Allows Inbound router to post messages without waiting, and Outbound pusher to
-accurately route assistant replies back to the originator.
+When an assistant message replies to a user message, the route is consumed (popped),
+ensuring subsequent proactive events (like delayed reminders) strictly route to
+the configured proactive push target (e.g. private chat) rather than hijacking the group.
 """
 
 from __future__ import annotations
@@ -25,7 +26,6 @@ class RouteManager:
     def __init__(self, ttl_s: float = 600.0):
         self.ttl_s = ttl_s
         self._routes: Dict[str, RouteInfo] = {}  # user_mid -> RouteInfo
-        self._latest_route: Optional[RouteInfo] = None
 
     def register(
         self,
@@ -44,7 +44,6 @@ class RouteManager:
         )
         if user_mid:
             self._routes[user_mid] = route
-        self._latest_route = route
         return route
 
     def get(self, user_mid: Optional[str]) -> Optional[RouteInfo]:
@@ -52,12 +51,11 @@ class RouteManager:
             return None
         return self._routes.get(user_mid)
 
-    def get_latest_active(self, max_age_s: float = 120.0) -> Optional[RouteInfo]:
-        if not self._latest_route:
+    def pop(self, user_mid: Optional[str]) -> Optional[RouteInfo]:
+        """Consume and remove the route for user_mid upon dispatching reply."""
+        if not user_mid:
             return None
-        if time.time() - self._latest_route.timestamp > max_age_s:
-            return None
-        return self._latest_route
+        return self._routes.pop(user_mid, None)
 
     def cleanup(self) -> None:
         now = time.time()

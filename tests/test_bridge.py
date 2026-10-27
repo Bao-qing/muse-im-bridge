@@ -203,7 +203,7 @@ class TestQQAdapterLogic(unittest.TestCase):
 
 
 class TestRouteManager(unittest.TestCase):
-    def test_register_and_lookup(self):
+    def test_register_and_lookup_and_pop(self):
         from muse_bridge.adapters.qq.route_manager import RouteManager
         rm = RouteManager(ttl_s=100)
         route = rm.register("mid_123", "group", "GRP_1", "msg_qq_1")
@@ -214,13 +214,11 @@ class TestRouteManager(unittest.TestCase):
         self.assertEqual(found.target_id, "GRP_1")
         self.assertEqual(found.msg_id, "msg_qq_1")
 
-    def test_latest_active_route(self):
-        from muse_bridge.adapters.qq.route_manager import RouteManager
-        rm = RouteManager()
-        rm.register("mid_1", "private", "USER_1")
-        latest = rm.get_latest_active(max_age_s=10.0)
-        self.assertIsNotNone(latest)
-        self.assertEqual(latest.user_mid, "mid_1")
+        # Test pop consumes the route
+        popped = rm.pop("mid_123")
+        self.assertEqual(popped.user_mid, "mid_123")
+        self.assertIsNone(rm.get("mid_123"))
+        self.assertIsNone(rm.pop("mid_123"))
 
 
 class TestOneBotClient(unittest.TestCase):
