@@ -221,25 +221,17 @@ class QQOutboundPusher:
                 continue
 
             # Route resolution: "回给谁？"
-            route = self.route_manager.get(last_user_mid)
+            route = self.route_manager.pop(last_user_mid)
             if route:
                 target_type = route.target_type
                 target_id = route.target_id
                 reply_msg_id = route.msg_id
                 route_type = "interactive_reply"
             else:
-                # Check recent active conversation in past 60s
-                latest = self.route_manager.get_latest_active(max_age_s=60.0)
-                if latest:
-                    target_type = latest.target_type
-                    target_id = latest.target_id
-                    reply_msg_id = latest.msg_id
-                    route_type = "active_followup"
-                else:
-                    # Default proactive push target
-                    target_type, target_id = self.config.resolve_push_target()
-                    reply_msg_id = None
-                    route_type = "proactive_push"
+                # Proactive push: strictly to configured push target (private chat)
+                target_type, target_id = self.config.resolve_push_target()
+                reply_msg_id = None
+                route_type = "proactive_push"
 
             if not target_id:
                 if self.config.debug:
