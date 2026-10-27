@@ -1,7 +1,0 @@
-{
-  "muse": {
-    "client_ip": "YOUR_EGRESS_IP",
-    "host": "hatch.metaaivm.com",
-    "timezone": "Asia/Shanghai"
-  }
-}

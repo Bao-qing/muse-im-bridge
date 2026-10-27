@@ -11,8 +11,8 @@ import base64
 import time
 from typing import Any, Callable, Dict, List, Optional
 
-from muse_client import MuseClient, TurnResult
-from muse_client.errors import HandshakeError, TurnCancelled
+from .client import MuseClient, TurnResult
+from .client.errors import HandshakeError, TurnCancelled
 
 from ..config.models import MuseConfig
 from ..core.message import Attachment

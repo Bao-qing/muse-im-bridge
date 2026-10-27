@@ -19,6 +19,7 @@ muse_bridge/
 │   │   ├── deduplicator.py   # 3状态消息去重器（防重防漏、支持故障回退）
 │   │   └── commands.py       # 通用斜杠指令层（/sessions, /switch, /new 等）
 │   ├── muse/                 # Muse 独立业务服务层
+│   │   ├── client/           # 底层 Noise_XX 加密协议与 WebSocket 传输客户端
 │   │   ├── token_manager.py  # 自动凭证推导与静默续期（cookies -> vm_id -> mint）
 │   │   └── service.py        # 会话交互、附件处理、工作区文件读写、主动事件流订阅
 │   ├── adapters/             # 适配器体系
@@ -34,7 +35,8 @@ muse_bridge/
 │   │       ├── client.py     # NapCat HTTP API 客户端（标准 Array 消息段结构）
 │   │       └── gateway.py    # NapCat WebSocket 实时事件监听
 │   └── engine.py             # BridgeEngine 协调调度引擎
-├── muse_client/              # 底层 Noise 加密与 WebSocket 传输库
+├── tools/
+│   └── export_cookies.js     # 网页端 Cookie 一键导出辅助工具
 └── tests/
     └── test_bridge.py        # 全新架构单元测试集
 ```
