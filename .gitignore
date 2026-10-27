@@ -1,0 +1,43 @@
+# Credentials & sensitive configurations (NEVER commit these)
+config.json
+credentials.json
+const.json
+cookies.json
+.mint.json
+*.bak*
+
+# Environment & local settings
+.env
+.env.*
+*.local.json
+
+# Runtime logs & state files
+*.log
+*.jsonl
+*.jsonl.tmp
+qq_delivered.jsonl*
+qq_push_state.json*
+qq_session.json*
+.data/
+
+# Python artifacts
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Virtual environments
+.venv/
+env/
+venv/
+ENV/
+
+# IDE & OS files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+*.tmp

@@ -1,0 +1,41 @@
+{
+  "muse": {
+    "cookies_file": "cookies.json",
+    "session_id": "YOUR_MUSE_SESSION_ID",
+    "reply_mode": "push"
+  },
+  "adapters": {
+    "qq": {
+      "enabled": true,
+      "app_id": "YOUR_QQ_APP_ID",
+      "app_secret": "YOUR_QQ_APP_SECRET",
+      "whitelist": {
+        "private": [
+          "YOUR_C2C_OPENID"
+        ],
+        "YOUR_GROUP_OPENID": "*"
+      },
+      "push": {
+        "enabled": true,
+        "target_type": "private",
+        "target_id": null
+      }
+    },
+    "onebot": {
+      "enabled": false,
+      "base_url": "https://onebot.example.com:81",
+      "access_token": "YOUR_ONEBOT_TOKEN",
+      "ws_url": "wss://onebot.example.com:81",
+      "target_group_id": 300000002,
+      "whitelist": {
+        "private": [],
+        "groups": [300000002]
+      }
+    }
+  },
+  "overrides": {
+    "chunk_chars": 1200,
+    "max_chunks": 8,
+    "max_active_chunks": 2
+  }
+}
