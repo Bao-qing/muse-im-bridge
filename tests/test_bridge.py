@@ -298,6 +298,30 @@ class TestRouteManager(unittest.TestCase):
         self.assertIsNone(rm.get("mid_123"))
         self.assertIsNone(rm.pop("mid_123"))
 
+    def test_match_route_multi_part_turn(self):
+        from muse_bridge.adapters.qq.route_manager import RouteManager
+        rm = RouteManager()
+        rm.register("user_turn_1", "group", "GRP_1", "msg_qq_1")
+
+        # 1. First event in turn binds root_exec_id
+        r1 = rm.match_route("user_turn_1", "exec_A")
+        self.assertIsNotNone(r1)
+        self.assertEqual(r1.target_type, "group")
+
+        # 2. Subsequent media event in SAME turn matches!
+        r2 = rm.match_route("user_turn_1", None)
+        self.assertIsNotNone(r2)
+        self.assertEqual(r2.target_type, "group")
+
+        # 3. Subsequent text event in SAME turn matches!
+        r3 = rm.match_route("user_turn_1", "exec_A")
+        self.assertIsNotNone(r3)
+        self.assertEqual(r3.target_type, "group")
+
+        # 4. Delayed reminder with DIFFERENT exec_id -> returns None (routes to private)!
+        r4 = rm.match_route("user_turn_1", "exec_B_delayed")
+        self.assertIsNone(r4)
+
 
 class TestGateCatchUp(unittest.TestCase):
     def test_baseline_when_disabled(self):

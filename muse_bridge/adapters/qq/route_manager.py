@@ -1,9 +1,10 @@
 """Route manager for asynchronous user message routing.
 
 Maps Muse user message IDs to QQ outbound destinations (group/private and msg_id).
-When an assistant message replies to a user message, the route is consumed (popped),
-ensuring subsequent proactive events (like delayed reminders) strictly route to
-the configured proactive push target (e.g. private chat) rather than hijacking the group.
+Coordinates execution IDs (root_message_execution_id) so multi-part replies
+(e.g. text + generated images + generated files) in the same conversational turn
+stay with the group, while subsequent events (like delayed reminders with a new
+execution ID) strictly route to the configured private chat.
 Persists to disk (qq_routes.json) so routes survive process restarts.
 """
 
@@ -22,6 +23,7 @@ class RouteInfo:
     target_type: str  # "group" or "private"
     target_id: str
     msg_id: Optional[str] = None
+    root_exec_id: Optional[str] = None
     timestamp: float = dataclasses.field(default_factory=time.time)
 
     def to_dict(self) -> dict:
@@ -94,8 +96,44 @@ class RouteManager:
             return None
         return self._routes.get(user_mid)
 
+    def match_route(
+        self,
+        user_mid: Optional[str],
+        root_exec_id: Optional[str] = None,
+    ) -> Optional[RouteInfo]:
+        """Match route for assistant event.
+
+        Keeps the route active for all assistant events sharing the same turn (same root_exec_id
+        or immediate presentation following the turn), but treats subsequent events with a
+        different root_exec_id (such as a delayed reminder) as unrouted proactive pushes.
+        """
+        if not user_mid:
+            return None
+        route = self._routes.get(user_mid)
+        if not route:
+            return None
+
+        # First assistant event in the turn binds its root_exec_id
+        if not route.root_exec_id and root_exec_id:
+            route.root_exec_id = root_exec_id
+            self._save_state()
+            return route
+
+        # Events sharing the same root_exec_id or presentations without one belong to this turn
+        if not root_exec_id or route.root_exec_id == root_exec_id:
+            return route
+
+        # Different root_exec_id means a separate turn / delayed reminder!
+        return None
+
+    def finish_turn(self, user_mid: Optional[str]) -> None:
+        """Clear route when a subsequent user message arrives."""
+        if user_mid and user_mid in self._routes:
+            self._routes.pop(user_mid, None)
+            self._save_state()
+
     def pop(self, user_mid: Optional[str]) -> Optional[RouteInfo]:
-        """Consume and remove the route for user_mid upon dispatching reply."""
+        """Consume and remove route for user_mid."""
         if not user_mid:
             return None
         route = self._routes.pop(user_mid, None)
