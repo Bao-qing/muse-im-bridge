@@ -58,11 +58,28 @@ class MuseService:
                         orig_connect()
                         return
                     except Exception as refresh_err:
+                        self.token_manager.invalidate()
                         raise RuntimeError(f"handshake failed ({e}) and token refresh failed ({refresh_err})") from e
                 raise
 
         client.connect = connect_with_retry
         return client
+
+    def verify_connection(self) -> bool:
+        """Verify Muse credentials by attempting a connection.
+        Returns True if connected and authenticated; False if invalid or expired.
+        """
+        if not self.token_manager.has_credentials():
+            return False
+        try:
+            with self.create_client() as client:
+                client.connect()
+                return True
+        except Exception as e:
+            msg = str(e).lower()
+            if any(k in msg for k in ("401", "403", "unauthorized", "handshake", "cookie", "credential", "hatch_vm_auth")):
+                self.token_manager.invalidate()
+            return False
 
     def process_attachments(
         self,
@@ -122,20 +139,26 @@ class MuseService:
         threshold_bytes: int = 2 * 1024 * 1024,
     ) -> str:
         """Post a user message to Muse and return the message_id immediately without waiting."""
-        with self.create_client() as client:
-            client.connect()
-            atts = attachments or []
-            inline_images, inline_files, file_refs, processed_text = self.process_attachments(
-                client, atts, text, threshold_bytes
-            )
-            sent_mid = client.send_message(
-                session_id=session_id,
-                text=processed_text,
-                images=inline_images or None,
-                files=inline_files or None,
-                file_refs=file_refs or None,
-            )
-            return sent_mid
+        try:
+            with self.create_client() as client:
+                client.connect()
+                atts = attachments or []
+                inline_images, inline_files, file_refs, processed_text = self.process_attachments(
+                    client, atts, text, threshold_bytes
+                )
+                sent_mid = client.send_message(
+                    session_id=session_id,
+                    text=processed_text,
+                    images=inline_images or None,
+                    files=inline_files or None,
+                    file_refs=file_refs or None,
+                )
+                return sent_mid
+        except Exception as e:
+            msg = str(e).lower()
+            if any(k in msg for k in ("401", "403", "unauthorized", "handshake", "cookie", "credential", "hatch_vm_auth")):
+                self.token_manager.invalidate()
+            raise
 
     def send_turn(
         self,
@@ -147,44 +170,50 @@ class MuseService:
         on_sent: Optional[Callable[[str], None]] = None,
     ) -> TurnResult:
         """Send a turn to Muse, wait for reply, and mark seen."""
-        with self.create_client() as client:
-            client.connect()
-            atts = attachments or []
-            inline_images, inline_files, file_refs, processed_text = self.process_attachments(
-                client, atts, text, threshold_bytes
-            )
+        try:
+            with self.create_client() as client:
+                client.connect()
+                atts = attachments or []
+                inline_images, inline_files, file_refs, processed_text = self.process_attachments(
+                    client, atts, text, threshold_bytes
+                )
 
-            # Send message
-            sent_mid = client.send_message(
-                session_id=session_id,
-                text=processed_text,
-                images=inline_images or None,
-                files=inline_files or None,
-                file_refs=file_refs or None,
-            )
+                # Send message
+                sent_mid = client.send_message(
+                    session_id=session_id,
+                    text=processed_text,
+                    images=inline_images or None,
+                    files=inline_files or None,
+                    file_refs=file_refs or None,
+                )
 
-            if on_sent and sent_mid:
-                try:
-                    on_sent(sent_mid)
-                except Exception:
-                    pass
+                if on_sent and sent_mid:
+                    try:
+                        on_sent(sent_mid)
+                    except Exception:
+                        pass
 
-            if should_cancel and should_cancel():
-                raise TurnCancelled("turn cancelled before wait")
+                if should_cancel and should_cancel():
+                    raise TurnCancelled("turn cancelled before wait")
 
-            # Wait for turn completion
-            if self.config.reply_mode == "push":
-                try:
-                    sub = client.subscribe(session_id, timeout=20)
-                    turn = client.wait_push(sub, session_id, processed_text, sent_mid, timeout=120)
-                except Exception:
-                    # Fallback to polling
+                # Wait for turn completion
+                if self.config.reply_mode == "push":
+                    try:
+                        sub = client.subscribe(session_id, timeout=20)
+                        turn = client.wait_push(sub, session_id, processed_text, sent_mid, timeout=120)
+                    except Exception:
+                        # Fallback to polling
+                        turn = client.wait_turn(session_id, processed_text, sent_mid=sent_mid, timeout=180, should_cancel=should_cancel)
+                else:
                     turn = client.wait_turn(session_id, processed_text, sent_mid=sent_mid, timeout=180, should_cancel=should_cancel)
-            else:
-                turn = client.wait_turn(session_id, processed_text, sent_mid=sent_mid, timeout=180, should_cancel=should_cancel)
 
-            client.mark_seen(session_id)
-            return turn
+                client.mark_seen(session_id)
+                return turn
+        except Exception as e:
+            msg = str(e).lower()
+            if any(k in msg for k in ("401", "403", "unauthorized", "handshake", "cookie", "credential", "hatch_vm_auth")):
+                self.token_manager.invalidate()
+            raise
 
     def read_workspace_bytes(self, paths: List[str], cap: int = 25 * 1024 * 1024) -> Dict[str, Optional[bytes]]:
         """Read files/images from the Muse workspace."""

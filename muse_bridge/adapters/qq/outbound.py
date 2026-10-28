@@ -142,18 +142,21 @@ class QQOutboundPusher:
         route_manager: RouteManager,
         session_id: str = "",
         session_mapper: Optional[SessionMapper] = None,
+        on_login_required: Optional[Callable[[Optional[str]], None]] = None,
     ):
         self.config = config
         self.client = client
         self.muse_service = muse_service
         self.deduplicator = deduplicator
         self.route_manager = route_manager
+        self._on_login_required = on_login_required
         # Without an explicit mapper behave exactly like the legacy single-session pusher.
         self.session_mapper = session_mapper or SessionMapper(
             mode=MODE_GLOBAL, global_session_id=session_id
         )
 
         self._running = False
+        self._login_alerted: bool = False
         self._seen_ids: Set[str] = set()
         self._last_seq: int = 0
         self._last_ts: Optional[float] = None
@@ -367,19 +370,42 @@ class QQOutboundPusher:
         self._gated.add(session_id)
         self._save_state()
 
+    async def _notify_login_required(self) -> None:
+        admin_target = self.config.get_default_private_target()
+        if admin_target:
+            try:
+                loop = asyncio.get_running_loop()
+                await loop.run_in_executor(
+                    None,
+                    self.client.send_message,
+                    "private",
+                    admin_target,
+                    "【系统提示】获取 Muse 消息时检测到凭据失效（401 Unauthorized）。\n已自动进入登录回落流程，请直接在此私聊发送：\n/login <您的邮箱>\n（或直接回复您的邮箱地址）即可获取验证码重新登录恢复服务 ♪",
+                )
+            except Exception as e:
+                if self.config.debug:
+                    print(f"[QQOutbound] Failed to notify admin for login: {e}")
+        if self._on_login_required:
+            try:
+                self._on_login_required(admin_target)
+            except Exception:
+                pass
+
+    def reset_login_alert(self) -> None:
+        self._login_alerted = False
+
     async def _run_loop(self) -> None:
         loop = asyncio.get_running_loop()
-        login_alerted = False
 
         while self._running:
             if not self.muse_service.token_manager.has_credentials():
-                if not login_alerted:
-                    login_alerted = True
-                    print("[QQOutbound] Muse 尚未登录或 Cookies 不存在，暂停出站扫描（等待管理员在私聊发送 /login 进行登录认证）。")
+                if not self._login_alerted:
+                    self._login_alerted = True
+                    print("[QQOutbound] Muse 尚未登录或凭据失效，暂停出站扫描，触发回落登录...")
+                    await self._notify_login_required()
                 await asyncio.sleep(5.0)
                 continue
 
-            login_alerted = False
             try:
                 def _tick() -> List[Tuple[str, List[dict]]]:
                     results: List[Tuple[str, List[dict]]] = []
@@ -393,7 +419,7 @@ class QQOutboundPusher:
                                 results.append((sid, self._fetch_session(client, sid)))
                             except Exception as ex:
                                 msg = str(ex).lower()
-                                if any(k in msg for k in ("credential", "cookie", "handshake", "unauthorized", "401")):
+                                if any(k in msg for k in ("credential", "cookie", "handshake", "unauthorized", "401", "hatch_vm_auth")):
                                     raise
                                 # one broken / not-yet-created session must not block the others
                                 if self.config.debug:
@@ -401,6 +427,7 @@ class QQOutboundPusher:
                     return results
 
                 results = await loop.run_in_executor(None, _tick)
+                self._login_alerted = False
                 for sid, hist in results:
                     if not hist:
                         # Nothing there yet (e.g. new session); it is still gated-fresh.
@@ -430,10 +457,12 @@ class QQOutboundPusher:
                 break
             except Exception as e:
                 err_msg = str(e).lower()
-                if any(k in err_msg for k in ("credential", "cookie", "handshake", "unauthorized", "401")):
-                    if not login_alerted:
-                        login_alerted = True
-                        print(f"[QQOutbound] Muse 凭据失效 ({e})，暂停出站扫描，等待重新登录...")
+                if any(k in err_msg for k in ("credential", "cookie", "handshake", "unauthorized", "401", "hatch_vm_auth")):
+                    self.muse_service.token_manager.invalidate()
+                    if not self._login_alerted:
+                        self._login_alerted = True
+                        print(f"[QQOutbound] 获取 Muse 消息时凭据失效 ({e})，触发回落登录流程...")
+                        await self._notify_login_required()
                     await asyncio.sleep(10.0)
                     continue
                 if self.config.debug:

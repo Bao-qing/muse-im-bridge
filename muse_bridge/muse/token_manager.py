@@ -56,6 +56,8 @@ class MuseTokenManager:
 
         self._token = ""
         self._notary_token = ""
+        self._invalid = False
+        self._cookie_mtime_when_invalidated: float = 0.0
         self._load_cached_mint()
 
     def _load_cached_mint(self) -> None:
@@ -223,7 +225,28 @@ class MuseTokenManager:
                 except OSError:
                     pass
 
+    def invalidate(self) -> None:
+        """Mark cached tokens and cookies as invalid and remove cached mint file."""
+        self._token = ""
+        self._notary_token = ""
+        self._invalid = True
+        if self.cookies_file and os.path.exists(self.cookies_file):
+            try:
+                self._cookie_mtime_when_invalidated = os.path.getmtime(self.cookies_file)
+            except OSError:
+                self._cookie_mtime_when_invalidated = time.time()
+        else:
+            self._cookie_mtime_when_invalidated = time.time()
+
+        if self.mint_file and os.path.exists(self.mint_file):
+            try:
+                os.remove(self.mint_file)
+            except OSError:
+                pass
+
     def is_fresh(self) -> bool:
+        if self._invalid:
+            return False
         if not self._token or not self._notary_token:
             return False
         exp = self.notary_expiry(self._notary_token)
@@ -231,6 +254,16 @@ class MuseTokenManager:
 
     def has_credentials(self) -> bool:
         """Check whether we have usable cached tokens or an existing cookies file."""
+        if self._invalid:
+            if self._cookie_mtime_when_invalidated and self.cookies_file and os.path.exists(self.cookies_file):
+                try:
+                    if os.path.getmtime(self.cookies_file) > self._cookie_mtime_when_invalidated:
+                        self._invalid = False
+                except OSError:
+                    pass
+            if self._invalid:
+                return False
+
         if self._token and self._notary_token and self.is_fresh():
             return True
         return bool(self.load_cookie_string())
@@ -250,6 +283,7 @@ class MuseTokenManager:
                 print(f"[Muse] 登录流程失败或取消：{e}")
 
         if not cookie:
+            self.invalidate()
             raise RuntimeError(
                 f"cookies file {self.cookies_file} not found or empty (cannot refresh mint)"
             )
@@ -262,27 +296,43 @@ class MuseTokenManager:
                 self.vm_id = self.vm_id_from_cookies(cookie)
 
         if not self.vm_id:
+            self.invalidate()
             raise RuntimeError("cannot resolve vm_id: not provided and not found in page HTML")
 
         vm_address = f"wss://{self.vm_id}.metaaivm.com/"
         token_url = f"{self.base_url}/api/hatch/token"
-        data = self._post_json(token_url, {"vmAddress": vm_address, "vmName": self.vm_id}, cookie)
+        try:
+            data = self._post_json(token_url, {"vmAddress": vm_address, "vmName": self.vm_id}, cookie)
+        except Exception as e:
+            msg = str(e).lower()
+            if any(k in msg for k in ("401", "403", "unauthorized", "hatch_vm_auth")):
+                self.invalidate()
+            raise
 
         token = (data.get("token") or "").strip()
         notary = (data.get("notary_token") or "").strip()
         if not token:
+            self.invalidate()
             raise RuntimeError(f"{token_url} returned no token")
 
         if not notary:
             notary_url = f"{self.base_url}/api/hatch/noise-notary-token"
-            extra = self._post_json(notary_url, {"vmName": self.vm_id}, cookie)
+            try:
+                extra = self._post_json(notary_url, {"vmName": self.vm_id}, cookie)
+            except Exception as e:
+                msg = str(e).lower()
+                if any(k in msg for k in ("401", "403", "unauthorized", "hatch_vm_auth")):
+                    self.invalidate()
+                raise
             notary = (extra.get("notaryToken") or "").strip()
 
         if not notary:
+            self.invalidate()
             raise RuntimeError("failed to acquire notary_token from web API")
 
         self._token = token
         self._notary_token = notary
+        self._invalid = False
         self._write_mint_atomic(token, notary)
         return token, notary, self.vm_id
 
@@ -295,6 +345,6 @@ class MuseTokenManager:
             try:
                 self.refresh_from_cookies()
             except Exception as e:
-                if not self._token or not self._notary_token:
-                    raise RuntimeError(f"failed to obtain valid Muse credentials: {e}")
+                self.invalidate()
+                raise RuntimeError(f"failed to obtain valid Muse credentials: {e}")
         return self._token, self._notary_token, self.vm_id

@@ -87,11 +87,35 @@ class QQAdapter(BaseAdapter):
             route_manager=self.route_manager,
             session_id=self.active_session_id,
             session_mapper=self.session_mapper,
+            on_login_required=self.enter_login_mode,
         )
 
+        self._in_login_fallback: bool = False
         self._login_sessions: Dict[Tuple[str, str, str], dict] = {}
         self._chat_send_locks: Dict[Tuple[str, str], asyncio.Lock] = {}
         self._running = False
+
+    def enter_login_mode(self, admin_target: Optional[str] = None) -> None:
+        self._in_login_fallback = True
+
+    def exit_login_mode(self) -> None:
+        self._in_login_fallback = False
+        if self.outbound_pusher:
+            self.outbound_pusher.reset_login_alert()
+
+    async def _notify_admin_login(self, admin_target: str) -> None:
+        try:
+            loop = asyncio.get_running_loop()
+            await loop.run_in_executor(
+                None,
+                self.client.send_message,
+                "private",
+                admin_target,
+                "【系统告警】向 Muse 发送消息时检测到凭据失效（401 Unauthorized）。\n已自动进入登录回落流程，请直接在此私聊发送：\n/login <您的邮箱>\n（或直接回复您的邮箱地址）即可获取验证码重新登录恢复服务 ♪",
+            )
+        except Exception as e:
+            if self.config.debug:
+                print(f"[QQAdapter] Failed to notify admin for login: {e}")
 
     async def _send_command_reply(
         self,
@@ -253,6 +277,7 @@ class QQAdapter(BaseAdapter):
                         del self._login_sessions[session_key]
                         try:
                             await loop.run_in_executor(None, self.muse_service.token_manager.refresh_from_cookies)
+                            self.exit_login_mode()
                             reply = f"【登录成功】已成功更新会话 Cookies ({cookies_path}) 并刷新凭据，Muse 服务已恢复正常！"
                         except Exception as refresh_err:
                             msg_str = str(refresh_err)
@@ -277,6 +302,48 @@ class QQAdapter(BaseAdapter):
                         msg_id,
                     )
                     return
+
+        # 0.1 Direct email input or login fallback check
+        needs_login = self._in_login_fallback or not self.muse_service.token_manager.has_credentials()
+        email_pattern = r"^[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+$"
+        is_email = bool(re.match(email_pattern, content.strip()))
+
+        # If admin directly sends an email in private chat (or in group if admin_only is false):
+        if (is_admin or not self.config.admin_only) and is_email:
+            email = content.strip()
+            from ...muse.login import MuseProtocolLogin
+            auth = MuseProtocolLogin(base_url="https://muse.ai")
+            loop = asyncio.get_running_loop()
+            try:
+                await loop.run_in_executor(None, auth.send_otp, email)
+                self._login_sessions[session_key] = {
+                    "auth": auth,
+                    "email": email,
+                    "timestamp": time.time(),
+                }
+                reply = f"【登录流程】验证码已成功发送至 {email}。\n请直接回复收到的 6 位数验证码完成登录（或发送 /cancel 取消）："
+            except Exception as e:
+                reply = f"【发送验证码失败】：{e}"
+            await self._send_command_reply(target_type, target_id, reply, msg_id)
+            return
+
+        # If in login fallback and user message is not a command, intercept immediately with login guidance
+        if needs_login and not content.startswith("/"):
+            if target_type == "private" and is_admin:
+                await self._send_command_reply(
+                    target_type,
+                    target_id,
+                    "【系统提示】Muse 会话凭据已失效，当前已回落至登录流程。\n请直接回复您的登录邮箱（如 user@example.com）或发送 /login <邮箱> 获取验证码 ♪",
+                    msg_id,
+                )
+            else:
+                await self._send_command_reply(
+                    target_type,
+                    target_id,
+                    "【系统提示】Muse 会话凭据已失效，机器人正处于登录维护状态，正在等待管理员重新认证恢复。",
+                    msg_id,
+                )
+            return
 
         # 1. Local Slash Commands
         parsed = CommandHandler.parse_command(content)
@@ -351,7 +418,13 @@ class QQAdapter(BaseAdapter):
             except CommandError as e:
                 reply = str(e)
             except Exception as e:
-                reply = f"命令执行出错：{e}"
+                err_msg = str(e).lower()
+                if any(k in err_msg for k in ("401", "403", "unauthorized", "credential", "cookie", "handshake", "hatch_vm_auth")):
+                    self.muse_service.token_manager.invalidate()
+                    self.enter_login_mode()
+                    reply = "【系统提示】执行指令时检测到 Muse 会话凭据已失效，已进入登录回落流程。\n请管理员在此私聊发送 /login <您的邮箱>（或直接回复邮箱）进行登录认证。"
+                else:
+                    reply = f"命令执行出错：{e}"
             finally:
                 if client:
                     try:
@@ -421,5 +494,22 @@ class QQAdapter(BaseAdapter):
                 if self.config.debug:
                     print(f"[QQAdapter] Message delivered to Muse (mid={sent_mid}), route registered for {target_type}:{target_id}")
             except Exception as e:
+                err_msg = str(e).lower()
+                if any(k in err_msg for k in ("401", "403", "unauthorized", "credential", "cookie", "handshake", "hatch_vm_auth")):
+                    print(f"[QQAdapter] Credential expired while sending message to Muse: {e}")
+                    self.muse_service.token_manager.invalidate()
+                    self.enter_login_mode()
+                    admin_target = self.config.get_default_private_target()
+                    if target_type == "private" and is_admin:
+                        reply = "【系统提示】发送消息时检测到 Muse 会话凭据已失效，已进入登录回落流程。\n请直接回复您的登录邮箱（如 user@example.com）以获取验证码 ♪"
+                    else:
+                        reply = "【系统提示】Muse 会话凭据已失效，服务已暂停并进入登录维护状态，已通知管理员重新登录。"
+                        if admin_target and (target_type != "private" or target_id != admin_target):
+                            loop.call_soon(
+                                asyncio.create_task,
+                                self._notify_admin_login(admin_target),
+                            )
+                    await self._send_command_reply(target_type, target_id, reply, msg_id)
+                    return
                 print(f"[QQAdapter] Failed to post message to Muse: {e}")
                 await self._send_command_reply(target_type, target_id, f"转接出错了：{e}", msg_id)
