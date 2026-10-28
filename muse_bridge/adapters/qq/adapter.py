@@ -19,6 +19,7 @@ from ...config.models import QQConfig
 from ...core.commands import CommandError, CommandHandler
 from ...core.deduplicator import MessageDeduplicator
 from ...core.message import Attachment
+from ...core.session_map import SessionMapper
 from ...muse.service import MuseService
 from ..base import BaseAdapter
 from .client import QQClient
@@ -58,6 +59,15 @@ class QQAdapter(BaseAdapter):
             self.config.session_id,
         )
 
+        # Chat -> Muse session mapping ("global": one shared session, "per_chat": isolated)
+        self.session_mapper = SessionMapper(
+            mode=self.config.session_mode,
+            global_session_id=self.active_session_id,
+            state_file=self.config.session_map_file,
+            bindings=self.config.session_bindings,
+            global_state_file=self.config.session_state_file,
+        )
+
         # 1. Inbound Gateway (receives QQ events)
         self.gateway = QQGateway(
             client=self.client,
@@ -76,6 +86,7 @@ class QQAdapter(BaseAdapter):
             deduplicator=self.deduplicator,
             route_manager=self.route_manager,
             session_id=self.active_session_id,
+            session_mapper=self.session_mapper,
         )
 
         self._login_sessions: Dict[Tuple[str, str, str], dict] = {}
@@ -213,6 +224,7 @@ class QQAdapter(BaseAdapter):
 
         author = d.get("author", {})
         user_openid = author.get("user_openid") or author.get("id") or ""
+        is_admin = self.config.is_admin(user_openid)
         session_key = (target_type, target_id, user_openid)
 
         # 0. Ongoing Login Session (both group & private supported)
@@ -306,22 +318,36 @@ class QQAdapter(BaseAdapter):
 
             loop = asyncio.get_running_loop()
             client = None
+            # Session this chat is currently bound to (own session in per_chat mode,
+            # the shared global one otherwise).
+            chat_session_id = self.session_mapper.current(target_type, target_id)
+            if self.session_mapper.per_chat and not chat_session_id:
+                chat_session_id = "（尚未创建，发送第一条消息后自动建立）"
             try:
                 if cmd_name not in ("help", "__help__", "__usage_hint__", "new"):
                     client = self.muse_service.create_client()
                     client.connect()
+                # session_state_file=None: persistence is handled by SessionMapper.bind
                 reply, new_sid = await loop.run_in_executor(
                     None,
                     CommandHandler.execute,
                     cmd_name,
                     cmd_args,
                     client,
-                    self.active_session_id,
-                    self.config.session_state_file,
+                    chat_session_id,
+                    None,
                 )
-                if new_sid != self.active_session_id:
-                    self.active_session_id = new_sid
-                    self.outbound_pusher.session_id = new_sid
+                if new_sid != chat_session_id:
+                    self.session_mapper.bind(target_type, target_id, new_sid)
+                    if self.session_mapper.per_chat:
+                        if cmd_name == "new":
+                            self.outbound_pusher.track_session(new_sid, fresh=True)
+                        else:
+                            # Bound to an existing session: never replay its old history.
+                            await self.outbound_pusher.ensure_baseline(new_sid)
+                    else:
+                        self.active_session_id = new_sid
+                        self.outbound_pusher.session_id = new_sid
             except CommandError as e:
                 reply = str(e)
             except Exception as e:
@@ -369,15 +395,26 @@ class QQAdapter(BaseAdapter):
                         content += f"\n[{att.type}下载失败：{e}]"
 
             try:
+                # Resolve which Muse session this chat talks to
+                session_id, created = self.session_mapper.resolve(target_type, target_id)
+                if self.session_mapper.per_chat:
+                    if created:
+                        self.outbound_pusher.track_session(session_id, fresh=True)
+                        print(f"[QQAdapter] New isolated Muse session {session_id} for {target_type}:{target_id}")
+                    else:
+                        # Pre-bound / restored session: baseline once so old history is never replayed
+                        await self.outbound_pusher.ensure_baseline(session_id)
+
                 # Post message to Muse in strict chronological order
                 sent_mid = await loop.run_in_executor(
                     None,
                     self.muse_service.post_message,
-                    self.active_session_id,
+                    session_id,
                     content,
                     attachments,
                     self.config.file_ref_threshold_bytes,
                 )
+                self.outbound_pusher.track_session(session_id)
 
                 # Register route for outbound pusher
                 self.route_manager.register(sent_mid, target_type, target_id, msg_id)

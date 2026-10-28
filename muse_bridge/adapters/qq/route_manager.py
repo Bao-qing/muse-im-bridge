@@ -97,6 +97,25 @@ class RouteManager:
             return None
         return self._routes.get(user_mid)
 
+    def get_latest_for_target(
+        self,
+        target_type: str,
+        target_id: str,
+        max_age_s: float = 280.0,
+    ) -> Optional[RouteInfo]:
+        """Find the most recent route for target within validity window (default 280s for QQ passive TTL)."""
+        now = time.time()
+        candidates = [
+            r for r in self._routes.values()
+            if r.target_type == target_type and r.target_id == target_id
+            and (now - r.timestamp) <= max_age_s
+            and r.msg_id
+            and r.seq <= (4 if target_type == "private" else 5)
+        ]
+        if not candidates:
+            return None
+        return max(candidates, key=lambda r: r.timestamp)
+
     def next_seq(self, user_mid: Optional[str]) -> int:
         """Get and increment the passive reply sequence number for user_mid."""
         if not user_mid or user_mid not in self._routes:
