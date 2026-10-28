@@ -75,12 +75,16 @@ class TestConfig(unittest.TestCase):
                 json.dump({
                     "overrides": {
                         "chunk_chars": 500,
-                        "timezone": "UTC"
+                        "timezone": "UTC",
+                        "ws_guid": "CUSTOM_GUID_123",
+                        "user_agent": "CustomBot/1.0"
                     }
                 }, f)
             cfg = ConfigLoader.load(cfg_path)
             self.assertEqual(cfg.qq.chunk_chars, 500)
             self.assertEqual(cfg.muse.timezone, "UTC")
+            self.assertEqual(cfg.qq.ws_guid, "CUSTOM_GUID_123")
+            self.assertEqual(cfg.qq.user_agent, "CustomBot/1.0")
 
 
 class TestMessageAndSplitter(unittest.TestCase):

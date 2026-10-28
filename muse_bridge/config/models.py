@@ -101,6 +101,10 @@ class QQConfig:
     max_video_upload_bytes: int = constants.DEFAULT_MAX_VIDEO_UPLOAD_BYTES
     file_ref_threshold_bytes: int = constants.DEFAULT_FILE_REF_THRESHOLD_BYTES
 
+    # Protocol & Headers
+    ws_guid: str = constants.DEFAULT_WS_GUID
+    user_agent: str = constants.DEFAULT_USER_AGENT
+
     # Timeouts
     gateway_dedup_s: int = constants.DEFAULT_GATEWAY_DEDUP_S
     download_timeout_s: int = constants.DEFAULT_DOWNLOAD_TIMEOUT_S
@@ -294,6 +298,8 @@ class ConfigLoader:
             poll_timeout_s=int(_get_val(q_raw, "poll_timeout_s", constants.DEFAULT_POLL_TIMEOUT_S)),
             poll_interval_s=int(_get_val(q_raw, "poll_interval_s", constants.DEFAULT_POLL_INTERVAL_S)),
             poll_quiet_polls=int(_get_val(q_raw, "poll_quiet_polls", constants.DEFAULT_POLL_QUIET_POLLS)),
+            ws_guid=str(_get_val(q_raw, "ws_guid", constants.DEFAULT_WS_GUID)),
+            user_agent=str(_get_val(q_raw, "user_agent", constants.DEFAULT_USER_AGENT)),
         )
 
         # 3. OneBot config

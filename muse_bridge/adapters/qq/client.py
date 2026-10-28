@@ -19,6 +19,7 @@ import urllib.parse
 import urllib.request
 from typing import Any, Dict, Optional, Tuple
 
+from ...config import constants
 from ...config.constants import BLOCKED_DOWNLOAD_HOST
 
 JPEG_START = b"\xff\xd8"
@@ -34,11 +35,13 @@ class QQClient:
         app_secret: str,
         proxy_url: Optional[str] = None,
         download_proxy: str = "",
+        user_agent: str = constants.DEFAULT_USER_AGENT,
     ):
         self.app_id = app_id
         self.app_secret = app_secret
         self.proxy_url = proxy_url
         self.download_proxy = download_proxy
+        self.user_agent = user_agent
 
         self._token: str = ""
         self._token_expires_at: float = 0.0
@@ -51,7 +54,11 @@ class QQClient:
 
         url = "https://bots.qq.com/app/getAppAccessToken"
         body = json.dumps({"appId": self.app_id, "clientSecret": self.app_secret}).encode("utf-8")
-        req = urllib.request.Request(url, data=body, headers={"Content-Type": "application/json"})
+        req = urllib.request.Request(
+            url,
+            data=body,
+            headers={"Content-Type": "application/json", "User-Agent": self.user_agent},
+        )
 
         try:
             with urllib.request.urlopen(req, timeout=15) as resp:
@@ -71,7 +78,10 @@ class QQClient:
     def get_gateway_url(self) -> str:
         token = self.get_access_token()
         url = "https://api.sgroup.qq.com/gateway/bot"
-        req = urllib.request.Request(url, headers={"Authorization": f"QQBot {token}"})
+        req = urllib.request.Request(
+            url,
+            headers={"Authorization": f"QQBot {token}", "User-Agent": self.user_agent},
+        )
         try:
             with urllib.request.urlopen(req, timeout=15) as resp:
                 data = json.loads(resp.read().decode("utf-8"))
@@ -91,6 +101,7 @@ class QQClient:
         headers = {
             "Authorization": f"QQBot {token}",
             "Content-Type": "application/json",
+            "User-Agent": self.user_agent,
         }
         req = urllib.request.Request(url, data=body, method=method, headers=headers)
         try:
@@ -209,10 +220,7 @@ class QQClient:
 
         try:
             headers = {
-                "User-Agent": (
-                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-                ),
+                "User-Agent": self.user_agent,
                 "Accept": "*/*",
             }
             conn.request("GET", path, headers=headers)
