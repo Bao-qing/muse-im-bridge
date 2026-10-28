@@ -45,10 +45,33 @@ class BridgeEngine:
         print(f"[BridgeEngine] Starting {len(enabled_adapters)} adapter(s): {[a.name for a in enabled_adapters]}")
         tasks = [asyncio.create_task(a.start()) for a in enabled_adapters]
 
+        # Check login_through_adapter on startup if credentials need attention
+        if self.config.gateway.login_through_adapter == "qq" and not self.token_manager.is_fresh():
+            admin_target = self.config.qq.get_default_private_target()
+            if admin_target:
+                asyncio.create_task(self._notify_admin_login(admin_target))
+
         try:
             await asyncio.gather(*tasks)
         except asyncio.CancelledError:
             pass
+
+    async def _notify_admin_login(self, admin_target: str) -> None:
+        await asyncio.sleep(5)  # Wait for QQ gateway to connect
+        qq_adapter = next((a for a in self.adapters if isinstance(a, QQAdapter)), None)
+        if qq_adapter:
+            try:
+                loop = asyncio.get_running_loop()
+                await loop.run_in_executor(
+                    None,
+                    qq_adapter.client.send_message,
+                    "private",
+                    admin_target,
+                    "【系统提示】Muse 会话凭据未就绪或 Cookies 已失效。\n您可直接在此私聊发送：\n/login <您的邮箱>\n即可快速完成在线登录认证并恢复服务 ♪",
+                )
+            except Exception as e:
+                if self.config.debug:
+                    print(f"[BridgeEngine] Failed to notify admin for login: {e}")
 
     async def stop(self) -> None:
         self._running = False

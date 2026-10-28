@@ -10,7 +10,7 @@ from typing import Any, List, Optional, Tuple
 GATEWAY_COMMANDS = frozenset(["status", "compact", "clear", "usage", "subagents", "stop"])
 LOCAL_COMMANDS = frozenset([
     "sessions", "switch", "new", "current", "delete", "rename",
-    "pin", "unpin", "archive", "unarchive", "help"
+    "pin", "unpin", "archive", "unarchive", "help", "login"
 ])
 
 HELP_TEXT = (
@@ -19,6 +19,7 @@ HELP_TEXT = (
     "/switch <序号|id> — 切换会话\n"
     "/new — 新开会话\n"
     "/current — 当前会话\n"
+    "/login <邮箱> — 登录 Muse（管理员私聊专用）\n"
     "/delete <序号|id> — 删除会话（主会话不能删）\n"
     "/rename <序号|id> <新标题> — 改名\n"
     "/pin /unpin <序号|id> — 置顶 / 取消置顶\n"

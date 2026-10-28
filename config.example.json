@@ -9,6 +9,9 @@
       "enabled": true,
       "app_id": "YOUR_QQ_APP_ID",
       "app_secret": "YOUR_QQ_APP_SECRET",
+      "admin_id": [
+        "YOUR_ADMIN_OPENID"
+      ],
       "whitelist": {
         "private": [
           "YOUR_C2C_OPENID"
@@ -33,6 +36,9 @@
         "groups": [836401578]
       }
     }
+  },
+  "gateway": {
+    "login_through_adapter": "qq"
   },
   "overrides": {
     "chunk_chars": 1200,

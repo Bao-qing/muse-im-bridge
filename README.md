@@ -158,6 +158,9 @@ python -m unittest discover tests
       "enabled": true,                             // [必填] 是否启用 QQ 官方机器人适配器
       "app_id": "YOUR_QQ_APP_ID",                  // [必填] QQ 机器人 AppID
       "app_secret": "YOUR_QQ_APP_SECRET",          // [必填] QQ 机器人 AppSecret
+      "admin_id": [                                // [可选] 管理员 OpenID 列表 (仅管理员可在私聊执行管理指令与 /login 登录)
+        "YOUR_ADMIN_OPENID"
+      ],
       "whitelist": {                               // [必填] 权限白名单
         "private": [
           "YOUR_C2C_OPENID"                        // 允许私聊机器人的用户 OpenID 列表
@@ -167,7 +170,7 @@ python -m unittest discover tests
       "push": {                                    // [可选] 主动推送子组件配置
         "enabled": true,                           // 是否启用主动推送 (默认: true)
         "target_type": "private",                  // 推送目标类型: "private" (私聊) 或 "group" (群聊) (默认: "private")
-        "target_id": null,                         // 推送目标 ID: 留空 null 则默认自动选取 whitelist.private[0]
+        "target_id": null,                         // 推送目标 ID: 留空 null 则默认自动推送到管理员 (admin_id[0]) 或第一私聊
         "catch_up_enabled": false,                 // 启动时是否追赶离线期间产生的历史未推送消息 (默认: false，全量标为已读)
         "catch_up_window_s": 21600,                // 追赶允许的最大离线时间窗口 (秒，默认: 21600 = 6小时)
         "catch_up_max_messages": 5,                // 追赶单次补推的最大消息条数 (默认: 5，防止刷屏)
@@ -202,6 +205,9 @@ python -m unittest discover tests
         "groups": [836401578]                      // 允许群聊的群号列表 ("*" 表示全员开放)
       }
     }
+  },
+  "gateway": {                                     // [可选] 跨通道与网关协同配置
+    "login_through_adapter": "qq"                  // 允许通过指定适配器进行登录认证 (如 "qq"，管理员可在私聊发送 /login <邮箱> 登录)
   },
   "overrides": {                                   // [可选] 全局顶层参数覆盖字典 (优先级最高)
     "chunk_chars": 1200,

@@ -83,6 +83,7 @@ class QQConfig:
     enabled: bool = True
     app_id: str = ""
     app_secret: str = ""
+    admin_id: List[str] = dataclasses.field(default_factory=list)
     session_id: str = ""
     whitelist: Dict[str, Union[List[str], str]] = dataclasses.field(default_factory=dict)
     push: QQPushConfig = dataclasses.field(default_factory=QQPushConfig)
@@ -117,8 +118,16 @@ class QQConfig:
     poll_interval_s: int = constants.DEFAULT_POLL_INTERVAL_S
     poll_quiet_polls: int = constants.DEFAULT_POLL_QUIET_POLLS
 
+    def is_admin(self, user_openid: str) -> bool:
+        """Whether the user openid belongs to an administrator."""
+        return bool(user_openid and user_openid in self.admin_id)
+
     def get_default_private_target(self) -> Optional[str]:
-        """Derive the first private openid from the whitelist."""
+        """Derive the first private target: admin_id first, then whitelist."""
+        if self.admin_id:
+            for a in self.admin_id:
+                if a and a != "*":
+                    return a
         if not self.whitelist:
             return None
         privates = self.whitelist.get("private")
@@ -138,11 +147,19 @@ class QQConfig:
         return None
 
     def get_candidate_push_targets(self) -> List[tuple[str, str]]:
-        """Return candidate push targets in order: specified target -> private targets -> group targets."""
+        """Return candidate push targets in order: specified target -> admin -> private -> group."""
         candidates = []
         if self.push.target_id:
             candidates.append((self.push.target_type, self.push.target_id))
             return candidates
+
+        # If not explicitly specified, default to the admin in private chat
+        if self.admin_id:
+            for a in self.admin_id:
+                if a and a != "*":
+                    candidates.append(("private", a))
+            if candidates:
+                return candidates
 
         privates = self.whitelist.get("private")
         if isinstance(privates, list):
@@ -159,8 +176,8 @@ class QQConfig:
     def resolve_push_target(self) -> tuple[str, str]:
         """Resolve push target (type, target_id).
 
-        Defaults to the first concrete private openid in whitelist.
-        Falls back to the first group openid if no private openid exists.
+        Defaults to the first administrator openid in private chat.
+        Falls back to whitelist private or group openid if no admin is configured.
         """
         candidates = self.get_candidate_push_targets()
         if candidates:
@@ -180,10 +197,16 @@ class OneBotConfig:
 
 
 @dataclasses.dataclass
+class GatewayConfig:
+    login_through_adapter: str = ""
+
+
+@dataclasses.dataclass
 class AppConfig:
     muse: MuseConfig = dataclasses.field(default_factory=MuseConfig)
     qq: QQConfig = dataclasses.field(default_factory=QQConfig)
     onebot: OneBotConfig = dataclasses.field(default_factory=OneBotConfig)
+    gateway: GatewayConfig = dataclasses.field(default_factory=GatewayConfig)
     debug: bool = False
 
 
@@ -277,10 +300,19 @@ class ConfigLoader:
             delivered_file=p_raw.get("delivered_file", "qq_delivered.jsonl"),
         )
 
+        admin_raw = q_raw.get("admin_id") or []
+        if isinstance(admin_raw, list):
+            admin_ids = [str(a) for a in admin_raw if a]
+        elif isinstance(admin_raw, str) and admin_raw:
+            admin_ids = [admin_raw]
+        else:
+            admin_ids = []
+
         qq_cfg = QQConfig(
             enabled=q_raw.get("enabled", True),
             app_id=str(q_raw.get("app_id") or os.environ.get("QQ_APP_ID") or ""),
             app_secret=str(q_raw.get("app_secret") or os.environ.get("QQ_APP_SECRET") or ""),
+            admin_id=admin_ids,
             session_id=str(q_raw.get("session_id") or muse_cfg.session_id or ""),
             whitelist=q_raw.get("whitelist") or {},
             push=push_cfg,
@@ -320,9 +352,19 @@ class ConfigLoader:
             whitelist=ob_raw.get("whitelist") or {},
         )
 
+        # 4. Gateway config
+        gw_raw = raw_data.get("gateway", {})
+        login_adapter = (
+            gw_raw.get("login_through_adapter")
+            or gw_raw.get("login_throuth_adapter")
+            or ""
+        )
+        gw_cfg = GatewayConfig(login_through_adapter=str(login_adapter))
+
         return AppConfig(
             muse=muse_cfg,
             qq=qq_cfg,
             onebot=ob_cfg,
+            gateway=gw_cfg,
             debug=raw_data.get("debug", False) or qq_cfg.debug,
         )
