@@ -302,6 +302,8 @@ class QQOutboundPusher:
             seq = event.get("seq", 0)
 
             if role == "user":
+                if last_user_mid and last_user_mid != mid:
+                    self.route_manager.finish_turn(last_user_mid)
                 last_user_mid = mid
                 if mid:
                     self._seen_ids.add(mid)
@@ -319,24 +321,40 @@ class QQOutboundPusher:
                 self._seen_ids.add(mid)
                 continue
 
-            # Assistant message
+            # Assistant message or presentation event
             payload = event.get("payload") or {}
             event_name = event.get("event_name")
+            kind = payload.get("kind")
+            data_field = payload.get("data") or {}
 
-            # Ignore pure web UI widget cards (e.g. HTML timer cards) that have no media
-            if event_name == "delta.presentation" and not payload.get("data", {}).get("image_path") and not payload.get("data", {}).get("file_path"):
+            # Check if this is an assistant message or presentation
+            if event_name not in ("message.assistant", "delta.presentation"):
+                continue
+
+            # Ignore pure web UI widget cards (e.g. HTML timer cards) that have no image/file media
+            is_media_presentation = (
+                event_name == "delta.presentation"
+                and (
+                    kind in ("file", "image", "video")
+                    or "file" in data_field
+                    or "image_path" in data_field
+                    or event.get("_extracted_images")
+                    or event.get("_extracted_files")
+                    or event.get("_extracted_videos")
+                )
+            )
+
+            if event_name == "delta.presentation" and not is_media_presentation:
                 self._seen_ids.add(mid)
                 continue
 
-            # Only dispatch completed assistant messages (never partial/streaming!)
-            status = payload.get("status") or event.get("status")
-            if status != "completed":
-                if self.config.debug:
-                    print(f"[QQOutbound] Skip {mid}: generation in progress (status={status})")
-                continue
-
-            if not event.get("display_text_ready", True):
-                continue
+            # For normal text messages, ensure generation is completed (never partial/streaming!)
+            if event_name == "message.assistant":
+                status = payload.get("status") or event.get("status")
+                if status != "completed":
+                    if self.config.debug:
+                        print(f"[QQOutbound] Skip {mid}: generation in progress (status={status})")
+                    continue
 
             raw_text = event.get("display_text") or ""
             clean_text = _clean_text(raw_text)
@@ -345,11 +363,20 @@ class QQOutboundPusher:
             files = event.get("_extracted_files") or []
             videos = event.get("_extracted_videos") or []
 
+            # If text simply mirrors the filename of an extracted file or image, suppress redundant text chunk
+            if files and clean_text in [fl.get("filename") for fl in files if fl.get("filename")]:
+                clean_text = ""
+            if images and clean_text in [im.get("filename") for im in images if im.get("filename")]:
+                clean_text = ""
+
             if not clean_text and not images and not files and not videos:
                 continue
 
             # Route resolution: "回给谁？"
-            route = self.route_manager.pop(last_user_mid)
+            meta = payload.get("metadata") or {}
+            root_exec_id = meta.get("root_message_execution_id")
+
+            route = self.route_manager.match_route(last_user_mid, root_exec_id)
             if route:
                 target_type = route.target_type
                 target_id = route.target_id
