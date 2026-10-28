@@ -404,7 +404,7 @@ class QQOutboundPusher:
                     images=images,
                     files=files,
                     videos=videos,
-                    msg_id=reply_msg_id,
+                    route=route,
                 )
                 if success:
                     self.deduplicator.mark_delivered([mid])
@@ -427,23 +427,29 @@ class QQOutboundPusher:
         images: List[dict],
         files: List[dict],
         videos: List[dict],
-        msg_id: Optional[str] = None,
+        route: Optional[RouteInfo] = None,
     ) -> bool:
         loop = asyncio.get_running_loop()
         chunks = chunk_text(text, self.config.chunk_chars, self.config.max_chunks) if text else []
         passive_limit = 4 if target_type == "private" else 5
         active_budget = self.config.max_active_chunks
-        seq = 1
 
-        # 1. Send text chunks
-        for chunk in chunks:
-            use_passive = bool(msg_id and seq <= passive_limit)
-            curr_msg_id = msg_id if use_passive else None
-            curr_seq = seq if use_passive else None
+        def _get_passive_meta():
+            if not route or not route.msg_id:
+                return None, None
+            s = self.route_manager.next_seq(route.user_mid)
+            if s <= passive_limit:
+                return route.msg_id, s
+            return None, None
 
-            if not use_passive:
+        async def _deliver_item(content=None, md=None, media_info=None) -> bool:
+            nonlocal active_budget
+            curr_mid, curr_seq = _get_passive_meta()
+
+            if not curr_mid:
                 if active_budget <= 0:
-                    break
+                    print(f"[QQOutbound] Active budget ({self.config.max_active_chunks}) exhausted; item dropped.")
+                    return False
                 active_budget -= 1
 
             code, body = await loop.run_in_executor(
@@ -451,25 +457,37 @@ class QQOutboundPusher:
                 self.client.send_message,
                 target_type,
                 target_id,
-                chunk,
-                chunk,
-                None,
-                curr_msg_id,
+                content,
+                md,
+                media_info,
+                curr_mid,
                 curr_seq,
             )
 
             # Retry as active if passive rejected
-            if use_passive and not (200 <= code < 300) and active_budget > 0:
-                active_budget -= 1
-                await loop.run_in_executor(
-                    None,
-                    self.client.send_message,
-                    target_type,
-                    target_id,
-                    chunk,
-                    chunk,
-                )
-            seq += 1
+            if curr_mid and not (200 <= code < 300):
+                if self.config.debug:
+                    print(f"[QQOutbound] Passive send failed ({code}): {body}, retrying as active...")
+                if active_budget > 0:
+                    active_budget -= 1
+                    code, body = await loop.run_in_executor(
+                        None,
+                        self.client.send_message,
+                        target_type,
+                        target_id,
+                        content,
+                        md,
+                        media_info,
+                    )
+
+            if not (200 <= code < 300):
+                print(f"[QQOutbound] Failed sending item to {target_type}:{target_id} ({code}): {body}")
+                return False
+            return True
+
+        # 1. Send text chunks
+        for chunk in chunks:
+            await _deliver_item(content=chunk, md=chunk)
 
         # 2. Send images
         for img in images:
@@ -502,27 +520,7 @@ class QQOutboundPusher:
                     1,  # 1=image
                     fname,
                 )
-                use_passive = bool(msg_id and seq <= passive_limit)
-                curr_msg_id = msg_id if use_passive else None
-                curr_seq = seq if use_passive else None
-
-                if not use_passive:
-                    if active_budget <= 0:
-                        break
-                    active_budget -= 1
-
-                await loop.run_in_executor(
-                    None,
-                    self.client.send_message,
-                    target_type,
-                    target_id,
-                    None,
-                    None,
-                    file_info,
-                    curr_msg_id,
-                    curr_seq,
-                )
-                seq += 1
+                await _deliver_item(media_info=file_info)
             except Exception as e:
                 print(f"[QQOutbound] Failed to upload/send image: {e}")
 
@@ -557,27 +555,7 @@ class QQOutboundPusher:
                     2,  # 2=video
                     fname,
                 )
-                use_passive = bool(msg_id and seq <= passive_limit)
-                curr_msg_id = msg_id if use_passive else None
-                curr_seq = seq if use_passive else None
-
-                if not use_passive:
-                    if active_budget <= 0:
-                        break
-                    active_budget -= 1
-
-                await loop.run_in_executor(
-                    None,
-                    self.client.send_message,
-                    target_type,
-                    target_id,
-                    None,
-                    None,
-                    file_info,
-                    curr_msg_id,
-                    curr_seq,
-                )
-                seq += 1
+                await _deliver_item(media_info=file_info)
             except Exception as e:
                 print(f"[QQOutbound] Failed to upload/send video: {e}")
 
@@ -612,27 +590,7 @@ class QQOutboundPusher:
                     4,  # 4=file
                     fname,
                 )
-                use_passive = bool(msg_id and seq <= passive_limit)
-                curr_msg_id = msg_id if use_passive else None
-                curr_seq = seq if use_passive else None
-
-                if not use_passive:
-                    if active_budget <= 0:
-                        break
-                    active_budget -= 1
-
-                await loop.run_in_executor(
-                    None,
-                    self.client.send_message,
-                    target_type,
-                    target_id,
-                    None,
-                    None,
-                    file_info,
-                    curr_msg_id,
-                    curr_seq,
-                )
-                seq += 1
+                await _deliver_item(media_info=file_info)
             except Exception as e:
                 print(f"[QQOutbound] Failed to upload/send file: {e}")
 

@@ -24,6 +24,7 @@ class RouteInfo:
     target_id: str
     msg_id: Optional[str] = None
     root_exec_id: Optional[str] = None
+    seq: int = 1
     timestamp: float = dataclasses.field(default_factory=time.time)
 
     def to_dict(self) -> dict:
@@ -95,6 +96,15 @@ class RouteManager:
         if not user_mid:
             return None
         return self._routes.get(user_mid)
+
+    def next_seq(self, user_mid: Optional[str]) -> int:
+        """Get and increment the passive reply sequence number for user_mid."""
+        if not user_mid or user_mid not in self._routes:
+            return 1
+        s = self._routes[user_mid].seq
+        self._routes[user_mid].seq += 1
+        self._save_state()
+        return s
 
     def match_route(
         self,
