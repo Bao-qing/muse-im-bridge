@@ -17,6 +17,7 @@ import base64
 import json
 import os
 import re
+import sys
 import tempfile
 import time
 import urllib.error
@@ -223,6 +224,12 @@ class MuseTokenManager:
             return False
         exp = self.notary_expiry(self._notary_token)
         return exp is None or time.time() < exp - 60
+
+    def has_credentials(self) -> bool:
+        """Check whether we have usable cached tokens or an existing cookies file."""
+        if self._token and self._notary_token and self.is_fresh():
+            return True
+        return bool(self.load_cookie_string())
 
     def refresh_from_cookies(self, interactive: bool = True) -> Tuple[str, str, str]:
         """Mint new tokens using cookies and save to mint_file atomically."""

@@ -183,8 +183,18 @@ class QQOutboundPusher:
     async def _run_loop(self) -> None:
         loop = asyncio.get_running_loop()
         startup_gated = False
+        login_alerted = False
 
         while self._running:
+            # If not logged in, pause scanning completely (avoid error spam)
+            if not self.muse_service.token_manager.has_credentials():
+                if not login_alerted:
+                    login_alerted = True
+                    print("[QQOutbound] Muse 尚未登录或 Cookies 不存在，暂停出站扫描（等待管理员在私聊发送 /login 进行登录认证）。")
+                await asyncio.sleep(5.0)
+                continue
+
+            login_alerted = False
             try:
                 def _fetch():
                     with self.muse_service.create_client() as client:
@@ -217,8 +227,17 @@ class QQOutboundPusher:
             except asyncio.CancelledError:
                 break
             except Exception as e:
+                err_msg = str(e).lower()
+                if any(k in err_msg for k in ("credential", "cookie", "handshake", "unauthorized", "401")):
+                    if not login_alerted:
+                        login_alerted = True
+                        print(f"[QQOutbound] Muse 凭据失效 ({e})，暂停出站扫描，等待重新登录...")
+                    await asyncio.sleep(10.0)
+                    continue
                 if self.config.debug:
                     print(f"[QQOutbound] Scan tick error: {e}")
+                await asyncio.sleep(3.0)
+                continue
             await asyncio.sleep(1.0)
 
     async def _scan_and_dispatch(self, hist: List[dict]) -> None:

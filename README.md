@@ -104,10 +104,10 @@ cp config.example.json config.json
     },
     "onebot": {
       "enabled": false,
-      "base_url": "https://bot.baoqing.eu.org:81",
-      "access_token": "YOUR_TOKEN",
-      "ws_url": "wss://bot.baoqing.eu.org:81",
-      "target_group_id": 836401578
+      "base_url": "https://onebot.example.com",
+      "access_token": "YOUR_ONEBOT_TOKEN",
+      "ws_url": "wss://onebot.example.com",
+      "target_group_id": null
     }
   }
 }
@@ -158,9 +158,10 @@ python -m unittest discover tests
       "enabled": true,                             // [必填] 是否启用 QQ 官方机器人适配器
       "app_id": "YOUR_QQ_APP_ID",                  // [必填] QQ 机器人 AppID
       "app_secret": "YOUR_QQ_APP_SECRET",          // [必填] QQ 机器人 AppSecret
-      "admin_id": [                                // [可选] 管理员 OpenID 列表 (仅管理员可在私聊执行管理指令与 /login 登录)
+      "admin_id": [                                // [可选] 管理员 OpenID 列表
         "YOUR_ADMIN_OPENID"
       ],
+      "admin_only": true,                          // [可选] 权限开关: true = /login 与管理指令仅限管理员私聊执行; false = 完全放开权限，允许在群聊中由成员使用 (默认: true)
       "whitelist": {                               // [必填] 权限白名单
         "private": [
           "YOUR_C2C_OPENID"                        // 允许私聊机器人的用户 OpenID 列表
@@ -195,14 +196,14 @@ python -m unittest discover tests
     },
     "onebot": {
       "enabled": false,                            // [可选] 是否启用 OneBot (NapCat v11) 适配器 (默认: false)
-      "base_url": "https://bot.baoqing.eu.org:81",  // [必填-若启用] OneBot HTTP API 地址
+      "base_url": "https://onebot.example.com",    // [必填-若启用] OneBot HTTP API 地址
       "access_token": "YOUR_ONEBOT_TOKEN",         // [必填-若启用] OneBot API Bearer Token
-      "ws_url": "wss://bot.baoqing.eu.org:81",     // [必填-若启用] OneBot 正向 WebSocket 事件流地址
-      "target_group_id": 836401578,                // [可选] 默认交互/推送的 QQ 群号
+      "ws_url": "wss://onebot.example.com",        // [必填-若启用] OneBot 正向 WebSocket 事件流地址
+      "target_group_id": null,                     // [可选] 默认交互/推送的 QQ 群号
       "session_id": "",                            // [可选] 独立绑定的 Muse 会话 ID，留空复用 muse.session_id
       "whitelist": {                               // [可选] OneBot 交互白名单
         "private": [],                             // 允许私聊的用户 QQ 号列表
-        "groups": [836401578]                      // 允许群聊的群号列表 ("*" 表示全员开放)
+        "groups": []                               // 允许群聊的群号列表 ("*" 表示全员开放)
       }
     }
   },
