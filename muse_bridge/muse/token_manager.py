@@ -20,9 +20,19 @@ import re
 import sys
 import tempfile
 import time
-import urllib.error
-import urllib.request
 from typing import Optional, Tuple
+
+import httpx
+
+_BASE_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/155.0.0.0 Safari/537.36"
+    ),
+    "Sec-Ch-Ua": '"Google Chrome";v="155", "Chromium";v="155", "Not(A:Brand";v="24"',
+    "Sec-Ch-Ua-Mobile": "?0",
+    "Sec-Ch-Ua-Platform": '"Windows"',
+}
 
 _VM_HOST_RE = re.compile(
     r"([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})"
@@ -143,25 +153,34 @@ class MuseTokenManager:
                 pairs.append(line)
         return "; ".join(pairs)
 
+    def _get_headers(self, cookie: str) -> dict:
+        return {
+            "Content-Type": "application/json",
+            "Cookie": cookie,
+            "Accept": "application/json, text/plain, */*",
+            "Origin": self.base_url,
+            "Referer": f"{self.base_url}/",
+            "User-Agent": _BASE_HEADERS["User-Agent"],
+            "Sec-Ch-Ua": _BASE_HEADERS["Sec-Ch-Ua"],
+            "Sec-Ch-Ua-Mobile": _BASE_HEADERS["Sec-Ch-Ua-Mobile"],
+            "Sec-Ch-Ua-Platform": _BASE_HEADERS["Sec-Ch-Ua-Platform"],
+            "Sec-Fetch-Dest": "empty",
+            "Sec-Fetch-Mode": "cors",
+            "Sec-Fetch-Site": "same-origin",
+        }
+
     def vm_id_from_cookies(self, cookie: str, timeout: int = 20) -> str:
         """Extract vm_id from muse.ai index page HTML using cookies."""
         if not cookie:
             return ""
-        req = urllib.request.Request(
-            self.base_url + "/",
-            headers={
-                "Cookie": cookie,
-                "Accept": "text/html",
-                "User-Agent": (
-                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                    "AppleWebKit/537.36 (KHTML, like Gecko) "
-                    "Chrome/120.0.0.0 Safari/537.36"
-                ),
-            },
-        )
+        headers = self._get_headers(cookie)
+        headers["Accept"] = "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
+        headers["Sec-Fetch-Dest"] = "document"
+        headers["Sec-Fetch-Mode"] = "navigate"
         try:
-            with urllib.request.urlopen(req, timeout=timeout) as resp:
-                html = resp.read().decode("utf-8", "replace")
+            with httpx.Client(http2=True, timeout=timeout, follow_redirects=True) as client:
+                resp = client.get(f"{self.base_url}/", headers=headers)
+                html = resp.text
         except Exception:
             return ""
         hits = _VM_HOST_RE.findall(html)
@@ -170,31 +189,16 @@ class MuseTokenManager:
         return max(set(hits), key=hits.count).lower()
 
     def _post_json(self, url: str, payload: dict, cookie: str, timeout: int = 20) -> dict:
-        body = json.dumps(payload).encode("utf-8")
-        req = urllib.request.Request(
-            url,
-            data=body,
-            method="POST",
-            headers={
-                "Content-Type": "application/json",
-                "Cookie": cookie,
-                "Accept": "application/json",
-                "Origin": self.base_url,
-                "Referer": f"{self.base_url}/",
-                "User-Agent": (
-                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                    "AppleWebKit/537.36 (KHTML, like Gecko) "
-                    "Chrome/120.0.0.0 Safari/537.36"
-                ),
-            },
-        )
+        headers = self._get_headers(cookie)
         try:
-            with urllib.request.urlopen(req, timeout=timeout) as resp:
-                raw = resp.read()
-            return json.loads(raw.decode("utf-8"))
-        except urllib.error.HTTPError as e:
-            detail = e.read()[:200].decode("utf-8", "replace")
-            raise RuntimeError(f"HTTP {e.code}: {detail}")
+            with httpx.Client(http2=True, timeout=timeout) as client:
+                resp = client.post(url, headers=headers, json=payload)
+                if resp.status_code != 200:
+                    detail = resp.text[:200]
+                    raise RuntimeError(f"HTTP {resp.status_code}: {detail}")
+                return resp.json()
+        except RuntimeError:
+            raise
         except Exception as e:
             raise RuntimeError(f"request to {url} failed: {e}")
 
