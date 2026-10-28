@@ -3,10 +3,10 @@
 The SOLE exit point for all outbound messages from Muse to QQ.
 Unifies both interactive conversational replies and proactive notifications:
 1. Listens for completed assistant events from the Muse event stream.
-2. Checks RouteManager using the preceding user message ID to determine destination.
-   - If triggered by a QQ user message -> replies to the matching group/private chat.
-   - If unsolicited (e.g. reminder, timer, web turn) -> pushes to the default target.
-3. Completely decouples message sending from generation, eliminating chat blocking.
+2. Extracts text, images (URLs & workspace), files (workspace & attachments), and videos.
+3. Automatically reads file-store bytes via client.read_file() and downloads external URLs.
+4. Uploads media to QQ files API (file_type: 1=image, 2=video, 4=file) and sends cards.
+5. Resolves destination via RouteManager (replying to group/private or default proactive target).
 """
 
 from __future__ import annotations
@@ -21,31 +21,66 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 from ...config.models import QQConfig
 from ...core.deduplicator import MessageDeduplicator
 from ...core.message import chunk_text
+from ...muse.client.render import (
+    extract_files,
+    extract_images,
+    extract_workspace_files,
+    extract_workspace_images,
+    extract_workspace_videos,
+)
 from ...muse.service import MuseService
 from .client import QQClient
 from .route_manager import RouteInfo, RouteManager
 
-_SANDBOX_IMG_RE = re.compile(r"!\[([^\]]*)\]\(sandbox://[^)]+\)")
+_SANDBOX_MEDIA_RE = re.compile(r"!?\[([^\]]*)\]\(sandbox://([^)]+)\)")
 _WIDGET_RE = re.compile(r"\[\[hatch_widget:[^\]]+\]\]")
+_IMAGE_EXTS = (".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp")
+_VIDEO_EXTS = (".mp4", ".mov", ".webm", ".mkv", ".avi", ".m4v")
 
 
 def _clean_text(text: str) -> str:
-    cleaned = _SANDBOX_IMG_RE.sub(r"[图片：\1]" if r"\1" else "[图片]", text)
+    cleaned = _SANDBOX_MEDIA_RE.sub("", text)
     cleaned = _WIDGET_RE.sub("", cleaned)
+    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
     return cleaned.strip()
 
 
-def _extract_images_from_payload(payload: dict) -> List[dict]:
-    parts = payload.get("parts") or []
-    out = []
-    for p in parts:
-        if isinstance(p, dict) and p.get("type") == "image" and p.get("url"):
-            out.append({
-                "url": p["url"],
-                "filename": p.get("filename") or "image.jpg",
-                "content_type": p.get("mime_type") or "image/jpeg",
-            })
-    return out
+def _extract_media_descriptors(event: dict, raw_text: str) -> Tuple[List[dict], List[dict], List[dict]]:
+    images = []
+    files = []
+    videos = []
+
+    # 1. From event payload
+    images.extend(extract_images(event) + extract_workspace_images(event))
+    files.extend(extract_files(event) + extract_workspace_files(event))
+    videos.extend(extract_workspace_videos(event))
+
+    # 2. From sandbox:// markdown links in text
+    if raw_text:
+        for alt, uri in _SANDBOX_MEDIA_RE.findall(raw_text):
+            path = uri.strip().lstrip("/")
+            base = path.lower().split("?", 1)[0]
+            if base.endswith(_VIDEO_EXTS):
+                videos.append({"workspace_path": path, "filename": alt or "video.mp4"})
+            elif base.endswith(_IMAGE_EXTS):
+                images.append({"workspace_path": path, "filename": alt or "image.jpg"})
+            else:
+                files.append({
+                    "workspace_path": path,
+                    "filename": alt or os.path.basename(path) or "file.dat",
+                })
+
+    def _dedup(items):
+        seen = set()
+        out = []
+        for it in items:
+            key = it.get("url") or it.get("workspace_path")
+            if key and key not in seen:
+                seen.add(key)
+                out.append(it)
+        return out
+
+    return _dedup(images), _dedup(files), _dedup(videos)
 
 
 def gate_catch_up(
@@ -57,11 +92,7 @@ def gate_catch_up(
     window_s: int,
     max_messages: int,
 ) -> Tuple[Set[str], str, int, int, int, str]:
-    """Startup catch-up gate.
-
-    Determines whether unseen messages from a previous session should be pushed.
-    Returns (seen_ids, action, kept_count, skipped_count, max_seq, reason).
-    """
+    """Startup catch-up gate."""
     all_assistant_ids = {
         e.get("message_id")
         for e in hist
@@ -186,7 +217,6 @@ class QQOutboundPusher:
         login_alerted = False
 
         while self._running:
-            # If not logged in, pause scanning completely (avoid error spam)
             if not self.muse_service.token_manager.has_credentials():
                 if not login_alerted:
                     login_alerted = True
@@ -196,12 +226,34 @@ class QQOutboundPusher:
 
             login_alerted = False
             try:
-                def _fetch():
+                def _fetch_history_and_media():
                     with self.muse_service.create_client() as client:
                         client.connect()
-                        return client.get_history(self.session_id, 25)
+                        hist = client.get_history(self.session_id, 25)
 
-                hist = await loop.run_in_executor(None, _fetch)
+                        # For candidate assistant events, pre-fetch any workspace media bytes
+                        for ev in hist:
+                            mid = ev.get("message_id")
+                            if not mid or mid in self._seen_ids or self.deduplicator.is_delivered(mid):
+                                continue
+                            if ev.get("role") != "assistant":
+                                continue
+                            raw_t = ev.get("display_text") or ""
+                            imgs, fls, vids = _extract_media_descriptors(ev, raw_t)
+                            for it in imgs + fls + vids:
+                                wpath = it.get("workspace_path")
+                                if wpath and not it.get("data"):
+                                    try:
+                                        it["data"] = client.read_file(wpath)
+                                    except Exception as e:
+                                        if self.config.debug:
+                                            print(f"[QQOutbound] Failed reading workspace media {wpath}: {e}")
+                            ev["_extracted_images"] = imgs
+                            ev["_extracted_files"] = fls
+                            ev["_extracted_videos"] = vids
+                        return hist
+
+                hist = await loop.run_in_executor(None, _fetch_history_and_media)
                 if hist:
                     if not startup_gated:
                         startup_gated = True
@@ -271,8 +323,8 @@ class QQOutboundPusher:
             payload = event.get("payload") or {}
             event_name = event.get("event_name")
 
-            # Ignore web UI widget cards (e.g. HTML timer cards) that have no image/file media
-            if event_name == "delta.presentation" and not payload.get("data", {}).get("image_path"):
+            # Ignore pure web UI widget cards (e.g. HTML timer cards) that have no media
+            if event_name == "delta.presentation" and not payload.get("data", {}).get("image_path") and not payload.get("data", {}).get("file_path"):
                 self._seen_ids.add(mid)
                 continue
 
@@ -288,9 +340,12 @@ class QQOutboundPusher:
 
             raw_text = event.get("display_text") or ""
             clean_text = _clean_text(raw_text)
-            images = _extract_images_from_payload(payload)
 
-            if not clean_text and not images:
+            images = event.get("_extracted_images") or []
+            files = event.get("_extracted_files") or []
+            videos = event.get("_extracted_videos") or []
+
+            if not clean_text and not images and not files and not videos:
                 continue
 
             # Route resolution: "回给谁？"
@@ -301,7 +356,7 @@ class QQOutboundPusher:
                 reply_msg_id = route.msg_id
                 route_type = "interactive_reply"
             else:
-                # Proactive push: strictly to configured push target (private chat)
+                # Proactive push: strictly to configured push target
                 target_type, target_id = self.config.resolve_push_target()
                 reply_msg_id = None
                 route_type = "proactive_push"
@@ -315,14 +370,22 @@ class QQOutboundPusher:
             self.deduplicator.mark_processing([mid])
 
             try:
-                success = await self._send_to_qq(target_type, target_id, clean_text, images, msg_id=reply_msg_id)
+                success = await self._send_to_qq(
+                    target_type=target_type,
+                    target_id=target_id,
+                    text=clean_text,
+                    images=images,
+                    files=files,
+                    videos=videos,
+                    msg_id=reply_msg_id,
+                )
                 if success:
                     self.deduplicator.mark_delivered([mid])
                     self._seen_ids.add(mid)
                     if seq > self._last_seq:
                         self._last_seq = seq
                     self._save_state()
-                    print(f"[QQOutbound] Dispatched {mid} -> {target_type}:{target_id} [{route_type}]")
+                    print(f"[QQOutbound] Dispatched {mid} -> {target_type}:{target_id} [{route_type}] (imgs={len(images)}, files={len(files)}, vids={len(videos)})")
                 else:
                     self.deduplicator.rollback_processing([mid])
             except Exception as e:
@@ -335,6 +398,8 @@ class QQOutboundPusher:
         target_id: str,
         text: str,
         images: List[dict],
+        files: List[dict],
+        videos: List[dict],
         msg_id: Optional[str] = None,
     ) -> bool:
         loop = asyncio.get_running_loop()
@@ -360,8 +425,8 @@ class QQOutboundPusher:
                 target_type,
                 target_id,
                 chunk,
-                chunk,  # markdown content
-                None,   # media file info
+                chunk,
+                None,
                 curr_msg_id,
                 curr_seq,
             )
@@ -381,24 +446,34 @@ class QQOutboundPusher:
 
         # 2. Send images
         for img in images:
-            url = img.get("url")
-            if not url:
+            data = img.get("data")
+            if not data and img.get("url"):
+                try:
+                    data = await loop.run_in_executor(
+                        None,
+                        self.client.download_bytes,
+                        img["url"],
+                        self.config.max_image_bytes,
+                    )
+                except Exception as e:
+                    print(f"[QQOutbound] Failed to download image {img['url']}: {e}")
+                    continue
+            if not data:
                 continue
+            if len(data) > self.config.max_image_bytes:
+                print(f"[QQOutbound] Image exceeds limit ({len(data)} > {self.config.max_image_bytes})")
+                continue
+
             try:
-                data = await loop.run_in_executor(
-                    None,
-                    self.client.download_bytes,
-                    url,
-                    self.config.max_image_bytes,
-                )
+                fname = img.get("filename") or "image.jpg"
                 file_info = await loop.run_in_executor(
                     None,
                     self.client.upload_media,
                     target_type,
                     target_id,
                     data,
-                    1,
-                    img.get("filename") or "image.jpg",
+                    1,  # 1=image
+                    fname,
                 )
                 use_passive = bool(msg_id and seq <= passive_limit)
                 curr_msg_id = msg_id if use_passive else None
@@ -422,6 +497,116 @@ class QQOutboundPusher:
                 )
                 seq += 1
             except Exception as e:
-                print(f"[QQOutbound] Failed to send image: {e}")
+                print(f"[QQOutbound] Failed to upload/send image: {e}")
+
+        # 3. Send videos
+        for vid in videos:
+            data = vid.get("data")
+            if not data and vid.get("url"):
+                try:
+                    data = await loop.run_in_executor(
+                        None,
+                        self.client.download_bytes,
+                        vid["url"],
+                        self.config.max_video_bytes,
+                    )
+                except Exception as e:
+                    print(f"[QQOutbound] Failed to download video {vid['url']}: {e}")
+                    continue
+            if not data:
+                continue
+            if len(data) > self.config.max_video_upload_bytes:
+                print(f"[QQOutbound] Video exceeds upload limit ({len(data)} > {self.config.max_video_upload_bytes})")
+                continue
+
+            try:
+                fname = vid.get("filename") or "video.mp4"
+                file_info = await loop.run_in_executor(
+                    None,
+                    self.client.upload_media,
+                    target_type,
+                    target_id,
+                    data,
+                    2,  # 2=video
+                    fname,
+                )
+                use_passive = bool(msg_id and seq <= passive_limit)
+                curr_msg_id = msg_id if use_passive else None
+                curr_seq = seq if use_passive else None
+
+                if not use_passive:
+                    if active_budget <= 0:
+                        break
+                    active_budget -= 1
+
+                await loop.run_in_executor(
+                    None,
+                    self.client.send_message,
+                    target_type,
+                    target_id,
+                    None,
+                    None,
+                    file_info,
+                    curr_msg_id,
+                    curr_seq,
+                )
+                seq += 1
+            except Exception as e:
+                print(f"[QQOutbound] Failed to upload/send video: {e}")
+
+        # 4. Send files
+        for fl in files:
+            data = fl.get("data")
+            if not data and fl.get("url"):
+                try:
+                    data = await loop.run_in_executor(
+                        None,
+                        self.client.download_bytes,
+                        fl["url"],
+                        self.config.max_file_bytes,
+                    )
+                except Exception as e:
+                    print(f"[QQOutbound] Failed to download file {fl['url']}: {e}")
+                    continue
+            if not data:
+                continue
+            if len(data) > self.config.max_file_bytes:
+                print(f"[QQOutbound] File exceeds limit ({len(data)} > {self.config.max_file_bytes})")
+                continue
+
+            try:
+                fname = fl.get("filename") or "file.dat"
+                file_info = await loop.run_in_executor(
+                    None,
+                    self.client.upload_media,
+                    target_type,
+                    target_id,
+                    data,
+                    4,  # 4=file
+                    fname,
+                )
+                use_passive = bool(msg_id and seq <= passive_limit)
+                curr_msg_id = msg_id if use_passive else None
+                curr_seq = seq if use_passive else None
+
+                if not use_passive:
+                    if active_budget <= 0:
+                        break
+                    active_budget -= 1
+
+                await loop.run_in_executor(
+                    None,
+                    self.client.send_message,
+                    target_type,
+                    target_id,
+                    None,
+                    None,
+                    file_info,
+                    curr_msg_id,
+                    curr_seq,
+                )
+                seq += 1
+            except Exception as e:
+                print(f"[QQOutbound] Failed to upload/send file: {e}")
 
         return True

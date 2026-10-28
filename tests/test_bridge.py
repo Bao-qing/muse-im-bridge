@@ -152,6 +152,36 @@ class TestMessageAndSplitter(unittest.TestCase):
         self.assertEqual(att.data, b"PNGDATA")
 
 
+class TestMediaExtraction(unittest.TestCase):
+    def test_extract_media_descriptors(self):
+        from muse_bridge.adapters.qq.outbound import _extract_media_descriptors, _clean_text
+        event = {
+            "role": "assistant",
+            "message_id": "mid_media",
+            "event_name": "message.assistant",
+            "display_text": "这是图片：![小猫](sandbox://workspace/imagine_media/cat.webp)\n这是代码：[test.py](sandbox://workspace/user/files/test.py)\n这是视频：[demo.mp4](sandbox://workspace/user/videos/demo.mp4)",
+            "payload": {}
+        }
+        images, files, videos = _extract_media_descriptors(event, event["display_text"])
+        self.assertEqual(len(images), 1)
+        self.assertEqual(images[0]["workspace_path"], "workspace/imagine_media/cat.webp")
+        self.assertEqual(images[0]["filename"], "小猫")
+
+        self.assertEqual(len(files), 1)
+        self.assertEqual(files[0]["workspace_path"], "workspace/user/files/test.py")
+        self.assertEqual(files[0]["filename"], "test.py")
+
+        self.assertEqual(len(videos), 1)
+        self.assertEqual(videos[0]["workspace_path"], "workspace/user/videos/demo.mp4")
+        self.assertEqual(videos[0]["filename"], "demo.mp4")
+
+        cleaned = _clean_text(event["display_text"])
+        self.assertNotIn("sandbox://", cleaned)
+        self.assertIn("这是图片：", cleaned)
+        self.assertIn("这是代码：", cleaned)
+        self.assertIn("这是视频：", cleaned)
+
+
 class TestDeduplicator(unittest.TestCase):
     def test_three_state_machine(self):
         with tempfile.TemporaryDirectory() as tmp:

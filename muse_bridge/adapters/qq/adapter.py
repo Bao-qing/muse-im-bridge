@@ -79,6 +79,7 @@ class QQAdapter(BaseAdapter):
         )
 
         self._login_sessions: Dict[Tuple[str, str, str], dict] = {}
+        self._chat_send_locks: Dict[Tuple[str, str], asyncio.Lock] = {}
         self._running = False
 
     async def _send_command_reply(
@@ -345,48 +346,43 @@ class QQAdapter(BaseAdapter):
             )
             return
 
-        # 2. Asynchronous User Message Ingestion (Non-blocking!)
-        loop = asyncio.get_running_loop()
+        # 2. Sequential Inbound Ingestion (Serialized per chat so slow files are never overtaken by later text!)
+        chat_key = (target_type, target_id)
+        chat_lock = self._chat_send_locks.setdefault(chat_key, asyncio.Lock())
 
-        # Download attachments if any
-        for att in attachments:
-            if att.url and not att.data:
-                max_cap = (
-                    self.config.max_video_bytes if att.type == "video"
-                    else self.config.max_file_bytes if att.type == "file"
-                    else self.config.max_image_bytes
-                )
-                try:
-                    att.data = await loop.run_in_executor(
-                        None, self.client.download_bytes, att.url, max_cap, self.config.download_timeout_s
+        async with chat_lock:
+            loop = asyncio.get_running_loop()
+
+            # Download attachments if any
+            for att in attachments:
+                if att.url and not att.data:
+                    max_cap = (
+                        self.config.max_video_bytes if att.type == "video"
+                        else self.config.max_file_bytes if att.type == "file"
+                        else self.config.max_image_bytes
                     )
-                except Exception as e:
-                    content += f"\n[{att.type}下载失败：{e}]"
+                    try:
+                        att.data = await loop.run_in_executor(
+                            None, self.client.download_bytes, att.url, max_cap, self.config.download_timeout_s
+                        )
+                    except Exception as e:
+                        content += f"\n[{att.type}下载失败：{e}]"
 
-        try:
-            # Post message to Muse immediately without waiting for generation!
-            sent_mid = await loop.run_in_executor(
-                None,
-                self.muse_service.post_message,
-                self.active_session_id,
-                content,
-                attachments,
-                self.config.file_ref_threshold_bytes,
-            )
+            try:
+                # Post message to Muse in strict chronological order
+                sent_mid = await loop.run_in_executor(
+                    None,
+                    self.muse_service.post_message,
+                    self.active_session_id,
+                    content,
+                    attachments,
+                    self.config.file_ref_threshold_bytes,
+                )
 
-            # Register route for outbound pusher
-            self.route_manager.register(sent_mid, target_type, target_id, msg_id)
-            if self.config.debug:
-                print(f"[QQAdapter] Message delivered to Muse (mid={sent_mid}), route registered for {target_type}:{target_id}")
-        except Exception as e:
-            print(f"[QQAdapter] Failed to post message to Muse: {e}")
-            await loop.run_in_executor(
-                None,
-                self.client.send_message,
-                target_type,
-                target_id,
-                f"转接出错了：{e}",
-                f"转接出错了：{e}",
-                None,
-                msg_id,
-            )
+                # Register route for outbound pusher
+                self.route_manager.register(sent_mid, target_type, target_id, msg_id)
+                if self.config.debug:
+                    print(f"[QQAdapter] Message delivered to Muse (mid={sent_mid}), route registered for {target_type}:{target_id}")
+            except Exception as e:
+                print(f"[QQAdapter] Failed to post message to Muse: {e}")
+                await self._send_command_reply(target_type, target_id, f"转接出错了：{e}", msg_id)
