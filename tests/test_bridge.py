@@ -58,6 +58,33 @@ class TestConfig(unittest.TestCase):
             self.assertEqual(target_type, "private")
             self.assertEqual(target_id, "PRIV_1")
 
+    def test_admin_id_and_push_default_to_admin(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg_path = os.path.join(tmp, "config.json")
+            with open(cfg_path, "w", encoding="utf-8") as f:
+                json.dump({
+                    "adapters": {
+                        "qq": {
+                            "app_id": "app",
+                            "admin_id": ["ADMIN_OPENID_1", "ADMIN_OPENID_2"],
+                            "whitelist": {"private": ["OTHER_USER"], "GRP_1": "*"},
+                            "push": {"enabled": True, "target_id": None}
+                        }
+                    },
+                    "gateway": {
+                        "login_through_adapter": "qq"
+                    }
+                }, f)
+            cfg = ConfigLoader.load(cfg_path)
+            self.assertEqual(cfg.qq.admin_id, ["ADMIN_OPENID_1", "ADMIN_OPENID_2"])
+            self.assertTrue(cfg.qq.is_admin("ADMIN_OPENID_1"))
+            self.assertFalse(cfg.qq.is_admin("OTHER_USER"))
+            # When push.target_id is not specified, defaults to admin!
+            target_type, target_id = cfg.qq.resolve_push_target()
+            self.assertEqual(target_type, "private")
+            self.assertEqual(target_id, "ADMIN_OPENID_1")
+            self.assertEqual(cfg.gateway.login_through_adapter, "qq")
+
     def test_explicit_push_target_override(self):
         qq = QQConfig(
             app_id="app",
