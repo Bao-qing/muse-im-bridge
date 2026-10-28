@@ -20,11 +20,11 @@ import ssl
 import threading
 from urllib.parse import unquote, urlparse
 
-WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
-UA = (
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/155.0.0.0 Safari/537.36"
-)
+from ...config import constants
+
+# Default fallbacks (configurable in config.json)
+WS_GUID = constants.DEFAULT_WS_GUID
+UA = constants.DEFAULT_USER_AGENT
 
 
 class QQWSError(Exception):
@@ -35,8 +35,8 @@ class QQWSClosed(QQWSError):
     pass
 
 
-def _expected_accept(key: str) -> str:
-    return base64.b64encode(hashlib.sha1((key + WS_GUID).encode()).digest()).decode()
+def _expected_accept(key: str, ws_guid: str = constants.DEFAULT_WS_GUID) -> str:
+    return base64.b64encode(hashlib.sha1((key + ws_guid).encode()).digest()).decode()
 
 
 def _build_frame(opcode: int, payload: bytes) -> bytes:
@@ -52,7 +52,14 @@ def _build_frame(opcode: int, payload: bytes) -> bytes:
     return header + mask + masked
 
 
-def _blocking_handshake(host: str, port: int, path: str, proxy_url: str | None = None):
+def _blocking_handshake(
+    host: str,
+    port: int,
+    path: str,
+    proxy_url: str | None = None,
+    ws_guid: str = constants.DEFAULT_WS_GUID,
+    user_agent: str = constants.DEFAULT_USER_AGENT,
+):
     if proxy_url:
         p = urlparse(proxy_url)
         s = socket.create_connection((p.hostname, p.port or 3128), timeout=20)
@@ -88,7 +95,7 @@ def _blocking_handshake(host: str, port: int, path: str, proxy_url: str | None =
         f"Connection: Upgrade\r\n"
         f"Sec-WebSocket-Key: {key}\r\n"
         f"Sec-WebSocket-Version: 13\r\n"
-        f"User-Agent: {UA}\r\n\r\n"
+        f"User-Agent: {user_agent}\r\n\r\n"
     )
     s.sendall(req.encode())
 
@@ -108,10 +115,12 @@ def _blocking_handshake(host: str, port: int, path: str, proxy_url: str | None =
         if b":" in line:
             k, v = line.split(b":", 1)
             headers[k.strip().lower().decode("latin-1")] = v.strip().decode("latin-1")
-    expected = _expected_accept(key)
-    actual = headers.get("sec-websocket-accept")
-    if actual != expected:
-        raise QQWSError(f"bad Sec-WebSocket-Accept: got {actual!r}, expected {expected!r}")
+    expected = _expected_accept(key, ws_guid)
+    if actual := headers.get("sec-websocket-accept"):
+        if actual != expected:
+            raise QQWSError(f"bad Sec-WebSocket-Accept: got {actual!r}, expected {expected!r}")
+    else:
+        raise QQWSError("missing Sec-WebSocket-Accept header")
 
     return s, leftover
 
@@ -133,7 +142,13 @@ class QQWebSocket:
         self._thread.start()
 
     @classmethod
-    async def connect(cls, url: str, proxy_url: str | None = None) -> QQWebSocket:
+    async def connect(
+        cls,
+        url: str,
+        proxy_url: str | None = None,
+        ws_guid: str = constants.DEFAULT_WS_GUID,
+        user_agent: str = constants.DEFAULT_USER_AGENT,
+    ) -> QQWebSocket:
         p = urlparse(url)
         host = p.hostname
         port = p.port or 443
@@ -141,7 +156,9 @@ class QQWebSocket:
         if p.query:
             path += "?" + p.query
         loop = asyncio.get_running_loop()
-        s, leftover = await loop.run_in_executor(None, _blocking_handshake, host, port, path, proxy_url)
+        s, leftover = await loop.run_in_executor(
+            None, _blocking_handshake, host, port, path, proxy_url, ws_guid, user_agent
+        )
         return cls(s, leftover, loop)
 
     def _io_loop(self, sock: ssl.SSLSocket, initial_buf: bytes):

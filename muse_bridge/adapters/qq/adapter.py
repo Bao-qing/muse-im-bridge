@@ -39,6 +39,7 @@ class QQAdapter(BaseAdapter):
             app_secret=self.config.app_secret,
             proxy_url=self.config.proxy_url,
             download_proxy=self.config.download_proxy,
+            user_agent=self.config.user_agent,
         )
 
         self.deduplicator = deduplicator or MessageDeduplicator(
@@ -61,6 +62,8 @@ class QQAdapter(BaseAdapter):
             on_event=self.handle_event,
             proxy_url=self.config.proxy_url,
             debug=self.config.debug,
+            ws_guid=self.config.ws_guid,
+            user_agent=self.config.user_agent,
         )
 
         # 2. Outbound Dispatcher (sole exit to QQ for both replies & proactive pushes)

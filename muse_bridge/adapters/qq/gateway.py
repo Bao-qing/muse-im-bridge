@@ -11,6 +11,7 @@ import json
 import time
 from typing import Any, Callable, Coroutine, Optional
 
+from ...config import constants
 from .client import QQClient
 from .ws_transport import QQWebSocket, QQWSClosed
 
@@ -25,11 +26,15 @@ class QQGateway:
         on_event: Callable[[str, dict], Coroutine[Any, Any, None]],
         proxy_url: Optional[str] = None,
         debug: bool = False,
+        ws_guid: str = constants.DEFAULT_WS_GUID,
+        user_agent: str = constants.DEFAULT_USER_AGENT,
     ):
         self.client = client
         self.on_event = on_event
         self.proxy_url = proxy_url
         self.debug = debug
+        self.ws_guid = ws_guid
+        self.user_agent = user_agent
 
         self._running = False
         self._ws: Optional[QQWebSocket] = None
@@ -46,7 +51,12 @@ class QQGateway:
                 gateway_url = self.client.get_gateway_url()
                 if self.debug:
                     print(f"[QQGateway] Connecting to {gateway_url}...")
-                self._ws = await QQWebSocket.connect(gateway_url, proxy_url=self.proxy_url)
+                self._ws = await QQWebSocket.connect(
+                    gateway_url,
+                    proxy_url=self.proxy_url,
+                    ws_guid=self.ws_guid,
+                    user_agent=self.user_agent,
+                )
                 backoff = 1.0  # Reset backoff on successful connect
                 await self._session_loop()
             except (QQWSClosed, asyncio.CancelledError) as e:

@@ -49,3 +49,10 @@ DEFAULT_RECONNECT_SLEEP_S = 5
 
 # Network Specific Workarounds
 BLOCKED_DOWNLOAD_HOST = "multimedia.nt.qq.com.cn"
+
+# WebSocket & HTTP Client Protocol Defaults
+DEFAULT_WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+DEFAULT_USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/155.0.0.0 Safari/537.36"
+)
