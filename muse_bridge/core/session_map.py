@@ -50,6 +50,11 @@ class SessionMapper:
         self._id_factory = id_factory
         self._lock = threading.RLock()
         self._global_sid = global_session_id
+        if not self.per_chat and not self._global_sid:
+            self._global_sid = self._id_factory()
+            if self.global_state_file:
+                from .commands import CommandHandler
+                CommandHandler.save_session_id(self.global_state_file, self._global_sid)
         self._map: Dict[str, str] = {}
         self._config_bindings: Dict[str, str] = {
             str(k): str(v) for k, v in (bindings or {}).items() if k and v
