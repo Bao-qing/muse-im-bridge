@@ -94,6 +94,21 @@ class QQConfig:
     download_proxy: str = ""
     debug: bool = False
 
+    # Session isolation: "global" (all chats share one Muse session, legacy)
+    # or "per_chat" (each group / private user gets its own Muse session).
+    session_mode: str = "global"
+    session_map_file: str = "qq_session_map.json"
+    # Optional pre-seeded bindings, e.g. {"group:<openid>": "<muse session id>"}
+    session_bindings: Dict[str, str] = dataclasses.field(default_factory=dict)
+    # per_chat only: route unsolicited events (reminders, background tasks)
+    # to the chat that owns the session instead of the admin private chat.
+    proactive_to_session_owner: bool = True
+    # per_chat only: keep fetching a session's history this long after the last
+    # detected activity (covers streaming replies), and do a full sweep every
+    # `session_sweep_s` as a safety net.
+    session_hot_window_s: int = 45
+    session_sweep_s: int = 60
+
     # Chunking & budget
     chunk_chars: int = constants.DEFAULT_CHUNK_CHARS
     max_chunks: int = constants.DEFAULT_MAX_CHUNKS
@@ -323,6 +338,14 @@ class ConfigLoader:
             proxy_url=q_raw.get("proxy_url") or muse_cfg.proxy_url,
             download_proxy=q_raw.get("download_proxy") or "",
             debug=q_raw.get("debug", False) or _env_bool("QQ_DEBUG", False),
+            session_mode=str(q_raw.get("session_mode") or "global").strip().lower(),
+            session_map_file=q_raw.get("session_map_file", "qq_session_map.json"),
+            session_bindings={
+                str(k): str(v) for k, v in (q_raw.get("session_bindings") or {}).items() if k and v
+            },
+            proactive_to_session_owner=bool(q_raw.get("proactive_to_session_owner", True)),
+            session_hot_window_s=int(q_raw.get("session_hot_window_s", 45)),
+            session_sweep_s=int(q_raw.get("session_sweep_s", 60)),
             chunk_chars=int(_get_val(q_raw, "chunk_chars", constants.DEFAULT_CHUNK_CHARS)),
             max_chunks=int(_get_val(q_raw, "max_chunks", constants.DEFAULT_MAX_CHUNKS)),
             max_active_chunks=int(_get_val(q_raw, "max_active_chunks", constants.DEFAULT_MAX_ACTIVE_CHUNKS)),

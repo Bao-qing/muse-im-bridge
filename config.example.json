@@ -13,6 +13,9 @@
         "YOUR_ADMIN_OPENID"
       ],
       "admin_only": true,
+      "session_mode": "global",
+      "session_bindings": {},
+      "proactive_to_session_owner": true,
       "whitelist": {
         "private": [
           "YOUR_C2C_OPENID"

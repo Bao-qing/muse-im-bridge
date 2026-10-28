@@ -216,3 +216,25 @@ python -m unittest discover tests
   }
 }
 ```
+
+## 会话隔离（`session_mode`）
+
+QQ 适配器支持两种会话模式，通过 `adapters.qq.session_mode` 选择：
+
+| 模式 | 行为 |
+| :--- | :--- |
+| `global`（默认） | 所有群聊/私聊共用同一个 Muse 会话（`qq_session.json` / `muse.session_id`），与旧版完全一致 |
+| `per_chat` | 每个群、每个私聊用户各自独立一个 Muse 会话，互不可见 |
+
+`per_chat` 相关选项：
+
+- `session_map_file`（默认 `qq_session_map.json`）：`群/私聊 -> Muse session_id` 映射，重启后保持。
+- `session_bindings`：预置绑定，键为 `group:<group_openid>` 或 `private:<user_openid>`，值为已有的 Muse `session_id`。
+- `proactive_to_session_owner`（默认 `true`）：提醒等无对应提问的主动消息，推回该会话所属的群/私聊；设为 `false` 则仍推给管理员私聊。
+- `session_hot_window_s` / `session_sweep_s`：出站检测参数（见下）。
+
+行为说明：
+
+- 首次收到某个群/私聊的消息时自动新建会话（新 UUID）；`/new`、`/switch` 只改变发指令的这个群/私聊。
+- 出站不会轮询所有会话历史：每轮只调用一次 `/api/session/list`，按 `updated_at_ms` 变化判断哪个会话有新活动（等价于网页端的 `sessions.updated` 事件），只拉取有变化或刚发过消息的会话历史。
+- 运行中切换到已有会话时，会先把该会话旧消息标记为已读，不会回放历史。
