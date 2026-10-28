@@ -2,9 +2,11 @@
 config.json
 credentials.json
 const.json
-cookies.json
+cookies*.json
 .mint.json
 *.bak*
+tools/login_flow/
+tools/req_*.json
 
 # Environment & local settings
 .env
