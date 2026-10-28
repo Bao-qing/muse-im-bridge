@@ -29,6 +29,11 @@ def parse_args(argv=None):
         action="store_true",
         help="Validate configuration and credentials without connecting to live gateways",
     )
+    parser.add_argument(
+        "--login",
+        action="store_true",
+        help="Run interactive pure-protocol login to acquire new cookies.json",
+    )
     return parser.parse_args(argv)
 
 
@@ -42,7 +47,17 @@ def main(argv=None) -> int:
         print(f"Error loading configuration: {e}", file=sys.stderr)
         return 1
 
-    # 2. Check mode: print sanitized status
+    # 2. Login mode
+    if args.login:
+        from muse_bridge.muse.login import run_protocol_login
+        try:
+            run_protocol_login(output_path=config.muse.cookies_file)
+            return 0
+        except Exception as e:
+            print(f"[MuseLogin] 登录失败：{e}", file=sys.stderr)
+            return 1
+
+    # 3. Check mode: print sanitized status
     if args.check:
         print("=== Muse Bridge Configuration Check ===")
         print(f"Muse Host:      {config.muse.host}")

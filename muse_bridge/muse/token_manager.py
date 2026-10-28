@@ -224,9 +224,20 @@ class MuseTokenManager:
         exp = self.notary_expiry(self._notary_token)
         return exp is None or time.time() < exp - 60
 
-    def refresh_from_cookies(self) -> Tuple[str, str, str]:
+    def refresh_from_cookies(self, interactive: bool = True) -> Tuple[str, str, str]:
         """Mint new tokens using cookies and save to mint_file atomically."""
         cookie = self.load_cookie_string()
+        if not cookie and interactive and sys.stdin.isatty():
+            print(f"[Muse] Cookies 文件 ({self.cookies_file}) 不存在或为空。")
+            try:
+                choice = input("是否立即通过纯协议登录获取新 Cookies？(y/n): ").strip().lower()
+                if choice in ("y", "yes"):
+                    from .login import run_protocol_login
+                    run_protocol_login(output_path=self.cookies_file)
+                    cookie = self.load_cookie_string()
+            except Exception as e:
+                print(f"[Muse] 登录流程失败或取消：{e}")
+
         if not cookie:
             raise RuntimeError(
                 f"cookies file {self.cookies_file} not found or empty (cannot refresh mint)"
