@@ -65,6 +65,9 @@ class QQPushConfig:
     enabled: bool = True
     target_type: str = "private"  # "private" or "group"
     target_id: Optional[str] = None  # None -> auto-select first private openid from whitelist
+    catch_up_enabled: bool = constants.DEFAULT_CATCH_UP_ENABLED
+    catch_up_window_s: int = constants.DEFAULT_CATCH_UP_WINDOW_S
+    catch_up_max_messages: int = constants.DEFAULT_CATCH_UP_MAX_MESSAGES
     in_flight_ttl_s: int = constants.DEFAULT_IN_FLIGHT_TTL_S
     processing_ttl_s: int = constants.DEFAULT_PROCESSING_TTL_S
     periodic_scan_s: int = constants.DEFAULT_PERIODIC_SCAN_S
@@ -261,6 +264,9 @@ class ConfigLoader:
             enabled=p_raw.get("enabled", True),
             target_type=p_raw.get("target_type", "private"),
             target_id=p_raw.get("target_id") or p_raw.get("target_user_openid") or p_raw.get("target_group_openid"),
+            catch_up_enabled=bool(_get_val(p_raw, "catch_up_enabled", constants.DEFAULT_CATCH_UP_ENABLED)),
+            catch_up_window_s=int(_get_val(p_raw, "catch_up_window_s", constants.DEFAULT_CATCH_UP_WINDOW_S)),
+            catch_up_max_messages=int(_get_val(p_raw, "catch_up_max_messages", constants.DEFAULT_CATCH_UP_MAX_MESSAGES)),
             in_flight_ttl_s=int(_get_val(p_raw, "in_flight_ttl_s", constants.DEFAULT_IN_FLIGHT_TTL_S)),
             processing_ttl_s=int(_get_val(p_raw, "processing_ttl_s", constants.DEFAULT_PROCESSING_TTL_S)),
             periodic_scan_s=int(_get_val(p_raw, "periodic_scan_s", constants.DEFAULT_PERIODIC_SCAN_S)),

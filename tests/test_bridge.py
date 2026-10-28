@@ -225,6 +225,52 @@ class TestRouteManager(unittest.TestCase):
         self.assertIsNone(rm.pop("mid_123"))
 
 
+class TestGateCatchUp(unittest.TestCase):
+    def test_baseline_when_disabled(self):
+        from muse_bridge.adapters.qq.outbound import gate_catch_up
+        hist = [
+            {"role": "assistant", "message_id": "m1", "seq": 1},
+            {"role": "assistant", "message_id": "m2", "seq": 2},
+        ]
+        seen_ids, action, kept, skipped, max_seq, reason = gate_catch_up(
+            hist=hist,
+            seen_ids=set(),
+            last_ts=time.time(),
+            now=time.time(),
+            enabled=False,
+            window_s=3600,
+            max_messages=5,
+        )
+        self.assertEqual(action, "baseline")
+        self.assertEqual(kept, 0)
+        self.assertEqual(skipped, 2)
+        self.assertIn("m1", seen_ids)
+        self.assertIn("m2", seen_ids)
+
+    def test_catch_up_within_window(self):
+        from muse_bridge.adapters.qq.outbound import gate_catch_up
+        hist = [
+            {"role": "assistant", "message_id": f"m{i}", "seq": i} for i in range(1, 10)
+        ]
+        seen_ids, action, kept, skipped, max_seq, reason = gate_catch_up(
+            hist=hist,
+            seen_ids=set(),
+            last_ts=time.time() - 60,
+            now=time.time(),
+            enabled=True,
+            window_s=3600,
+            max_messages=3,
+        )
+        self.assertEqual(action, "catch_up")
+        self.assertEqual(kept, 3)
+        self.assertEqual(skipped, 6)
+        self.assertNotIn("m7", seen_ids)
+        self.assertNotIn("m8", seen_ids)
+        self.assertNotIn("m9", seen_ids)
+        for i in range(1, 7):
+            self.assertIn(f"m{i}", seen_ids)
+
+
 class TestOneBotClient(unittest.TestCase):
     @mock.patch("urllib.request.urlopen")
     def test_send_group_msg_array_format(self, mock_urlopen):

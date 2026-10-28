@@ -48,6 +48,58 @@ def _extract_images_from_payload(payload: dict) -> List[dict]:
     return out
 
 
+def gate_catch_up(
+    hist: List[dict],
+    seen_ids: Set[str],
+    last_ts: Optional[float],
+    now: float,
+    enabled: bool,
+    window_s: int,
+    max_messages: int,
+) -> Tuple[Set[str], str, int, int, int, str]:
+    """Startup catch-up gate.
+
+    Determines whether unseen messages from a previous session should be pushed.
+    Returns (seen_ids, action, kept_count, skipped_count, max_seq, reason).
+    """
+    all_assistant_ids = {
+        e.get("message_id")
+        for e in hist
+        if e.get("role") == "assistant" and e.get("message_id")
+    }
+    max_seq = max([e.get("seq") or 0 for e in hist] or [0])
+
+    if not enabled:
+        reason = "catch-up disabled"
+    elif last_ts is None:
+        reason = "no last-run timestamp"
+    elif window_s <= 0 or max_messages <= 0:
+        reason = "catch-up window/max is 0"
+    elif now - last_ts > window_s:
+        reason = f"gap {now - last_ts:.0f}s exceeds window {window_s}s"
+    else:
+        reason = ""
+
+    if reason:
+        return seen_ids | all_assistant_ids, "baseline", 0, len(all_assistant_ids - seen_ids), max_seq, reason
+
+    unseen = sorted(
+        [
+            e
+            for e in hist
+            if e.get("role") == "assistant"
+            and e.get("message_id")
+            and e.get("message_id") not in seen_ids
+        ],
+        key=lambda e: e.get("seq") or 0,
+    )
+    kept = unseen[-max_messages:]
+    kept_ids = {e.get("message_id") for e in kept}
+    skipped = {e.get("message_id") for e in unseen} - kept_ids
+
+    return seen_ids | skipped, "catch_up", len(kept_ids), len(skipped), max_seq, ""
+
+
 class QQOutboundPusher:
     def __init__(
         self,
@@ -68,6 +120,7 @@ class QQOutboundPusher:
         self._running = False
         self._seen_ids: Set[str] = set()
         self._last_seq: int = 0
+        self._last_ts: Optional[float] = None
         self._load_state()
 
     def _load_state(self) -> None:
@@ -78,6 +131,7 @@ class QQOutboundPusher:
                     data = json.load(f)
                     self._last_seq = int(data.get("last_seq", 0))
                     self._seen_ids = set(data.get("seen_ids", []))
+                    self._last_ts = data.get("updated_ts")
             except Exception:
                 pass
 
@@ -89,7 +143,11 @@ class QQOutboundPusher:
         try:
             with open(tmp, "w", encoding="utf-8") as f:
                 json.dump(
-                    {"last_seq": self._last_seq, "seen_ids": list(self._seen_ids)[-2000:]},
+                    {
+                        "last_seq": self._last_seq,
+                        "seen_ids": list(self._seen_ids)[-2000:],
+                        "updated_ts": time.time(),
+                    },
                     f,
                     ensure_ascii=False,
                     indent=2,
@@ -124,6 +182,7 @@ class QQOutboundPusher:
 
     async def _run_loop(self) -> None:
         loop = asyncio.get_running_loop()
+        startup_gated = False
 
         while self._running:
             try:
@@ -134,18 +193,27 @@ class QQOutboundPusher:
 
                 hist = await loop.run_in_executor(None, _fetch)
                 if hist:
-                    # Baseline on initial run if last_seq is 0
-                    if self._last_seq == 0:
-                        for item in hist:
-                            mid = item.get("message_id")
-                            if mid:
-                                self._seen_ids.add(mid)
-                            seq = item.get("seq", 0)
-                            if seq > self._last_seq:
-                                self._last_seq = seq
-                        self._save_state()
-                    else:
-                        await self._scan_and_dispatch(hist)
+                    if not startup_gated:
+                        startup_gated = True
+                        seen_ids, action, kept, skipped, max_seq, reason = gate_catch_up(
+                            hist=hist,
+                            seen_ids=self._seen_ids,
+                            last_ts=self._last_ts,
+                            now=time.time(),
+                            enabled=self.config.push.catch_up_enabled,
+                            window_s=self.config.push.catch_up_window_s,
+                            max_messages=self.config.push.catch_up_max_messages,
+                        )
+                        self._seen_ids = seen_ids
+                        if action == "baseline":
+                            self._last_seq = max(self._last_seq, max_seq)
+                            self._save_state()
+                            if self.config.debug:
+                                print(f"[QQOutbound] Startup baseline ({reason}): marked {skipped} messages seen, 0 pushed.")
+                        else:
+                            print(f"[QQOutbound] Startup catch-up: recovering up to {kept} recent message(s) (skipped {skipped} older).")
+
+                    await self._scan_and_dispatch(hist)
             except asyncio.CancelledError:
                 break
             except Exception as e:
