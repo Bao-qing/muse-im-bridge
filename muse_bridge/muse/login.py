@@ -4,7 +4,7 @@ Executes the complete Meta/Muse native OTP authentication protocol:
 1. Performs HTTP/2 SSO handshake with auth.muse.ai to acquire initial CSRF and datr cookies.
 2. Calls /api/auth/native/restart to establish auth state and CSRF token.
 3. Calls /api/auth/native/send-otp to trigger 6-digit email verification code.
-4. Calls /api/auth/native/confirm-otp with the verification code.
+4. Calls /api/auth/native/confirm-otp with the user-provided verification code.
 5. Captures and exports the resulting hatch_sess session cookies to JSON.
 """
 
@@ -12,11 +12,9 @@ from __future__ import annotations
 
 import json
 import os
-import re
-import subprocess
 import time
 import uuid
-from typing import Dict, List, Optional
+from typing import Dict, Optional
 
 import httpx
 
@@ -36,31 +34,6 @@ _BASE_HEADERS = {
     "Sec-Fetch-User": "?1",
     "Upgrade-Insecure-Requests": "1",
 }
-
-
-def try_fetch_agent_mail_otp() -> Optional[str]:
-    """Check recent emails via agently-cli to automatically capture OTP code."""
-    try:
-        res = subprocess.run(
-            "agently-cli message +list --limit 2",
-            shell=True,
-            capture_output=True,
-            text=True,
-            timeout=10,
-        )
-        if res.returncode == 0:
-            data = json.loads(res.stdout)
-            messages = data.get("data", {}).get("data", [])
-            for msg in messages:
-                snippet = msg.get("snippet", "")
-                subject = msg.get("subject", "")
-                if "验证" in subject or "验证码" in snippet or "登录" in subject:
-                    m = re.search(r"([0-9]{6})", snippet)
-                    if m:
-                        return m.group(1)
-    except Exception:
-        pass
-    return None
 
 
 class MuseProtocolLogin:
@@ -105,7 +78,7 @@ class MuseProtocolLogin:
         # Call /restart
         r1 = self.client.post(f"{self.base_url}/api/auth/native/restart", headers=self._api_headers(), json={})
         if r1.status_code != 201:
-            raise RuntimeError(f"failed to initialize native auth ({r1.status_code}): {r1.text}")
+            raise RuntimeError(f"初始化认证失败 ({r1.status_code}): {r1.text}")
 
         self.csrf_token = r1.json().get("csrf_token")
         if not self.csrf_token:
@@ -122,7 +95,7 @@ class MuseProtocolLogin:
             json={"contact_point": email.strip(), "region": region},
         )
         if r2.status_code != 201:
-            raise RuntimeError(f"failed to send OTP to {email} ({r2.status_code}): {r2.text}")
+            raise RuntimeError(f"验证码发送失败 ({r2.status_code}): {r2.text}")
 
         return r2.json()
 
@@ -134,19 +107,19 @@ class MuseProtocolLogin:
             json={"otp_code": otp_code.strip(), "remember_device": True},
         )
         if r.status_code != 200:
-            raise RuntimeError(f"OTP confirmation failed ({r.status_code}): {r.text}")
+            raise RuntimeError(f"验证码校验失败 ({r.status_code}): {r.text}")
 
         data = r.json()
 
-        # If registration completion is required (new account without name/birthday):
+        # If registration completion is required (new account without profile):
         if data.get("registration_state") == "completion_required":
             r_comp = self.client.post(
                 f"{self.base_url}/api/auth/native/register-completion",
                 headers=self._api_headers(),
                 json={
                     "date_of_birth": "2000-01-01",
-                    "first_name": "保清",
-                    "last_name": "秦",
+                    "first_name": "Muse",
+                    "last_name": "User",
                     "tos_content_version": "ntm_create_account:default_v1_meta_account_v2+docs_v1",
                     "remember_device": True,
                 },
@@ -157,7 +130,7 @@ class MuseProtocolLogin:
         return data
 
     def extract_cookies(self) -> Dict[str, str]:
-        """Extract all cookies for muse.ai as a dict and a concatenated header string."""
+        """Extract all cookies for muse.ai as a concatenated header string."""
         cookies_dict = {}
         for cookie in self.client.cookies.jar:
             if "muse.ai" in cookie.domain and cookie.value:
@@ -169,8 +142,7 @@ class MuseProtocolLogin:
 
 def run_protocol_login(
     email: Optional[str] = None,
-    output_path: str = "cookies_test.json",
-    auto_otp: bool = True,
+    output_path: str = "cookies.json",
 ) -> Dict[str, str]:
     """Interactive protocol login runner."""
     if not email:
@@ -178,39 +150,25 @@ def run_protocol_login(
     if not email:
         raise ValueError("邮箱地址不能为空")
 
-    print(f"[MuseLogin] 正在通过纯 HTTP/2 协议登录 (邮箱: {email})...")
+    print(f"[MuseLogin] 正在请求发送验证码至 {email}...")
     auth = MuseProtocolLogin()
-
-    print("[MuseLogin] 正在请求发送验证码...")
     auth.send_otp(email)
-    print(f"[MuseLogin] 验证码已成功发送至 {email}！")
+    print(f"[MuseLogin] 验证码已成功发送至 {email}，请查收邮件！")
 
-    otp_code = None
-    if email.endswith("@agent.qq.com") and auto_otp:
-        print("[MuseLogin] 检测到 Agent Mail，等待邮件到达并自动提取验证码...")
-        for _ in range(15):
-            time.sleep(2)
-            otp_code = try_fetch_agent_mail_otp()
-            if otp_code:
-                print(f"[MuseLogin] 自动获取到验证码: {otp_code}")
-                break
-
-    if not otp_code:
-        otp_code = input("请输入收到的 6 位数验证码: ").strip()
-
+    otp_code = input("请输入收到的 6 位数验证码: ").strip()
     if not otp_code or len(otp_code) != 6:
         raise ValueError(f"验证码格式不正确：{otp_code}")
 
-    print("[MuseLogin] 正在提交验证码并换取会话 Cookies...")
+    print("[MuseLogin] 正在提交验证码并获取会话 Cookies...")
     auth.confirm_otp(otp_code)
 
     cookies_data = auth.extract_cookies()
     if "hatch_sess" not in cookies_data.get("cookie", ""):
-        print("[MuseLogin] 警告: 当前返回未显式包含 hatch_sess（账号可能处于等候名单或需进一步核验）。")
+        print("[MuseLogin] 提示: 返回结果未包含 hatch_sess（账号可能处于等候名单或需进一步核验）。")
 
     with open(output_path, "w", encoding="utf-8") as f:
         json.dump(cookies_data, f, indent=2, ensure_ascii=False)
         f.write("\n")
 
-    print(f"[MuseLogin] 纯协议登录成功！Cookies 已保存至: {output_path}")
+    print(f"[MuseLogin] 登录成功！Cookies 已保存至: {output_path}")
     return cookies_data

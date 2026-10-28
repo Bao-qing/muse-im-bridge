@@ -12,6 +12,7 @@
       "admin_id": [
         "YOUR_ADMIN_OPENID"
       ],
+      "admin_only": true,
       "whitelist": {
         "private": [
           "YOUR_C2C_OPENID"
@@ -27,13 +28,13 @@
     },
     "onebot": {
       "enabled": false,
-      "base_url": "https://onebot.example.com:81",
+      "base_url": "https://onebot.example.com",
       "access_token": "YOUR_ONEBOT_TOKEN",
-      "ws_url": "wss://onebot.example.com:81",
-      "target_group_id": 300000002,
+      "ws_url": "wss://onebot.example.com",
+      "target_group_id": null,
       "whitelist": {
         "private": [],
-        "groups": [300000002]
+        "groups": []
       }
     }
   },

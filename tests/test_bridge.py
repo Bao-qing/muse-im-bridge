@@ -84,6 +84,23 @@ class TestConfig(unittest.TestCase):
             self.assertEqual(target_type, "private")
             self.assertEqual(target_id, "ADMIN_OPENID_1")
             self.assertEqual(cfg.gateway.login_through_adapter, "qq")
+            self.assertTrue(cfg.qq.admin_only)
+
+    def test_admin_only_switch(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg_path = os.path.join(tmp, "config.json")
+            with open(cfg_path, "w", encoding="utf-8") as f:
+                json.dump({
+                    "adapters": {
+                        "qq": {
+                            "app_id": "app",
+                            "admin_id": ["ADMIN_1"],
+                            "admin_only": False
+                        }
+                    }
+                }, f)
+            cfg = ConfigLoader.load(cfg_path)
+            self.assertFalse(cfg.qq.admin_only)
 
     def test_explicit_push_target_override(self):
         qq = QQConfig(
@@ -305,15 +322,15 @@ class TestOneBotClient(unittest.TestCase):
         mock_resp.read.return_value = json.dumps({"status": "ok", "retcode": 0, "data": {"message_id": 999}}).encode()
         mock_urlopen.return_value.__enter__.return_value = mock_resp
 
-        client = OneBotClient(base_url="https://onebot.example.com:81", access_token="test_tok")
-        res = client.send_group_msg(group_id=300000002, text="Hello NapCat!")
+        client = OneBotClient(base_url="http://127.0.0.1:3000", access_token="test_tok")
+        res = client.send_group_msg(group_id=10001, text="Hello NapCat!")
         self.assertEqual(res["retcode"], 0)
 
         # Inspect request payload
         req = mock_urlopen.call_args[0][0]
         self.assertEqual(req.headers["Authorization"], "Bearer test_tok")
         payload = json.loads(req.data.decode("utf-8"))
-        self.assertEqual(payload["group_id"], 300000002)
+        self.assertEqual(payload["group_id"], 10001)
         self.assertEqual(payload["message"], [{"type": "text", "data": {"text": "Hello NapCat!"}}])
 
 

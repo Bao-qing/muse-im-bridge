@@ -10,7 +10,9 @@ Completely decouples Inbound message reception from Outbound delivery:
 from __future__ import annotations
 
 import asyncio
+import json
 import re
+import time
 from typing import Dict, List, Optional, Tuple
 
 from ...config.models import QQConfig
@@ -76,7 +78,7 @@ class QQAdapter(BaseAdapter):
             session_id=self.active_session_id,
         )
 
-        self._admin_login_sessions: Dict[str, dict] = {}
+        self._login_sessions: Dict[Tuple[str, str, str], dict] = {}
         self._running = False
 
     async def _send_command_reply(
@@ -87,7 +89,7 @@ class QQAdapter(BaseAdapter):
         msg_id: Optional[str] = None,
     ) -> None:
         loop = asyncio.get_running_loop()
-        await loop.run_in_executor(
+        code, body = await loop.run_in_executor(
             None,
             self.client.send_message,
             target_type,
@@ -96,7 +98,18 @@ class QQAdapter(BaseAdapter):
             reply,
             None,
             msg_id,
+            1 if msg_id else None,
         )
+        if not (200 <= code < 300):
+            # Fall back to active send so command replies are never dropped
+            await loop.run_in_executor(
+                None,
+                self.client.send_message,
+                target_type,
+                target_id,
+                reply,
+                reply,
+            )
 
     @property
     def name(self) -> str:
@@ -199,17 +212,16 @@ class QQAdapter(BaseAdapter):
 
         author = d.get("author", {})
         user_openid = author.get("user_openid") or author.get("id") or ""
-        is_private = (event_type == "C2C_MESSAGE_CREATE")
-        is_admin = is_private and self.config.is_admin(user_openid)
+        session_key = (target_type, target_id, user_openid)
 
-        # 0. Ongoing Admin Login Session in private chat
-        if is_admin and user_openid in self._admin_login_sessions:
-            session = self._admin_login_sessions[user_openid]
+        # 0. Ongoing Login Session (both group & private supported)
+        if session_key in self._login_sessions:
+            session = self._login_sessions[session_key]
             if time.time() - session["timestamp"] > 300:
-                del self._admin_login_sessions[user_openid]
+                del self._login_sessions[session_key]
             else:
                 if content.lower() in ("/cancel", "取消", "退出"):
-                    del self._admin_login_sessions[user_openid]
+                    del self._login_sessions[session_key]
                     await self._send_command_reply(target_type, target_id, "【系统提示】登录流程已取消。", msg_id)
                     return
 
@@ -225,14 +237,17 @@ class QQAdapter(BaseAdapter):
                         with open(cookies_path, "w", encoding="utf-8") as f:
                             json.dump(cookies_data, f, indent=2, ensure_ascii=False)
                             f.write("\n")
-                        await loop.run_in_executor(None, self.muse_service.token_manager.refresh_from_cookies)
-                        del self._admin_login_sessions[user_openid]
-                        await self._send_command_reply(
-                            target_type,
-                            target_id,
-                            f"【登录成功】已成功更新会话 Cookies ({cookies_path}) 并刷新凭据，Muse 服务已恢复正常！",
-                            msg_id,
-                        )
+                        del self._login_sessions[session_key]
+                        try:
+                            await loop.run_in_executor(None, self.muse_service.token_manager.refresh_from_cookies)
+                            reply = f"【登录成功】已成功更新会话 Cookies ({cookies_path}) 并刷新凭据，Muse 服务已恢复正常！"
+                        except Exception as refresh_err:
+                            msg_str = str(refresh_err)
+                            if "cannot resolve vm_id" in msg_str or "not found in page HTML" in msg_str:
+                                reply = f"【登录提示】验证码校验成功，Cookies 已保存至 {cookies_path}。\n但该账号目前处于等候名单（Waitlist），尚未分配虚拟机（VM），请等待官方审核放行。"
+                            else:
+                                reply = f"【登录提示】Cookies 已保存，但刷新 Token 提示：{refresh_err}"
+                        await self._send_command_reply(target_type, target_id, reply, msg_id)
                     except Exception as e:
                         await self._send_command_reply(
                             target_type,
@@ -255,38 +270,38 @@ class QQAdapter(BaseAdapter):
         if parsed is not None:
             cmd_name, cmd_args = parsed
 
-            # A) Admin-only /login command
+            # Check admin-only permission switch
+            admin_cmds = {"login", "switch", "delete", "rename", "archive", "unarchive", "new"}
+            if self.config.admin_only and cmd_name in admin_cmds and not is_admin:
+                await self._send_command_reply(
+                    target_type,
+                    target_id,
+                    "权限不足：管理指令仅限管理员在私聊中执行（如需在群聊中使用，可在配置中设置 admin_only: false）。",
+                    msg_id,
+                )
+                return
+
+            # /login command
             if cmd_name == "login":
-                if not is_admin:
-                    await self._send_command_reply(target_type, target_id, "权限不足：登录认证仅限管理员在私聊中执行。", msg_id)
-                    return
                 email = cmd_args.strip()
                 if not email or "@" not in email:
                     await self._send_command_reply(target_type, target_id, "用法：/login <邮箱地址>\n示例：/login user@example.com", msg_id)
                     return
                 from ...muse.login import MuseProtocolLogin
-                base = f"https://{self.muse_service.config.host}" if "://" not in self.muse_service.config.host else self.muse_service.config.host
-                auth = MuseProtocolLogin(base_url=base)
+                auth = MuseProtocolLogin(base_url="https://muse.ai")
                 loop = asyncio.get_running_loop()
                 try:
                     await loop.run_in_executor(None, auth.send_otp, email)
-                    self._admin_login_sessions[user_openid] = {
+                    self._login_sessions[session_key] = {
                         "auth": auth,
                         "email": email,
                         "timestamp": time.time(),
                     }
-                    reply = f"【登录流程】验证码已成功发送至 {email}。\n请直接在此私聊回复收到的 6 位数验证码完成登录（或发送 /cancel 取消）："
+                    reply = f"【登录流程】验证码已成功发送至 {email}。\n请直接回复收到的 6 位数验证码完成登录（或发送 /cancel 取消）："
                 except Exception as e:
                     reply = f"【发送验证码失败】：{e}"
                 await self._send_command_reply(target_type, target_id, reply, msg_id)
                 return
-
-            # B) Admin-only check for sensitive management commands
-            admin_cmds = {"switch", "delete", "rename", "archive", "unarchive", "new"}
-            if cmd_name in admin_cmds:
-                if self.config.admin_id and not is_admin:
-                    await self._send_command_reply(target_type, target_id, "权限不足：管理指令仅限管理员在私聊中执行。", msg_id)
-                    return
 
             loop = asyncio.get_running_loop()
             client = None

@@ -84,6 +84,7 @@ class QQConfig:
     app_id: str = ""
     app_secret: str = ""
     admin_id: List[str] = dataclasses.field(default_factory=list)
+    admin_only: bool = constants.DEFAULT_ADMIN_ONLY
     session_id: str = ""
     whitelist: Dict[str, Union[List[str], str]] = dataclasses.field(default_factory=dict)
     push: QQPushConfig = dataclasses.field(default_factory=QQPushConfig)
@@ -188,10 +189,10 @@ class QQConfig:
 @dataclasses.dataclass
 class OneBotConfig:
     enabled: bool = False
-    base_url: str = "https://onebot.example.com:81"
-    access_token: str = "REDACTED_ONEBOT_TOKEN"
-    ws_url: str = "wss://onebot.example.com:81"
-    target_group_id: Optional[int] = 300000002
+    base_url: str = ""
+    access_token: str = ""
+    ws_url: str = ""
+    target_group_id: Optional[int] = None
     session_id: str = ""
     whitelist: Dict[str, Any] = dataclasses.field(default_factory=dict)
 
@@ -313,6 +314,7 @@ class ConfigLoader:
             app_id=str(q_raw.get("app_id") or os.environ.get("QQ_APP_ID") or ""),
             app_secret=str(q_raw.get("app_secret") or os.environ.get("QQ_APP_SECRET") or ""),
             admin_id=admin_ids,
+            admin_only=bool(_get_val(q_raw, "admin_only", constants.DEFAULT_ADMIN_ONLY)),
             session_id=str(q_raw.get("session_id") or muse_cfg.session_id or ""),
             whitelist=q_raw.get("whitelist") or {},
             push=push_cfg,
@@ -344,22 +346,17 @@ class ConfigLoader:
         ob_raw = adapters_raw.get("onebot") or raw_data.get("onebot") or {}
         ob_cfg = OneBotConfig(
             enabled=ob_raw.get("enabled", False),
-            base_url=ob_raw.get("base_url", "https://onebot.example.com:81"),
-            access_token=ob_raw.get("access_token", "REDACTED_ONEBOT_TOKEN"),
-            ws_url=ob_raw.get("ws_url", "wss://onebot.example.com:81"),
-            target_group_id=ob_raw.get("target_group_id", 300000002),
+            base_url=ob_raw.get("base_url", ""),
+            access_token=ob_raw.get("access_token", ""),
+            ws_url=ob_raw.get("ws_url", ""),
+            target_group_id=ob_raw.get("target_group_id"),
             session_id=str(ob_raw.get("session_id") or muse_cfg.session_id or ""),
             whitelist=ob_raw.get("whitelist") or {},
         )
 
         # 4. Gateway config
         gw_raw = raw_data.get("gateway", {})
-        login_adapter = (
-            gw_raw.get("login_through_adapter")
-            or gw_raw.get("login_throuth_adapter")
-            or ""
-        )
-        gw_cfg = GatewayConfig(login_through_adapter=str(login_adapter))
+        gw_cfg = GatewayConfig(login_through_adapter=str(gw_raw.get("login_through_adapter", "")))
 
         return AppConfig(
             muse=muse_cfg,

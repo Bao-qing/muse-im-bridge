@@ -22,7 +22,7 @@ class BridgeEngine:
             mint_file=self.config.muse.mint_file,
             cookies_file=self.config.muse.cookies_file,
             vm_id=self.config.muse.vm_id,
-            base_url=f"https://{self.config.muse.host}" if "://" not in self.config.muse.host else self.config.muse.host,
+            base_url="https://muse.ai",
         )
         self.muse_service = MuseService(config=self.config.muse, token_manager=self.token_manager)
 
