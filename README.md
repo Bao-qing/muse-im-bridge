@@ -98,7 +98,8 @@ cp config.example.json config.json
       "push": {
         "enabled": true,
         "target_type": "private",
-        "target_id": null
+        "target_id": null,
+        "catch_up_enabled": false
       }
     },
     "onebot": {
