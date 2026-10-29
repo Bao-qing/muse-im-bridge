@@ -120,31 +120,37 @@ class PushSubscription:
         self._client = client
         self.stream_id = stream_id
         self._buf = buffer
+        if hasattr(client, "_register_subscription"):
+            client._register_subscription(self)
 
     def reset(self):
         self._buf = b""
+
+    def feed_bytes(self, data: bytes):
+        if data:
+            self._buf += data
+
+    def drain_events(self):
+        events = []
+        while b"\n" in self._buf:
+            line, self._buf = self._buf.split(b"\n", 1)
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                obj = json.loads(line.decode("utf-8", "replace"))
+            except Exception:
+                continue
+            if isinstance(obj, dict):
+                events.append(obj)
+        return events
 
     def read_events(self, timeout: float):
         """Read until at least one complete event is available or the
         timeout expires. Returns a list (possibly empty on timeout).
         Raises ConnectionLost on transport drop."""
         deadline = time.time() + timeout
-        events = []
-
-        def drain():
-            while b"\n" in self._buf:
-                line, self._buf = self._buf.split(b"\n", 1)
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    obj = json.loads(line.decode("utf-8", "replace"))
-                except Exception:
-                    continue
-                if isinstance(obj, dict):
-                    events.append(obj)
-
-        drain()
+        events = self.drain_events()
         if events:
             return events
         while time.time() < deadline:
@@ -164,17 +170,19 @@ class PushSubscription:
                 continue
             sid, kind, detail = parse_service_frame(unwrap_service_response(full))
             if sid != self.stream_id:
+                if hasattr(self._client, "_dispatch_other_stream_frame"):
+                    self._client._dispatch_other_stream_frame(sid, kind, detail)
                 continue
             if kind == "body_chunk":
                 data = detail.get("data", b"")
                 if data:
                     self._buf += data
-                drain()
+                events.extend(self.drain_events())
                 if events:
                     return events
                 if detail.get("end_body"):
                     break
-        drain()
+        events.extend(self.drain_events())
         return events
 
 
@@ -207,6 +215,52 @@ class MuseClient:
         self._recv_cs = None
         self._reasm = None
         self._seq = 0
+        self._subscriptions = {}  # stream_id -> PushSubscription
+
+    def _register_subscription(self, sub: PushSubscription):
+        self._subscriptions[sub.stream_id] = sub
+
+    def _dispatch_other_stream_frame(self, sid: int, kind: str, detail: dict):
+        sub = self._subscriptions.get(sid)
+        if sub is None:
+            return
+        if kind == "body_chunk":
+            sub.feed_bytes(detail.get("data", b""))
+        elif kind == "response" and detail.get("body"):
+            sub.feed_bytes(detail["body"])
+
+    def read_any_subscription_events(self, timeout: float = 1.0):
+        """Read multiplexed push events across all active PushSubscriptions on this connection.
+        Returns a flat list of event dicts."""
+        events = []
+        for sub in list(self._subscriptions.values()):
+            events.extend(sub.drain_events())
+        if events:
+            return events
+
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            try:
+                _, frame = self._ws.recv(
+                    timeout=min(10, max(0.05, deadline - time.time())))
+            except ConnectionError as e:
+                raise ConnectionLost(f"push stream lost: {e}") from e
+            except Exception:
+                continue
+            try:
+                pt = self._recv_cs.decrypt(frame)
+            except Exception as e:
+                raise ConnectionLost(f"push decrypt failed: {e}") from e
+            full = self._reasm.feed(pt)
+            if full is None:
+                continue
+            sid, kind, detail = parse_service_frame(unwrap_service_response(full))
+            self._dispatch_other_stream_frame(sid, kind, detail)
+            for sub in list(self._subscriptions.values()):
+                events.extend(sub.drain_events())
+            if events:
+                return events
+        return events
 
     # -- connection ---------------------------------------------------
     def connect(self):
@@ -230,6 +284,7 @@ class MuseClient:
         self._recv_cs = recv_cs
         self._reasm = ChunkReassembler()
         self._seq = 0
+        self._subscriptions = {}
 
     def close(self):
         if self._ws is not None:
@@ -240,6 +295,7 @@ class MuseClient:
             self._ws = None
             self._send_cs = None
             self._recv_cs = None
+            self._subscriptions = {}
 
     def __enter__(self):
         self.connect()
@@ -275,6 +331,7 @@ class MuseClient:
                 continue
             sid, kind, detail = parse_service_frame(unwrap_service_response(full))
             if sid != want_seq:
+                self._dispatch_other_stream_frame(sid, kind, detail)
                 continue
             if kind == "response":
                 status = detail.get("status")
@@ -653,7 +710,7 @@ class MuseClient:
         return self.session_action("unarchive", session_id)
 
     # -- push (subscribe) ---------------------------------------------
-    def subscribe(self, session_id, timeout=20):
+    def subscribe(self, session_id=None, timeout=20):
         """Open a /chat/subscribe stream. Returns a PushSubscription once
         the server ACKs (subscribed:true). Raises SubscribeError on a
         non-200 status, a not_found body, an ended stream, or timeout.
@@ -665,9 +722,10 @@ class MuseClient:
         self._ensure_connected()
         self._seq += 1
         seq = self._seq
+        payload = {"session_id": session_id} if session_id else {}
         env = http_request_envelope(
             seq, "POST", "/chat/subscribe",
-            json.dumps({"session_id": session_id}).encode())
+            json.dumps(payload).encode())
         try:
             self._ws.send(self._send_cs.encrypt(transport_frame(env)))
         except ConnectionError as e:
@@ -731,6 +789,7 @@ class MuseClient:
                 continue
             sid, kind, detail = parse_service_frame(unwrap_service_response(full))
             if sid != seq:
+                self._dispatch_other_stream_frame(sid, kind, detail)
                 continue
             if kind == "response":
                 status = detail.get("status")
