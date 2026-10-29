@@ -252,7 +252,14 @@ class QQOutboundPusher:
     # ------------------------------------------------------------------
     def _fetch_session(self, client, session_id: str) -> List[dict]:
         """Fetch recent history of one session and pre-read candidate workspace media."""
-        hist = client.get_history(session_id, 25)
+        try:
+            hist = client.get_history(session_id, 25)
+        except Exception as e:
+            msg = str(e).lower()
+            if "status 404" in msg or "not_found" in msg or "session not found" in msg:
+                # Session not yet created on Muse server (lazy-created upon first message)
+                return []
+            raise
 
         for ev in hist:
             mid = ev.get("message_id")
@@ -429,28 +436,28 @@ class QQOutboundPusher:
                 results = await loop.run_in_executor(None, _tick)
                 self._login_alerted = False
                 for sid, hist in results:
-                    if not hist:
-                        # Nothing there yet (e.g. new session); it is still gated-fresh.
-                        continue
                     if sid not in self._gated:
                         self._gated.add(sid)
-                        seen_ids, action, kept, skipped, max_seq, reason = gate_catch_up(
-                            hist=hist,
-                            seen_ids=self._seen_ids,
-                            last_ts=self._last_ts,
-                            now=time.time(),
-                            enabled=self.config.push.catch_up_enabled,
-                            window_s=self.config.push.catch_up_window_s,
-                            max_messages=self.config.push.catch_up_max_messages,
-                        )
-                        self._seen_ids = seen_ids
-                        if action == "baseline":
-                            self._last_seq = max(self._last_seq, max_seq)
-                            self._save_state()
-                            if self.config.debug:
-                                print(f"[QQOutbound] Startup baseline {sid[:8]} ({reason}): marked {skipped} messages seen, 0 pushed.")
-                        else:
-                            print(f"[QQOutbound] Startup catch-up {sid[:8]}: recovering up to {kept} recent message(s) (skipped {skipped} older).")
+                    if not hist:
+                        # Nothing there yet (e.g. new session); it is now gated.
+                        continue
+                    seen_ids, action, kept, skipped, max_seq, reason = gate_catch_up(
+                        hist=hist,
+                        seen_ids=self._seen_ids,
+                        last_ts=self._last_ts,
+                        now=time.time(),
+                        enabled=self.config.push.catch_up_enabled,
+                        window_s=self.config.push.catch_up_window_s,
+                        max_messages=self.config.push.catch_up_max_messages,
+                    )
+                    self._seen_ids = seen_ids
+                    if action == "baseline":
+                        self._last_seq = max(self._last_seq, max_seq)
+                        self._save_state()
+                        if self.config.debug:
+                            print(f"[QQOutbound] Startup baseline {sid[:8]} ({reason}): marked {skipped} messages seen, 0 pushed.")
+                    else:
+                        print(f"[QQOutbound] Startup catch-up {sid[:8]}: recovering up to {kept} recent message(s) (skipped {skipped} older).")
 
                     await self._scan_and_dispatch(hist, sid)
             except asyncio.CancelledError:
@@ -469,7 +476,14 @@ class QQOutboundPusher:
                     print(f"[QQOutbound] Scan tick error: {e}")
                 await asyncio.sleep(3.0)
                 continue
-            await asyncio.sleep(1.0)
+
+            # Dynamic polling interval:
+            # 1.0s during active conversation / reply streaming (Hot)
+            # recheck_sleep_s (default 5.0s) when idle
+            now = time.monotonic()
+            is_hot = any(now < self._hot_until.get(s, 0.0) for s in self.session_mapper.session_ids())
+            sleep_s = 1.0 if is_hot else max(1.0, float(self.config.push.recheck_sleep_s))
+            await asyncio.sleep(sleep_s)
 
     def _proactive_target(self, session_id: Optional[str]) -> Tuple[str, str]:
         """Destination for events that match no inbound route (reminders etc.)."""
