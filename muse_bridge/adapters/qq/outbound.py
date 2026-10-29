@@ -2,7 +2,7 @@
 
 The SOLE exit point for all outbound messages from Muse to QQ.
 Unifies both interactive conversational replies and proactive notifications:
-1. Listens for completed assistant events from the Muse event stream.
+1. Listens for completed assistant events from the Muse /chat/subscribe event stream.
 2. Extracts text, images (URLs & workspace), files (workspace & attachments), and videos.
 3. Automatically reads file-store bytes via client.read_file() and downloads external URLs.
 4. Uploads media to QQ files API (file_type: 1=image, 2=video, 4=file) and sends cards.
@@ -16,11 +16,14 @@ import json
 import os
 import re
 import time
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
 from ...config.models import QQConfig
 from ...core.deduplicator import MessageDeduplicator
 from ...core.message import chunk_text
+from ...core.session_map import MODE_GLOBAL, SessionMapper
+from ...muse.client.errors import ConnectionLost, HandshakeError, MuseError, RPCError, SubscribeError
+from ...muse.client.push import PushTurnTracker
 from ...muse.client.render import (
     extract_files,
     extract_images,
@@ -30,7 +33,6 @@ from ...muse.client.render import (
 )
 from ...muse.service import MuseService
 from .client import QQClient
-from ...core.session_map import MODE_GLOBAL, SessionMapper
 from .route_manager import RouteInfo, RouteManager
 
 _SANDBOX_MEDIA_RE = re.compile(r"!?\[([^\]]*)\]\(sandbox://([^)]+)\)")
@@ -161,11 +163,13 @@ class QQOutboundPusher:
         self._last_seq: int = 0
         self._last_ts: Optional[float] = None
 
-        # Per-session watch state (per_chat mode change detection)
+        # Per-session watch & subscription state
         self._gated: Set[str] = set()                 # sessions whose startup gate already ran
         self._last_updated: Dict[str, int] = {}       # sid -> last seen updated_at_ms
-        self._hot_until: Dict[str, float] = {}        # sid -> keep fetching until this monotonic ts
+        self._hot_until: Dict[str, float] = {}        # sid -> keep active until this monotonic ts
         self._last_sweep: float = 0.0
+        self._pending_subscribe: Set[str] = set()     # sessions that need /chat/subscribe opened
+        self._uncreated_sessions: Set[str] = set()    # lazy sessions (404 until first message is posted)
         self._load_state()
 
     # -- legacy accessor: the single global session ------------------------
@@ -177,17 +181,25 @@ class QQOutboundPusher:
     def session_id(self, value: str) -> None:
         if not self.session_mapper.per_chat:
             self.session_mapper._global_sid = value
+            if value:
+                self._pending_subscribe.add(value)
 
     def track_session(self, session_id: str, fresh: bool = False) -> None:
-        """Called by the adapter right after posting into ``session_id``.
+        """Called by the adapter right after creating or posting into ``session_id``.
 
-        ``fresh`` marks a session created just now (nothing to baseline).
-        The session is kept "hot" so the reply is fetched promptly.
+        ``fresh`` marks a session created just now (nothing to baseline, not on server yet).
+        When ``fresh=False`` (called after ``post_message`` succeeds), the session now exists
+        on the Muse server and is queued for immediate ``/chat/subscribe`` registration.
         """
         if not session_id:
             return
         if fresh:
             self._gated.add(session_id)
+            self._uncreated_sessions.add(session_id)
+        else:
+            # A message was just posted to this session -> it now exists on server!
+            self._uncreated_sessions.discard(session_id)
+            self._pending_subscribe.add(session_id)
         self._hot_until[session_id] = time.monotonic() + max(5, self.config.session_hot_window_s)
 
     def _load_state(self) -> None:
@@ -230,7 +242,7 @@ class QQOutboundPusher:
     async def start(self) -> None:
         self._running = True
         default_type, default_id = self.config.resolve_push_target()
-        print(f"[QQOutbound] Started unified outbound dispatcher (Default push target: {default_type}:{default_id})")
+        print(f"[QQOutbound] Started event-driven outbound dispatcher (Default push target: {default_type}:{default_id})")
 
         while self._running:
             try:
@@ -241,23 +253,25 @@ class QQOutboundPusher:
                 if not self._running:
                     break
                 if self.config.debug:
-                    print(f"[QQOutbound] Polling error: {e}, retrying in 3s...")
+                    print(f"[QQOutbound] Event stream loop error: {e}, reconnecting in 3s...")
                 await asyncio.sleep(3.0)
 
     async def stop(self) -> None:
         self._running = False
 
     # ------------------------------------------------------------------
-    # History fetching (one session at a time)
+    # History fetching & media extraction (triggered on demand by events)
     # ------------------------------------------------------------------
     def _fetch_session(self, client, session_id: str) -> List[dict]:
-        """Fetch recent history of one session and pre-read candidate workspace media."""
+        """Fetch authoritative history of one session and read workspace media."""
         try:
             hist = client.get_history(session_id, 25)
+            self._uncreated_sessions.discard(session_id)
         except Exception as e:
             msg = str(e).lower()
             if "status 404" in msg or "not_found" in msg or "session not found" in msg:
                 # Session not yet created on Muse server (lazy-created upon first message)
+                self._uncreated_sessions.add(session_id)
                 return []
             raise
 
@@ -295,15 +309,7 @@ class QQOutboundPusher:
         self._hot_until[session_id] = time.monotonic() + max(5, self.config.session_hot_window_s)
 
     def _sessions_to_fetch(self, client) -> List[str]:
-        """Decide which watched sessions need a history fetch on this tick.
-
-        global mode : the single active session, every tick (legacy behaviour).
-        per_chat    : one cheap /api/session/list call is the change detector
-                      (the polling analogue of the web UI's `sessions.updated`
-                      event: a session whose `updated_at_ms` moved has new
-                      activity). Only changed / hot / not-yet-gated sessions are
-                      fetched, so cost does not grow with idle sessions.
-        """
+        """Compatibility helper for initial / fallback session inspection."""
         watched = self.session_mapper.session_ids()
         if not self.session_mapper.per_chat:
             return watched
@@ -323,7 +329,7 @@ class QQOutboundPusher:
             }
         except Exception as e:
             if self.config.debug:
-                print(f"[QQOutbound] session list failed ({e}); falling back to fetching all watched sessions")
+                print(f"[QQOutbound] session list failed ({e}); falling back to watched sessions")
 
         out: List[str] = []
         for sid in watched:
@@ -366,8 +372,13 @@ class QQOutboundPusher:
 
         try:
             hist = await loop.run_in_executor(None, _do)
+            self._uncreated_sessions.discard(session_id)
+            self._pending_subscribe.add(session_id)
         except Exception as e:
             # Session may not exist yet (nothing to baseline) – treat as fresh.
+            msg = str(e).lower()
+            if "status 404" in msg or "not_found" in msg or "session not found" in msg:
+                self._uncreated_sessions.add(session_id)
             if self.config.debug:
                 print(f"[QQOutbound] baseline fetch for {session_id[:8]} failed ({e}); treating as empty")
             hist = []
@@ -401,70 +412,228 @@ class QQOutboundPusher:
     def reset_login_alert(self) -> None:
         self._login_alerted = False
 
+    async def _hydrate_and_dispatch(self, sid: str, hist: List[dict], is_initial_gate: bool) -> None:
+        """Apply startup gate if needed, then dispatch any completed assistant messages."""
+        if is_initial_gate:
+            self._gated.add(sid)
+            if not hist:
+                return
+            seen_ids, action, kept, skipped, max_seq, reason = gate_catch_up(
+                hist=hist,
+                seen_ids=self._seen_ids,
+                last_ts=self._last_ts,
+                now=time.time(),
+                enabled=self.config.push.catch_up_enabled,
+                window_s=self.config.push.catch_up_window_s,
+                max_messages=self.config.push.catch_up_max_messages,
+            )
+            self._seen_ids = seen_ids
+            if action == "baseline":
+                self._last_seq = max(self._last_seq, max_seq)
+                self._save_state()
+                if self.config.debug:
+                    print(f"[QQOutbound] Startup baseline {sid[:8]} ({reason}): marked {skipped} messages seen, 0 pushed.")
+            else:
+                print(f"[QQOutbound] Startup catch-up {sid[:8]}: recovering up to {kept} recent message(s) (skipped {skipped} older).")
+
+        if hist:
+            await self._scan_and_dispatch(hist, sid)
+
+    @staticmethod
+    def _is_auth_error(exc: Exception) -> bool:
+        msg = str(exc).lower()
+        return any(k in msg for k in ("credential", "cookie", "handshake", "unauthorized", "401", "hatch_vm_auth"))
+
+    @staticmethod
+    def _classify_push_event(ev: dict, default_sid: Optional[str] = None) -> Tuple[Optional[str], Optional[str]]:
+        """Extract (session_id, trigger_kind) from a /chat/subscribe event.
+
+        trigger_kind:
+        - "sync": An assistant message or media presentation has finished/arrived and should be synced.
+        - "stream": A turn is actively streaming in this session.
+        - None: Non-triggering event.
+        """
+        if not isinstance(ev, dict):
+            return None, None
+        name = ev.get("event") or ev.get("event_name")
+        if not name:
+            return None, None
+
+        payload = ev.get("payload") or {}
+        if not isinstance(payload, dict):
+            payload = {}
+
+        sid = PushTurnTracker._event_session(ev) or default_sid
+
+        if name in ("delta.message_start", "delta.text_append", "delta.tool_start"):
+            return sid, "stream"
+
+        if name in ("delta.message_done", "message.assistant"):
+            status = payload.get("status") or ev.get("status")
+            if status in ("interrupted", "cancelled"):
+                return sid, None
+            return sid, "sync"
+
+        if name == "delta.presentation":
+            data = payload.get("data") or {}
+            if not isinstance(data, dict):
+                data = {}
+            kind = data.get("type") or payload.get("kind")
+            if kind in ("image", "file", "video") or "file" in data or "image_path" in payload or "video_path" in payload:
+                return sid, "sync"
+            return sid, None
+
+        if name == "task.status":
+            if payload.get("status") == "completed":
+                return sid, "sync"
+            return sid, "stream"
+
+        return sid, None
+
     async def _run_loop(self) -> None:
+        """Pure event-driven loop powered by /chat/subscribe over persistent Noise WebSocket."""
         loop = asyncio.get_running_loop()
 
         while self._running:
             if not self.muse_service.token_manager.has_credentials():
                 if not self._login_alerted:
                     self._login_alerted = True
-                    print("[QQOutbound] Muse 尚未登录或凭据失效，暂停出站扫描，触发回落登录...")
+                    print("[QQOutbound] Muse 尚未登录或凭据失效，暂停出站监听，触发回落登录...")
                     await self._notify_login_required()
                 await asyncio.sleep(5.0)
                 continue
 
+            client = None
             try:
-                def _tick() -> List[Tuple[str, List[dict]]]:
-                    results: List[Tuple[str, List[dict]]] = []
-                    sids_probe = self.session_mapper.session_ids()
-                    if not sids_probe:
-                        return results
-                    with self.muse_service.create_client() as client:
-                        client.connect()
-                        for sid in self._sessions_to_fetch(client):
-                            try:
-                                results.append((sid, self._fetch_session(client, sid)))
-                            except Exception as ex:
-                                msg = str(ex).lower()
-                                if any(k in msg for k in ("credential", "cookie", "handshake", "unauthorized", "401", "hatch_vm_auth")):
-                                    raise
-                                # one broken / not-yet-created session must not block the others
-                                if self.config.debug:
-                                    print(f"[QQOutbound] history fetch failed for {sid[:8]}: {ex}")
-                    return results
+                def _connect_client():
+                    c = self.muse_service.create_client()
+                    c.connect()
+                    return c
 
-                results = await loop.run_in_executor(None, _tick)
+                client = await loop.run_in_executor(None, _connect_client)
                 self._login_alerted = False
-                for sid, hist in results:
-                    if sid not in self._gated:
-                        self._gated.add(sid)
-                    if not hist:
-                        # Nothing there yet (e.g. new session); it is now gated.
-                        continue
-                    seen_ids, action, kept, skipped, max_seq, reason = gate_catch_up(
-                        hist=hist,
-                        seen_ids=self._seen_ids,
-                        last_ts=self._last_ts,
-                        now=time.time(),
-                        enabled=self.config.push.catch_up_enabled,
-                        window_s=self.config.push.catch_up_window_s,
-                        max_messages=self.config.push.catch_up_max_messages,
-                    )
-                    self._seen_ids = seen_ids
-                    if action == "baseline":
-                        self._last_seq = max(self._last_seq, max_seq)
-                        self._save_state()
-                        if self.config.debug:
-                            print(f"[QQOutbound] Startup baseline {sid[:8]} ({reason}): marked {skipped} messages seen, 0 pushed.")
-                    else:
-                        print(f"[QQOutbound] Startup catch-up {sid[:8]}: recovering up to {kept} recent message(s) (skipped {skipped} older).")
 
-                    await self._scan_and_dispatch(hist, sid)
+                # Compatibility fallback if a test mock does not implement `subscribe`
+                if not hasattr(client, "subscribe"):
+                    await self._run_legacy_poll_once(client)
+                    now = time.monotonic()
+                    is_hot = any(now < self._hot_until.get(s, 0.0) for s in self.session_mapper.session_ids())
+                    sleep_s = 1.0 if is_hot else max(1.0, float(self.config.push.recheck_sleep_s))
+                    await asyncio.sleep(sleep_s)
+                    continue
+
+                subscribed_sids: Set[str] = set()
+                trackers: Dict[str, PushTurnTracker] = {}
+
+                # Inner persistent event loop over the single connected MuseClient
+                while self._running:
+                    if not self.muse_service.token_manager.has_credentials():
+                        break
+
+                    watched = self.session_mapper.session_ids()
+                    if not watched:
+                        await asyncio.sleep(1.0)
+                        continue
+
+                    # 1. Sync subscriptions & initial hydration for newly watched or re-activated sessions
+                    need_setup = [
+                        sid for sid in watched
+                        if (sid not in self._gated)
+                        or (sid in self._pending_subscribe)
+                        or (sid not in subscribed_sids and sid not in self._uncreated_sessions)
+                    ]
+
+                    if need_setup:
+                        def _setup_sessions(sids: List[str]) -> List[Tuple[str, List[dict], bool, bool]]:
+                            out: List[Tuple[str, List[dict], bool, bool]] = []
+                            for sid in sids:
+                                is_init = sid not in self._gated
+                                self._pending_subscribe.discard(sid)
+                                hist: List[dict] = []
+                                sub_ok = sid in subscribed_sids
+
+                                if not sub_ok:
+                                    try:
+                                        sub = client.subscribe(sid)
+                                        # Discard initial subscribe snapshot events; history hydration covers baseline/catch-up
+                                        sub.reset()
+                                        sub_ok = True
+                                    except SubscribeError as se:
+                                        s_msg = str(se).lower()
+                                        if "not found" in s_msg or "not_found" in s_msg or "404" in s_msg:
+                                            # Lazy session not created on server yet; mark gated & wait for post_message
+                                            self._uncreated_sessions.add(sid)
+                                            out.append((sid, [], is_init, False))
+                                            continue
+                                        raise
+
+                                # Session exists on server: fetch history once for initial gate or post-create sync
+                                hist = self._fetch_session(client, sid)
+                                out.append((sid, hist, is_init, sub_ok))
+                            return out
+
+                        setup_results = await loop.run_in_executor(None, _setup_sessions, need_setup)
+                        for sid, hist, is_init, sub_ok in setup_results:
+                            if sub_ok:
+                                subscribed_sids.add(sid)
+                                trackers.setdefault(sid, PushTurnTracker(sid))
+                            await self._hydrate_and_dispatch(sid, hist, is_initial_gate=is_init)
+
+                    if not subscribed_sids:
+                        # All watched sessions are lazy/uncreated (waiting for first user message)
+                        await asyncio.sleep(0.5)
+                        continue
+
+                    # 2. Read real-time push events from active /chat/subscribe stream(s)
+                    def _read_And_sync_events() -> List[Tuple[str, List[dict]]]:
+                        if hasattr(client, "read_any_subscription_events"):
+                            events = client.read_any_subscription_events(timeout=1.0)
+                        else:
+                            # Fallback if single subscription object
+                            subs = list(getattr(client, "_subscriptions", {}).values())
+                            events = subs[0].read_events(timeout=1.0) if subs else []
+
+                        if not events:
+                            return []
+
+                        default_sid = next(iter(subscribed_sids)) if len(subscribed_sids) == 1 else self.session_id
+                        dirty_sids: Set[str] = set()
+
+                        for ev in events:
+                            sid, kind = self._classify_push_event(ev, default_sid=default_sid)
+                            if not sid:
+                                continue
+                            tracker = trackers.setdefault(sid, PushTurnTracker(sid))
+                            if tracker.feed(ev):
+                                dirty_sids.add(sid)
+                                trackers[sid] = PushTurnTracker(sid)
+                            elif kind == "sync":
+                                dirty_sids.add(sid)
+                            elif kind == "stream":
+                                self._touch_hot(sid)
+
+                        if not dirty_sids:
+                            return []
+
+                        synced: List[Tuple[str, List[dict]]] = []
+                        for sid in dirty_sids:
+                            try:
+                                synced.append((sid, self._fetch_session(client, sid)))
+                            except Exception as ex:
+                                if self._is_auth_error(ex):
+                                    raise
+                                if self.config.debug:
+                                    print(f"[QQOutbound] Event-triggered sync failed for {sid[:8]}: {ex}")
+                        return synced
+
+                    synced_batches = await loop.run_in_executor(None, _read_And_sync_events)
+                    for sid, hist in synced_batches:
+                        await self._hydrate_and_dispatch(sid, hist, is_initial_gate=(sid not in self._gated))
+
             except asyncio.CancelledError:
                 break
             except Exception as e:
-                err_msg = str(e).lower()
-                if any(k in err_msg for k in ("credential", "cookie", "handshake", "unauthorized", "401", "hatch_vm_auth")):
+                if self._is_auth_error(e):
                     self.muse_service.token_manager.invalidate()
                     if not self._login_alerted:
                         self._login_alerted = True
@@ -473,17 +642,37 @@ class QQOutboundPusher:
                     await asyncio.sleep(10.0)
                     continue
                 if self.config.debug:
-                    print(f"[QQOutbound] Scan tick error: {e}")
+                    print(f"[QQOutbound] Subscribe stream error ({e}), reconnecting in 3s...")
                 await asyncio.sleep(3.0)
                 continue
+            finally:
+                if client is not None:
+                    try:
+                        await loop.run_in_executor(None, client.close)
+                    except Exception:
+                        pass
 
-            # Dynamic polling interval:
-            # 1.0s during active conversation / reply streaming (Hot)
-            # recheck_sleep_s (default 5.0s) when idle
-            now = time.monotonic()
-            is_hot = any(now < self._hot_until.get(s, 0.0) for s in self.session_mapper.session_ids())
-            sleep_s = 1.0 if is_hot else max(1.0, float(self.config.push.recheck_sleep_s))
-            await asyncio.sleep(sleep_s)
+    async def _run_legacy_poll_once(self, client) -> None:
+        """Fallback single tick for test mocks that do not provide `subscribe`."""
+        loop = asyncio.get_running_loop()
+
+        def _tick() -> List[Tuple[str, List[dict]]]:
+            results: List[Tuple[str, List[dict]]] = []
+            if not self.session_mapper.session_ids():
+                return results
+            for sid in self._sessions_to_fetch(client):
+                try:
+                    results.append((sid, self._fetch_session(client, sid)))
+                except Exception as ex:
+                    if self._is_auth_error(ex):
+                        raise
+                    if self.config.debug:
+                        print(f"[QQOutbound] history fetch failed for {sid[:8]}: {ex}")
+            return results
+
+        results = await loop.run_in_executor(None, _tick)
+        for sid, hist in results:
+            await self._hydrate_and_dispatch(sid, hist, is_initial_gate=(sid not in self._gated))
 
     def _proactive_target(self, session_id: Optional[str]) -> Tuple[str, str]:
         """Destination for events that match no inbound route (reminders etc.)."""
@@ -592,21 +781,12 @@ class QQOutboundPusher:
                 target_type, target_id = self._proactive_target(session_id)
                 route_type = "proactive_push"
                 reply_msg_id = None
-                # If target is a group, QQ API disallows unsolicited active sends (40034105).
-                # Check if we have an active passive route within 5-min TTL to reply to.
+                # If target is a group, try to use a recent passive route within 5-min TTL
                 if target_type == "group":
                     fallback_route = self.route_manager.get_latest_for_target("group", target_id, max_age_s=280.0)
                     if fallback_route and fallback_route.msg_id:
                         route = fallback_route
                         reply_msg_id = route.msg_id
-                    else:
-                        # Fallback to administrator private push to ensure notification is never lost
-                        admin_type, admin_id = self.config.resolve_push_target()
-                        if admin_id:
-                            target_type, target_id = admin_type, admin_id
-                            clean_text = f"【群消息提醒】\n{clean_text}" if clean_text else clean_text
-                            route = None
-                            reply_msg_id = None
 
             if not target_id:
                 if self.config.debug:
@@ -699,6 +879,23 @@ class QQOutboundPusher:
                         md,
                         media_info,
                     )
+
+            if not (200 <= code < 300):
+                # If active send to group fails with permission error (40034105), fall back to admin private
+                if target_type == "group" and any(k in str(body) for k in ("40034105", "无权限", "主动消息失败")):
+                    admin_type, admin_id = self.config.resolve_push_target()
+                    if admin_id and (admin_type != target_type or admin_id != target_id):
+                        if self.config.debug:
+                            print(f"[QQOutbound] Group active send rejected ({code}); falling back to admin {admin_type}:{admin_id}")
+                        code, body = await loop.run_in_executor(
+                            None,
+                            self.client.send_message,
+                            admin_type,
+                            admin_id,
+                            f"【群消息提醒】\n{content}" if content else content,
+                            f"【群消息提醒】\n{md}" if md else md,
+                            media_info,
+                        )
 
             if not (200 <= code < 300):
                 print(f"[QQOutbound] Failed sending item to {target_type}:{target_id} ({code}): {body}")

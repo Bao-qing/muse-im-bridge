@@ -65,12 +65,17 @@ class PushTurnTracker:
 
     @staticmethod
     def _event_session(event: dict):
+        if not isinstance(event, dict):
+            return None
         payload = event.get("payload") or {}
-        sid = payload.get("session_id")
-        if sid:
-            return sid
-        ctx = payload.get("chat_context") or {}
-        return ctx.get("chat_id")
+        if isinstance(payload, dict):
+            sid = payload.get("session_id") or payload.get("thread_id")
+            if sid:
+                return sid
+            ctx = payload.get("chat_context") or {}
+            if isinstance(ctx, dict) and ctx.get("chat_id"):
+                return ctx.get("chat_id")
+        return event.get("session_id") or event.get("thread_id")
 
     def feed(self, event: dict) -> bool:
         """Feed one pushed event dict. Returns True once the turn is done."""
