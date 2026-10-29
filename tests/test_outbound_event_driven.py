@@ -275,6 +275,91 @@ class TestOutboundEventDriven(unittest.IsolatedAsyncioTestCase):
         self.assertIn("a1", pusher._seen_ids)
         self.assertTrue(pusher.deduplicator.mark_delivered.called)
 
+    def test_widget_option_and_card_rendering(self):
+        from muse_bridge.muse.client.render import (
+            render_widget_to_text,
+            render_presentation_card_to_text,
+            render_assistant_event,
+        )
+
+        # 1. Option Choice widget
+        widget_option = {
+            "widget_id": "w1",
+            "kind": "option",
+            "data": {
+                "options": ["帮我启动机器测通", "先别启动，保持暂停"],
+            },
+            "state": {"data": {"selectedText": "帮我启动机器测通"}},
+        }
+        res_opt = render_widget_to_text(widget_option)
+        self.assertIn("【请选择】：", res_opt)
+        self.assertIn("1. 帮我启动机器测通 (已选)", res_opt)
+        self.assertIn("2. 先别启动，保持暂停", res_opt)
+
+        # Embed into assistant message
+        ev_msg = {
+            "event_name": "message.assistant",
+            "display_text": "保清，请做选择：[[hatch_widget:w1]]",
+            "payload": {"widgets": [widget_option]},
+        }
+        rendered_text = render_assistant_event(ev_msg)
+        self.assertIn("保清，请做选择：", rendered_text)
+        self.assertIn("【请选择】：", rendered_text)
+
+        # 2. Browser task presentation card
+        ev_browser = {
+            "event_name": "delta.presentation",
+            "payload": {
+                "kind": "browser_task",
+                "data": {
+                    "display_status": "已完成",
+                    "latest_tab": {
+                        "title": "设备已连接",
+                        "url": "https://auth.instabox.sh/device/success",
+                    },
+                },
+            },
+        }
+        res_browser = render_presentation_card_to_text(ev_browser)
+        self.assertIn("【浏览器任务：已完成】", res_browser)
+        self.assertIn("设备已连接", res_browser)
+        self.assertIn("https://auth.instabox.sh/device/success", res_browser)
+
+        # 3. Secret / Credentials Vault presentation card
+        ev_vault = {
+            "event_name": "delta.presentation",
+            "payload": {
+                "kind": "internal_link_action_card",
+                "data": {
+                    "type": "credentials_vault",
+                    "title": "安全存储",
+                    "subtitle": "登录 github.com",
+                    "data": {
+                        "username_label": "Username",
+                        "password_label": "Password",
+                    },
+                },
+            },
+        }
+        res_vault = render_presentation_card_to_text(ev_vault)
+        self.assertIn("【安全存储提示】登录 github.com", res_vault)
+        self.assertIn("Username/Password", res_vault)
+        self.assertIn("请前往网页端完成安全输入", res_vault)
+
+        # 4. Avatar share card
+        ev_avatar = {
+            "event_name": "delta.presentation",
+            "payload": {
+                "kind": "avatar_share",
+                "data": {
+                    "title": "我的新形象换好啦",
+                    "subtitle": "你可以分享给朋友哦！",
+                },
+            },
+        }
+        res_avatar = render_presentation_card_to_text(ev_avatar)
+        self.assertEqual("【卡片提示】我的新形象换好啦：你可以分享给朋友哦！", res_avatar)
+
 
 if __name__ == "__main__":
     unittest.main()

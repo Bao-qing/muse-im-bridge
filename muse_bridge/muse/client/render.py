@@ -17,6 +17,112 @@ later) uses them unchanged.
 import re
 
 
+def render_widget_to_text(widget: dict) -> str:
+    """Render a single widget (like option choice box) to clean readable plain text."""
+    if not isinstance(widget, dict):
+        return ""
+    kind = widget.get("kind") or ""
+    data = widget.get("data") or {}
+    state_data = (widget.get("state") or {}).get("data") or {}
+
+    # 1. Option Choice Box (选择框)
+    if kind == "option" or "options" in data:
+        options = data.get("options") or []
+        if isinstance(options, list) and options:
+            lines = ["【请选择】："]
+            selected = state_data.get("selectedText")
+            for idx, opt in enumerate(options, 1):
+                opt_str = str(opt).strip()
+                if selected and opt_str == str(selected).strip():
+                    lines.append(f"{idx}. {opt_str} (已选)")
+                else:
+                    lines.append(f"{idx}. {opt_str}")
+            return "\n".join(lines)
+        fb = widget.get("fallback_text") or widget.get("display_text") or ""
+        return fb.strip()
+
+    # 2. General widget fallback
+    fb = widget.get("fallback_text") or widget.get("display_text") or ""
+    return fb.strip() if fb else ""
+
+
+def render_presentation_card_to_text(event: dict):
+    """Render non-media presentation cards (browser cards, secret/credentials vaults, etc.)
+    into concise, user-friendly notification text for IM channels.
+    """
+    if not isinstance(event, dict):
+        return None
+    name = event.get("event_name") or event.get("event")
+    if name != "delta.presentation":
+        return None
+    payload = event.get("payload") or {}
+    kind = payload.get("kind") or (payload.get("data") or {}).get("type") or ""
+    data = payload.get("data") or {}
+
+    # 1. Browser Card (浏览器卡片)
+    if kind == "browser_task":
+        status = data.get("display_status") or data.get("display_state") or data.get("status") or "进行中"
+        tab = data.get("latest_tab") or {}
+        site = data.get("current_site") or {}
+        title = tab.get("title") or site.get("page_title") or payload.get("fallback_text") or event.get("display_text") or "网页浏览"
+        url = tab.get("url") or site.get("url") or ""
+        if url:
+            return f"【浏览器任务：{status}】{title} ({url})"
+        return f"【浏览器任务：{status}】{title}"
+
+    # 2. Secret / Credentials Input Box (秘钥框 / 安全存储凭据输入)
+    if kind == "internal_link_action_card" or data.get("type") == "credentials_vault" or "credentials" in str(kind).lower():
+        sub = data.get("subtitle") or ""
+        title = data.get("title") or payload.get("reply_to_text") or "安全存储"
+        inner_data = data.get("data") or {}
+        user_lbl = inner_data.get("username_label")
+        pwd_lbl = inner_data.get("password_label")
+        hint_parts = []
+        if user_lbl and pwd_lbl:
+            hint_parts.append(f"需要输入{user_lbl}/{pwd_lbl}")
+        elif pwd_lbl:
+            hint_parts.append(f"需要输入{pwd_lbl}")
+        hint_str = "，".join(hint_parts)
+        if hint_str:
+            hint_str = f"（{hint_str}，请前往网页端完成安全输入）"
+        else:
+            hint_str = "（需要输入秘钥/授权凭据，请前往网页端完成安全输入）"
+        if sub:
+            return f"【{title}提示】{sub}{hint_str}"
+        return f"【{title}提示】{hint_str}"
+
+    # 3. Image Options (图片选择框)
+    if kind == "image_options":
+        cands = data.get("candidates") or []
+        if isinstance(cands, list) and cands:
+            lines = ["【图片选项】："]
+            for idx, c in enumerate(cands, 1):
+                lbl = c.get("label") or f"选项 {idx}"
+                lines.append(f"{idx}. {lbl}")
+            return "\n".join(lines)
+        fb = payload.get("fallback_text") or event.get("display_text") or ""
+        return f"【图片选项】：\n{fb}" if fb else "【图片选项】"
+
+    # 4. Avatar Share / Action Cards (头像分享/卡片)
+    if kind == "avatar_share":
+        title = data.get("title") or "新形象已生成"
+        sub = data.get("subtitle") or ""
+        fb = data.get("fallback_text") or payload.get("fallback_text") or ""
+        desc = sub or fb or ""
+        return f"【卡片提示】{title}：{desc}".strip("：")
+
+    # 5. Generic Card Fallback (其他卡片作为文本发送提示)
+    title = data.get("title") or payload.get("reply_to_text") or ""
+    sub = data.get("subtitle") or ""
+    fb = payload.get("fallback_text") or event.get("display_text") or ""
+    body = sub or fb
+    if title and body and title != body:
+        return f"【卡片提示】{title}：{body}"
+    if title or body:
+        return f"【卡片提示】{title or body}"
+    return None
+
+
 def render_assistant_event(event: dict):
     """Render one history event to plain text, or None to skip it."""
     name = event.get("event_name")
@@ -34,22 +140,13 @@ def render_assistant_event(event: dict):
             w = widgets.get(m.group(1))
             if not w:
                 return ""
-            return (w.get("fallback_text") or w.get("display_text") or "").strip()
+            return render_widget_to_text(w)
 
         text = re.sub(r"\[\[hatch_widget:([^\]]+)\]\]", sub, text)
         text = re.sub(r"\n{3,}", "\n\n", text).strip()
         return text or None
     if name == "delta.presentation":
-        if payload.get("kind") == "browser_task":
-            data = payload.get("data") or {}
-            status = data.get("display_status") or data.get("display_state") or ""
-            title = payload.get("fallback_text") or event.get("display_text") or ""
-            label = payload.get("reply_to_text") or "浏览器"
-            if title and status:
-                return f"[{label}：{status}·{title}]"
-            return f"[{label}：{title}]" if title else None
-        fb = payload.get("fallback_text") or event.get("display_text") or ""
-        return fb.strip() or None
+        return render_presentation_card_to_text(event)
     return None
 
 
