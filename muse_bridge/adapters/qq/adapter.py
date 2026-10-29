@@ -511,5 +511,28 @@ class QQAdapter(BaseAdapter):
                             )
                     await self._send_command_reply(target_type, target_id, reply, msg_id)
                     return
+                if "status 404" in err_msg or "session not found" in err_msg or "not_found" in err_msg:
+                    # Session expired / deleted on Muse: auto-recreate a new session!
+                    new_sid = self.session_mapper.new_session(target_type, target_id)
+                    if not self.session_mapper.per_chat:
+                        self.active_session_id = new_sid
+                        self.outbound_pusher.session_id = new_sid
+                    print(f"[QQAdapter] Session {session_id[:8]} expired/not found on Muse, auto-created new session {new_sid[:8]}")
+                    try:
+                        sent_mid = await loop.run_in_executor(
+                            None,
+                            self.muse_service.post_message,
+                            new_sid,
+                            content,
+                            attachments,
+                            self.config.file_ref_threshold_bytes,
+                        )
+                        self.outbound_pusher.track_session(new_sid, fresh=True)
+                        self.route_manager.register(sent_mid, target_type, target_id, msg_id)
+                        return
+                    except Exception as retry_err:
+                        print(f"[QQAdapter] Failed to post message to new session: {retry_err}")
+                        await self._send_command_reply(target_type, target_id, f"会话重建后发送出错：{retry_err}", msg_id)
+                        return
                 print(f"[QQAdapter] Failed to post message to Muse: {e}")
                 await self._send_command_reply(target_type, target_id, f"转接出错了：{e}", msg_id)

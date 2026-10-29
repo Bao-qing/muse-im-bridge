@@ -139,6 +139,12 @@ class SessionMapper:
             self._map[chat_key(target_type, target_id)] = session_id
             self._save()
 
+    def new_session(self, target_type: str, target_id: str) -> str:
+        """Force create a brand new session ID for a chat and persist binding."""
+        new_sid = self._id_factory()
+        self.bind(target_type, target_id, new_sid)
+        return new_sid
+
     # -- reverse lookups (used by the outbound pusher) ------------------
     def session_ids(self) -> List[str]:
         """All session ids that must be watched for assistant output."""

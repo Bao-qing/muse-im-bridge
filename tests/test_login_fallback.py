@@ -189,6 +189,86 @@ class TestLoginFallback(unittest.IsolatedAsyncioTestCase):
             session_key = ("private", "ADMIN_OPENID", "ADMIN_OPENID")
             self.assertIn(session_key, adapter._login_sessions)
 
+    async def test_outbound_pusher_handles_404_session_not_found(self):
+        """Test outbound pusher treats 404 session not found as empty and marks it gated."""
+        qq_config = QQConfig(
+            app_id="app_123",
+            admin_id=["ADMIN_OPENID"],
+            whitelist={"private": ["ADMIN_OPENID"]},
+            push=QQPushConfig(enabled=True, target_type="private", target_id="ADMIN_OPENID"),
+        )
+        mock_qq_client = MagicMock()
+        pusher = QQOutboundPusher(
+            config=qq_config,
+            client=mock_qq_client,
+            muse_service=self.muse_service,
+            deduplicator=MessageDeduplicator(),
+            route_manager=RouteManager(),
+            session_id="new-empty-session",
+        )
+
+        with patch.object(self.muse_service, "create_client") as mock_create:
+            mock_client = MagicMock()
+            mock_client.__enter__.return_value = mock_client
+            mock_client.get_history.side_effect = RuntimeError(
+                'GET /chat/history?session_id=new-empty-session -> status 404: b\'{"ok":false,"error":{"code":"not_found"}}\''
+            )
+            mock_create.return_value = mock_client
+
+            # _fetch_session should gracefully return empty list
+            res = pusher._fetch_session(mock_client, "new-empty-session")
+            self.assertEqual(res, [])
+
+            # Run one tick of run_loop
+            pusher._running = True
+            task = asyncio.create_task(pusher._run_loop())
+            await asyncio.sleep(0.05)
+            pusher._running = False
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+
+            # The new session should now be marked gated so it is not re-fetched constantly
+            self.assertIn("new-empty-session", pusher._gated)
+
+    async def test_inbound_post_message_404_auto_recreates_session(self):
+        """Test sending message encountering 404 automatically creates new session and posts."""
+        qq_config = QQConfig(
+            app_id="app_123",
+            admin_id=["ADMIN_OPENID"],
+            whitelist={"private": ["ADMIN_OPENID"]},
+            push=QQPushConfig(enabled=True, target_type="private", target_id="ADMIN_OPENID"),
+        )
+        adapter = QQAdapter(config=qq_config, muse_service=self.muse_service)
+        mock_qq_client = MagicMock()
+        mock_qq_client.send_message.return_value = (200, {})
+        adapter.client = mock_qq_client
+
+        old_sid = adapter.active_session_id
+        calls = []
+
+        def mock_post(sid, text, *args, **kwargs):
+            calls.append(sid)
+            if len(calls) == 1:
+                raise RuntimeError("GET /chat/history -> status 404: session not found")
+            return "new_mid_123"
+
+        with patch.object(self.muse_service, "post_message", side_effect=mock_post):
+            event = {
+                "id": "msg_003",
+                "content": "Hello",
+                "author": {"user_openid": "ADMIN_OPENID"},
+            }
+            await adapter.handle_event("C2C_MESSAGE_CREATE", event)
+
+            self.assertEqual(len(calls), 2)
+            self.assertEqual(calls[0], old_sid)
+            self.assertNotEqual(calls[1], old_sid)
+            # Active session was updated
+            self.assertEqual(adapter.active_session_id, calls[1])
+
 
 if __name__ == "__main__":
     unittest.main()
