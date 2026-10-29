@@ -30,6 +30,8 @@ from ...muse.client.render import (
     extract_workspace_files,
     extract_workspace_images,
     extract_workspace_videos,
+    render_widget_to_text,
+    render_presentation_card_to_text,
 )
 from ...muse.service import MuseService
 from .client import QQClient
@@ -41,9 +43,21 @@ _IMAGE_EXTS = (".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp")
 _VIDEO_EXTS = (".mp4", ".mov", ".webm", ".mkv", ".avi", ".m4v")
 
 
-def _clean_text(text: str) -> str:
+def _clean_text(text: str, widgets: Optional[List[dict]] = None) -> str:
     cleaned = _SANDBOX_MEDIA_RE.sub("", text)
-    cleaned = _WIDGET_RE.sub("", cleaned)
+    if widgets:
+        w_map = {w["widget_id"]: w for w in widgets if isinstance(w, dict) and w.get("widget_id")}
+        def _replace_widget(m):
+            wid = m.group(1)
+            w = w_map.get(wid)
+            if w:
+                rendered = render_widget_to_text(w)
+                if rendered:
+                    return f"\n\n{rendered}\n\n"
+            return ""
+        cleaned = re.sub(r"\[\[hatch_widget:([^\]]+)\]\]", _replace_widget, cleaned)
+    else:
+        cleaned = _WIDGET_RE.sub("", cleaned)
     cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
     return cleaned.strip()
 
@@ -475,13 +489,9 @@ class QQOutboundPusher:
             return sid, "sync"
 
         if name == "delta.presentation":
-            data = payload.get("data") or {}
-            if not isinstance(data, dict):
-                data = {}
-            kind = data.get("type") or payload.get("kind")
-            if kind in ("image", "file", "video") or "file" in data or "image_path" in payload or "video_path" in payload:
-                return sid, "sync"
-            return sid, None
+            # All presentations (media images/files/videos as well as browser cards,
+            # credentials vaults, option boxes, etc.) trigger outbound sync.
+            return sid, "sync"
 
         if name == "task.status":
             if payload.get("status") == "completed":
@@ -725,7 +735,6 @@ class QQOutboundPusher:
             if event_name not in ("message.assistant", "delta.presentation"):
                 continue
 
-            # Ignore pure web UI widget cards (e.g. HTML timer cards) that have no image/file media
             is_media_presentation = (
                 event_name == "delta.presentation"
                 and (
@@ -738,10 +747,6 @@ class QQOutboundPusher:
                 )
             )
 
-            if event_name == "delta.presentation" and not is_media_presentation:
-                self._seen_ids.add(mid)
-                continue
-
             # For normal text messages, ensure generation is completed (never partial/streaming!)
             if event_name == "message.assistant":
                 status = payload.get("status") or event.get("status")
@@ -751,7 +756,11 @@ class QQOutboundPusher:
                     continue
 
             raw_text = event.get("display_text") or ""
-            clean_text = _clean_text(raw_text)
+            if event_name == "delta.presentation" and not is_media_presentation:
+                # Non-media presentation cards (browser tasks, credentials vaults, image options, etc.)
+                clean_text = render_presentation_card_to_text(event) or ""
+            else:
+                clean_text = _clean_text(raw_text, payload.get("widgets"))
 
             images = event.get("_extracted_images") or []
             files = event.get("_extracted_files") or []
