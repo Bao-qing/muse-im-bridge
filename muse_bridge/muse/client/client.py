@@ -317,7 +317,8 @@ class MuseClient:
         deadline = time.time() + timeout
         while time.time() < deadline:
             try:
-                _, frame = self._ws.recv(timeout=20)
+                _, frame = self._ws.recv(
+                    timeout=min(20, max(0.05, deadline - time.time())))
             except ConnectionError as e:
                 raise ConnectionLost(f"gateway connection lost: {e}") from e
             except Exception:
@@ -370,6 +371,15 @@ class MuseClient:
         if status != 200:
             raise RPCError(method, path, status, data)
         return data
+
+    def ping(self, presence: str = "active", timeout: float = 10.0) -> dict:
+        """Application-level Noise RPC heartbeat (`POST /api/ping`).
+        Matches the official web client's `startHeartbeatLoop` (30s interval,
+        10s timeout) to keep long-lived subscribe streams alive and detect
+        half-open dead sockets promptly."""
+        body = json.dumps({"presence": presence}).encode()
+        raw = self.request("POST", "/api/ping", body, timeout=timeout)
+        return json.loads(raw)
 
     # -- chat RPCs ----------------------------------------------------
     def send_message(self, session_id, text, images=None, files=None,

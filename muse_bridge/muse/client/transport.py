@@ -180,6 +180,7 @@ class WS:
         else:
             raise RuntimeError(
                 "WS route is not configured: pass proxy_url, or direct=True")
+        self._enable_tcp_keepalive(s)
         ctx = ssl.create_default_context()
         ctx.set_alpn_protocols(["http/1.1"])
         self.sock = ctx.wrap_socket(s, server_hostname=host)
@@ -200,6 +201,19 @@ class WS:
         if " 101" not in head.split("\r\n")[0]:
             raise RuntimeError(f"WS upgrade failed: {head[:300]}")
         self.buf = resp.split(b"\r\n\r\n", 1)[1]
+
+    @staticmethod
+    def _enable_tcp_keepalive(sock) -> None:
+        try:
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+            if hasattr(socket, "TCP_KEEPIDLE"):
+                sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPIDLE, 30)
+            if hasattr(socket, "TCP_KEEPINTVL"):
+                sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPINTVL, 10)
+            if hasattr(socket, "TCP_KEEPCNT"):
+                sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPCNT, 3)
+        except Exception:
+            pass
 
     @staticmethod
     def _read_until(sock, marker: bytes) -> bytes:
