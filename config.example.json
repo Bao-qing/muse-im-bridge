@@ -2,7 +2,11 @@
   "muse": {
     "cookies_file": "cookies.json",
     "session_id": "YOUR_MUSE_SESSION_ID",
-    "reply_mode": "push"
+    "reply_mode": "push",
+    "approval": {
+      "mode": "manual",
+      "notify": true
+    }
   },
   "adapters": {
     "qq": {
@@ -13,6 +17,7 @@
         "YOUR_ADMIN_OPENID"
       ],
       "admin_only": true,
+      "credentials_in_place": false,
       "session_mode": "global",
       "session_bindings": {},
       "proactive_to_session_owner": true,

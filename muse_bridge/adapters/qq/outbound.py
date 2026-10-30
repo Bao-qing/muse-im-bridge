@@ -412,7 +412,7 @@ class QQOutboundPusher:
                     self.client.send_message,
                     "private",
                     admin_target,
-                    "【系统提示】获取 Muse 消息时检测到凭据失效（401 Unauthorized）。\n已自动进入登录回落流程，请直接在此私聊发送：\n/login <您的邮箱>\n（或直接回复您的邮箱地址）即可获取验证码重新登录恢复服务 ♪",
+                    "【系统提示】获取 Muse 消息时检测到凭据失效（401 Unauthorized）。\n已自动进入登录回落流程，请直接在此私聊发送：\n/login <您的邮箱>\n即可获取验证码重新登录恢复服务 ♪",
                 )
             except Exception as e:
                 if self.config.debug:
@@ -710,7 +710,31 @@ class QQOutboundPusher:
                 return owners[0]
         return self.config.resolve_push_target()
 
+    async def notify_interaction(self, item, text):
+        # Routing is not authorization; only configured admins can decide.
+        targets = list(self.session_mapper.owners(item.session_id))
+        if not targets:
+            target = self._proactive_target(item.session_id)
+            if target[1]:
+                targets.append(target)
+        targets.extend(("private", admin) for admin in self.config.admin_id)
+        delivered = False
+        for target_type, target_id in dict.fromkeys(targets):
+            if not target_id:
+                continue
+            route = self.route_manager.get_latest_for_target(target_type, target_id, max_age_s=280.0)
+            fingerprint = item.context.get("fingerprint")
+            ok = await self._send_to_qq(target_type, target_id, text, [], [], [], route=route)
+            if ok and item.kind == "approval":
+                item.context.setdefault("displayed_to", {})[(target_type, target_id)] = fingerprint
+            delivered = bool(ok) or delivered
+        return delivered
+
     async def _scan_and_dispatch(self, hist: List[dict], session_id: Optional[str] = None) -> None:
+        # Consume state updates before message delivery deduplication.
+        for event in hist:
+            if event.get("event_name") == "delta.presentation" and session_id:
+                self.muse_service.interaction_protocol.register_credential(event, session_id)
         ordered = sorted(hist, key=lambda e: e.get("seq") or 0)
         last_user_mid: Optional[str] = None
 
@@ -769,10 +793,27 @@ class QQOutboundPusher:
                         print(f"[QQOutbound] Skip {mid}: generation in progress (status={status})")
                     continue
 
+            credential = None
             raw_text = event.get("display_text") or ""
             if event_name == "delta.presentation" and not is_media_presentation:
                 # Non-media presentation cards (browser tasks, credentials vaults, image options, etc.)
-                clean_text = render_presentation_card_to_text(event) or ""
+                credential = self.muse_service.interaction_protocol.register_credential(event, session_id) if session_id else None
+                if credential and not credential.terminal:
+                    if credential.context.get("auth_providers") or credential.context.get("grant_request_type"):
+                        hint = "请在 Muse 网页完成此登录。"
+                    elif not self.config.credentials_in_place:
+                        hint = "请管理员私聊填写。"
+                    elif credential.context.get("capture") == "verification_code":
+                        hint = "管理员可引用此消息，发送验证码。"
+                    else:
+                        hint = "管理员可引用此消息，分两行发送账号和密码。"
+                    clean_text = chr(10).join((
+                        f"【凭证 {credential.id}】{credential.context['page_url']}",
+                        hint, f"也可发送 /凭证 {credential.id}；"))
+                elif credential:
+                    clean_text = "凭证卡已结束。"
+                else:
+                    clean_text = render_presentation_card_to_text(event) or ""
             else:
                 clean_text = _clean_text(raw_text, payload.get("widgets"))
 
@@ -828,6 +869,7 @@ class QQOutboundPusher:
                     files=files,
                     videos=videos,
                     route=route,
+                    **({"credential": credential} if credential else {}),
                 )
                 if success:
                     self.deduplicator.mark_delivered([mid])
@@ -851,11 +893,13 @@ class QQOutboundPusher:
         files: List[dict],
         videos: List[dict],
         route: Optional[RouteInfo] = None,
+        credential=None,
     ) -> bool:
         loop = asyncio.get_running_loop()
         chunks = chunk_text(text, self.config.chunk_chars, self.config.max_chunks) if text else []
         passive_limit = 4 if target_type == "private" else 5
         active_budget = self.config.max_active_chunks
+        all_delivered = True
 
         def _get_passive_meta():
             if not route or not route.msg_id:
@@ -868,6 +912,7 @@ class QQOutboundPusher:
         async def _deliver_item(content=None, md=None, media_info=None) -> bool:
             nonlocal active_budget
             curr_mid, curr_seq = _get_passive_meta()
+            delivered_type, delivered_id = target_type, target_id
 
             if not curr_mid:
                 if active_budget <= 0:
@@ -910,6 +955,7 @@ class QQOutboundPusher:
                     if admin_id and (admin_type != target_type or admin_id != target_id):
                         if self.config.debug:
                             print(f"[QQOutbound] Group active send rejected ({code}); falling back to admin {admin_type}:{admin_id}")
+                        delivered_type, delivered_id = admin_type, admin_id
                         code, body = await loop.run_in_executor(
                             None,
                             self.client.send_message,
@@ -923,11 +969,14 @@ class QQOutboundPusher:
             if not (200 <= code < 300):
                 print(f"[QQOutbound] Failed sending item to {target_type}:{target_id} ({code}): {body}")
                 return False
+            if credential is not None:
+                self.muse_service.interactions.remember_credential_message(
+                    delivered_type, delivered_id, body, credential)
             return True
 
         # 1. Send text chunks
         for chunk in chunks:
-            await _deliver_item(content=chunk, md=chunk)
+            all_delivered = await _deliver_item(content=chunk, md=chunk) and all_delivered
 
         # 2. Send images
         for img in images:
@@ -1034,4 +1083,4 @@ class QQOutboundPusher:
             except Exception as e:
                 print(f"[QQOutbound] Failed to upload/send file: {e}")
 
-        return True
+        return all_delivered

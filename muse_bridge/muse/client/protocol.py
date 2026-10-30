@@ -74,11 +74,13 @@ def pb_parse(data: bytes):
 
 
 def http_request_envelope(seq: int, method: str, path: str, body: bytes = b"",
-                          extra_headers=(), include_content_type: bool = True) -> bytes:
+                          extra_headers=(), include_content_type: bool = True,
+                          service: str = "daemon") -> bytes:
     """ServiceRequest{ payload: ServiceFrame{ stream_id: seq,
     kind.request: ApplicationRequest{ verb, path, headers[], body, end_body } } }.
-    ServiceRequest.service is omitted (= 0, the default). GET requests on the
-    page carry no Content-Type header, so callers can omit it."""
+    Service enum verified in the web client's module 545050: daemon=0,
+    sentinel=1, vault=2, authd=3, ssh_access=4. GET requests on the page
+    carry no Content-Type header, so callers can omit it."""
     headers = []
     if include_content_type:
         headers.append(("Content-Type", "application/json"))
@@ -95,7 +97,11 @@ def http_request_envelope(seq: int, method: str, path: str, body: bytes = b"",
         req += pb_bytes(4, body)
     req += pb_field_varint(5, 1)  # end_body = true
     frame = pb_field_varint(1, seq) + pb_bytes(2, req)
-    return pb_bytes(2, frame)
+    services = {"daemon": 0, "sentinel": 1, "vault": 2, "authd": 3, "ssh_access": 4}
+    if service not in services:
+        raise ValueError(f"Unknown Noise service: {service}")
+    selector = pb_field_varint(1, services[service]) if services[service] else b""
+    return selector + pb_bytes(2, frame)
 
 
 def transport_frame(payload: bytes, chunk_id=None, chunk_index=0,

@@ -60,12 +60,27 @@ class BridgeEngine:
         else:
             print("[BridgeEngine] 启动验证：Muse 会话凭据有效，认证通过。")
 
+        if cred_ok:
+            try:
+                await self.muse_service.interaction_protocol.reconcile()
+            except Exception:
+                print("[BridgeEngine] 审批状态尚未就绪，普通消息保持门禁。")
+
         tasks = [asyncio.create_task(a.start()) for a in enabled_adapters]
+        tasks.append(asyncio.create_task(self.muse_service.interaction_protocol.run(
+            self._notify_interaction, lambda: self._running)))
 
         try:
             await asyncio.gather(*tasks)
         except asyncio.CancelledError:
             pass
+
+    async def _notify_interaction(self, item, text):
+        delivered = False
+        for adapter in self.adapters:
+            if isinstance(adapter, QQAdapter) and adapter.is_enabled:
+                delivered = await adapter.notify_interaction(item, text) or delivered
+        return delivered
 
     async def _notify_admin_login(self, admin_target: str) -> None:
         await asyncio.sleep(4)  # Wait for QQ gateway to connect
@@ -78,7 +93,7 @@ class BridgeEngine:
                     qq_adapter.client.send_message,
                     "private",
                     admin_target,
-                    "【系统提示】Muse 会话凭据未就绪或已失效，已进入登录回落流程。\n您可直接在此私聊发送：\n/login <您的邮箱>\n（或直接回复您的邮箱地址）即可获取验证码完成在线认证 ♪",
+                    "【系统提示】Muse 会话凭据未就绪或已失效，已进入登录回落流程。\n您可直接在此私聊发送：\n/login <您的邮箱>\n即可获取验证码完成在线认证 ♪",
                 )
                 qq_adapter.enter_login_mode(admin_target)
             except Exception as e:
@@ -87,6 +102,7 @@ class BridgeEngine:
 
     async def stop(self) -> None:
         self._running = False
+        self.muse_service.interactions.close()
         print("[BridgeEngine] Stopping all adapters...")
         stop_tasks = [a.stop() for a in self.adapters if a.is_enabled]
         if stop_tasks:

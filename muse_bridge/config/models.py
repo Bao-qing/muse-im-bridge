@@ -47,6 +47,18 @@ def _detect_egress_ip(proxy_url: Optional[str] = None, direct: bool = True) -> s
 
 
 @dataclasses.dataclass
+class ApprovalConfig:
+    mode: str = "manual"
+    notify: bool = True
+
+    def __post_init__(self):
+        if self.mode not in {"manual", "allow_all", "deny_all"}:
+            raise ValueError("muse.approval.mode must be manual, allow_all, or deny_all")
+        if not isinstance(self.notify, bool):
+            raise ValueError("muse.approval.notify must be a boolean")
+
+
+@dataclasses.dataclass
 class MuseConfig:
     mint_file: str = ".mint.json"
     cookies_file: str = "cookies.json"
@@ -58,6 +70,7 @@ class MuseConfig:
     proxy_url: Optional[str] = None
     direct: bool = constants.DEFAULT_MUSE_DIRECT
     reply_mode: str = constants.DEFAULT_MUSE_REPLY_MODE
+    approval: ApprovalConfig = dataclasses.field(default_factory=ApprovalConfig)
 
 
 @dataclasses.dataclass
@@ -85,6 +98,7 @@ class QQConfig:
     app_secret: str = ""
     admin_id: List[str] = dataclasses.field(default_factory=list)
     admin_only: bool = constants.DEFAULT_ADMIN_ONLY
+    credentials_in_place: bool = False
     session_id: str = ""
     whitelist: Dict[str, Union[List[str], str]] = dataclasses.field(default_factory=dict)
     push: QQPushConfig = dataclasses.field(default_factory=QQPushConfig)
@@ -133,6 +147,10 @@ class QQConfig:
     poll_timeout_s: int = constants.DEFAULT_POLL_TIMEOUT_S
     poll_interval_s: int = constants.DEFAULT_POLL_INTERVAL_S
     poll_quiet_polls: int = constants.DEFAULT_POLL_QUIET_POLLS
+
+    def __post_init__(self):
+        if type(self.credentials_in_place) is not bool:
+            raise ValueError("adapters.qq.credentials_in_place must be a boolean")
 
     def is_admin(self, user_openid: str) -> bool:
         """Whether the user openid belongs to an administrator."""
@@ -276,7 +294,15 @@ class ConfigLoader:
 
         # 1. Muse config
         m_raw = raw_data.get("muse", {})
+        approval_raw = m_raw.get("approval", {})
+        if not isinstance(approval_raw, dict):
+            raise ValueError("muse.approval must be an object")
+        approval_cfg = ApprovalConfig(
+            mode=approval_raw.get("mode", "manual"),
+            notify=approval_raw.get("notify", True),
+        )
         muse_cfg = MuseConfig(
+            approval=approval_cfg,
             mint_file=_get_val(m_raw, "mint_file", os.environ.get("MUSE_MINT_FILE") or ".mint.json"),
             cookies_file=_get_val(m_raw, "cookies_file", os.environ.get("MUSE_COOKIES_FILE") or "cookies.json"),
             session_id=_get_val(m_raw, "session_id", os.environ.get("MUSE_SESSION_ID") or ""),
@@ -330,6 +356,7 @@ class ConfigLoader:
             app_secret=str(q_raw.get("app_secret") or os.environ.get("QQ_APP_SECRET") or ""),
             admin_id=admin_ids,
             admin_only=bool(_get_val(q_raw, "admin_only", constants.DEFAULT_ADMIN_ONLY)),
+            credentials_in_place=q_raw.get("credentials_in_place", False),
             session_id=str(q_raw.get("session_id") or muse_cfg.session_id or ""),
             whitelist=q_raw.get("whitelist") or {},
             push=push_cfg,

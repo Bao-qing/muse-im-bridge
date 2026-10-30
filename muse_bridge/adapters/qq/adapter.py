@@ -21,9 +21,11 @@ from ...core.deduplicator import MessageDeduplicator
 from ...core.message import Attachment
 from ...core.session_map import SessionMapper
 from ...muse.service import MuseService
+from ...muse.interactions import ApprovalBlocked
 from ..base import BaseAdapter
 from .client import QQClient
 from .gateway import QQGateway
+from .interactions import QQInteractions
 from .outbound import QQOutboundPusher
 from .route_manager import RouteManager
 
@@ -68,6 +70,8 @@ class QQAdapter(BaseAdapter):
             global_state_file=self.config.session_state_file,
         )
 
+        self.muse_service.interactions.managed_sessions.update(self.session_mapper.session_ids())
+
         # 1. Inbound Gateway (receives QQ events)
         self.gateway = QQGateway(
             client=self.client,
@@ -91,9 +95,12 @@ class QQAdapter(BaseAdapter):
         )
 
         self._in_login_fallback: bool = False
-        self._login_sessions: Dict[Tuple[str, str, str], dict] = {}
+        self.interaction_router = QQInteractions(self)
         self._chat_send_locks: Dict[Tuple[str, str], asyncio.Lock] = {}
         self._running = False
+
+    async def notify_interaction(self, item, text):
+        return await self.outbound_pusher.notify_interaction(item, text)
 
     def enter_login_mode(self, admin_target: Optional[str] = None) -> None:
         self._in_login_fallback = True
@@ -111,7 +118,7 @@ class QQAdapter(BaseAdapter):
                 self.client.send_message,
                 "private",
                 admin_target,
-                "【系统告警】向 Muse 发送消息时检测到凭据失效（401 Unauthorized）。\n已自动进入登录回落流程，请直接在此私聊发送：\n/login <您的邮箱>\n（或直接回复您的邮箱地址）即可获取验证码重新登录恢复服务 ♪",
+                "【系统告警】向 Muse 发送消息时检测到凭据失效（401 Unauthorized）。\n已自动进入登录回落流程，请直接在此私聊发送：\n/login <您的邮箱>\n即可获取验证码重新登录恢复服务 ♪",
             )
         except Exception as e:
             if self.config.debug:
@@ -123,7 +130,7 @@ class QQAdapter(BaseAdapter):
         target_id: str,
         reply: str,
         msg_id: Optional[str] = None,
-    ) -> None:
+    ) -> dict:
         loop = asyncio.get_running_loop()
         code, body = await loop.run_in_executor(
             None,
@@ -138,7 +145,7 @@ class QQAdapter(BaseAdapter):
         )
         if not (200 <= code < 300):
             # Fall back to active send so command replies are never dropped
-            await loop.run_in_executor(
+            code, body = await loop.run_in_executor(
                 None,
                 self.client.send_message,
                 target_type,
@@ -146,6 +153,9 @@ class QQAdapter(BaseAdapter):
                 reply,
                 reply,
             )
+        if not (200 <= code < 300):
+            raise RuntimeError("QQ reply delivery failed")
+        return body
 
     @property
     def name(self) -> str:
@@ -175,7 +185,7 @@ class QQAdapter(BaseAdapter):
     def is_allowed(self, event_type: str, d: dict) -> bool:
         """Check sender against whitelist."""
         author = d.get("author", {})
-        openid = author.get("user_openid") or author.get("id") or ""
+        openid = author.get("user_openid") or author.get("member_openid") or author.get("id") or ""
         wl = self.config.whitelist
         if not wl:
             return False
@@ -238,112 +248,30 @@ class QQAdapter(BaseAdapter):
         content = re.sub(r"<@!?\w+>", "", raw_content).strip()
         attachments = self.extract_attachments(d)
 
-        if not content and not attachments:
+        if not content and not attachments and not self.interaction_router.message_references(d):
             return
 
         target_type = "private" if event_type == "C2C_MESSAGE_CREATE" else "group"
         target_id = d.get("author", {}).get("user_openid") if target_type == "private" else d.get("group_openid")
 
-        print(f"[QQAdapter] Inbound ({event_type}) from {target_type}:{target_id}: {content}")
-
         author = d.get("author", {})
-        user_openid = author.get("user_openid") or author.get("id") or ""
+        user_openid = author.get("user_openid") or author.get("member_openid") or author.get("id") or ""
         is_admin = self.config.is_admin(user_openid)
-        session_key = (target_type, target_id, user_openid)
+        owner = (target_type, target_id, user_openid)
+        session_id = self.session_mapper.current(target_type, target_id) or ""
 
-        # 0. Ongoing Login Session (both group & private supported)
-        if session_key in self._login_sessions:
-            session = self._login_sessions[session_key]
-            if time.time() - session["timestamp"] > 300:
-                del self._login_sessions[session_key]
-            else:
-                if content.lower() in ("/cancel", "取消", "退出"):
-                    del self._login_sessions[session_key]
-                    await self._send_command_reply(target_type, target_id, "【系统提示】登录流程已取消。", msg_id)
-                    return
+        # Consume sensitive input before any raw message logging.
+        if await self.interaction_router.handle(owner, content, msg_id, is_admin, session_id, event=d):
+            print(f"[QQAdapter] Local interaction from {target_type}:{target_id}: [redacted]")
+            return
 
-                code_match = re.search(r"^\s*([0-9]{6})\s*$", content)
-                if code_match:
-                    otp_code = code_match.group(1)
-                    auth = session["auth"]
-                    loop = asyncio.get_running_loop()
-                    try:
-                        await loop.run_in_executor(None, auth.confirm_otp, otp_code)
-                        cookies_data = auth.extract_cookies()
-                        cookies_path = self.muse_service.config.cookies_file or "cookies.json"
-                        with open(cookies_path, "w", encoding="utf-8") as f:
-                            json.dump(cookies_data, f, indent=2, ensure_ascii=False)
-                            f.write("\n")
-                        del self._login_sessions[session_key]
-                        try:
-                            await loop.run_in_executor(None, self.muse_service.token_manager.refresh_from_cookies)
-                            self.exit_login_mode()
-                            reply = f"【登录成功】已成功更新会话 Cookies ({cookies_path}) 并刷新凭据，Muse 服务已恢复正常！"
-                        except Exception as refresh_err:
-                            msg_str = str(refresh_err)
-                            if "cannot resolve vm_id" in msg_str or "not found in page HTML" in msg_str:
-                                reply = f"【登录提示】验证码校验成功，Cookies 已保存至 {cookies_path}。\n但该账号目前处于等候名单（Waitlist），尚未分配虚拟机（VM），请等待官方审核放行。"
-                            else:
-                                reply = f"【登录提示】Cookies 已保存，但刷新 Token 提示：{refresh_err}"
-                        await self._send_command_reply(target_type, target_id, reply, msg_id)
-                    except Exception as e:
-                        await self._send_command_reply(
-                            target_type,
-                            target_id,
-                            f"【登录失败】验证码确认出错：{e}\n请重新输入收到的 6 位数验证码，或发送 /cancel 取消。",
-                            msg_id,
-                        )
-                    return
-                else:
-                    await self._send_command_reply(
-                        target_type,
-                        target_id,
-                        f"【等待验证码】当前正在登录流程中（邮箱: {session['email']}）。\n请直接回复收到的 6 位数纯数字验证码，或回复 /cancel 取消。",
-                        msg_id,
-                    )
-                    return
-
-        # 0.1 Direct email input or login fallback check
         needs_login = self._in_login_fallback or not self.muse_service.token_manager.has_credentials()
-        email_pattern = r"^[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+$"
-        is_email = bool(re.match(email_pattern, content.strip()))
-
-        # If admin directly sends an email in private chat (or in group if admin_only is false):
-        if (is_admin or not self.config.admin_only) and is_email:
-            email = content.strip()
-            from ...muse.login import MuseProtocolLogin
-            auth = MuseProtocolLogin(base_url="https://muse.ai")
-            loop = asyncio.get_running_loop()
-            try:
-                await loop.run_in_executor(None, auth.send_otp, email)
-                self._login_sessions[session_key] = {
-                    "auth": auth,
-                    "email": email,
-                    "timestamp": time.time(),
-                }
-                reply = f"【登录流程】验证码已成功发送至 {email}。\n请直接回复收到的 6 位数验证码完成登录（或发送 /cancel 取消）："
-            except Exception as e:
-                reply = f"【发送验证码失败】：{e}"
-            await self._send_command_reply(target_type, target_id, reply, msg_id)
-            return
-
-        # If in login fallback and user message is not a command, intercept immediately with login guidance
         if needs_login and not content.startswith("/"):
-            if target_type == "private" and is_admin:
-                await self._send_command_reply(
-                    target_type,
-                    target_id,
-                    "【系统提示】Muse 会话凭据已失效，当前已回落至登录流程。\n请直接回复您的登录邮箱（如 user@example.com）或发送 /login <邮箱> 获取验证码 ♪",
-                    msg_id,
-                )
-            else:
-                await self._send_command_reply(
-                    target_type,
-                    target_id,
-                    "【系统提示】Muse 会话凭据已失效，机器人正处于登录维护状态，正在等待管理员重新认证恢复。",
-                    msg_id,
-                )
+            text = "Muse 认证不可用，请管理员私聊发送 /login 或 /login <邮箱>。"
+            await self._send_command_reply(target_type, target_id, text, msg_id)
             return
+
+        print(f"[QQAdapter] Inbound ({event_type}) from {target_type}:{target_id}: {content}")
 
         # 1. Local Slash Commands
         parsed = CommandHandler.parse_command(content)
@@ -359,28 +287,6 @@ class QQAdapter(BaseAdapter):
                     "权限不足：管理指令仅限管理员在私聊中执行（如需在群聊中使用，可在配置中设置 admin_only: false）。",
                     msg_id,
                 )
-                return
-
-            # /login command
-            if cmd_name == "login":
-                email = cmd_args.strip()
-                if not email or "@" not in email:
-                    await self._send_command_reply(target_type, target_id, "用法：/login <邮箱地址>\n示例：/login user@example.com", msg_id)
-                    return
-                from ...muse.login import MuseProtocolLogin
-                auth = MuseProtocolLogin(base_url="https://muse.ai")
-                loop = asyncio.get_running_loop()
-                try:
-                    await loop.run_in_executor(None, auth.send_otp, email)
-                    self._login_sessions[session_key] = {
-                        "auth": auth,
-                        "email": email,
-                        "timestamp": time.time(),
-                    }
-                    reply = f"【登录流程】验证码已成功发送至 {email}。\n请直接回复收到的 6 位数验证码完成登录（或发送 /cancel 取消）："
-                except Exception as e:
-                    reply = f"【发送验证码失败】：{e}"
-                await self._send_command_reply(target_type, target_id, reply, msg_id)
                 return
 
             loop = asyncio.get_running_loop()
@@ -417,12 +323,15 @@ class QQAdapter(BaseAdapter):
                         self.outbound_pusher.session_id = new_sid
             except CommandError as e:
                 reply = str(e)
+            except ApprovalBlocked as e:
+                await self._send_command_reply(target_type, target_id, str(e), msg_id)
+                return
             except Exception as e:
                 err_msg = str(e).lower()
                 if any(k in err_msg for k in ("401", "403", "unauthorized", "credential", "cookie", "handshake", "hatch_vm_auth")):
                     self.muse_service.token_manager.invalidate()
                     self.enter_login_mode()
-                    reply = "【系统提示】执行指令时检测到 Muse 会话凭据已失效，已进入登录回落流程。\n请管理员在此私聊发送 /login <您的邮箱>（或直接回复邮箱）进行登录认证。"
+                    reply = "【系统提示】执行指令时检测到 Muse 会话凭据已失效，已进入登录回落流程。\n请管理员在此私聊发送 /login <您的邮箱>进行登录认证。"
                 else:
                     reply = f"命令执行出错：{e}"
             finally:
@@ -493,6 +402,9 @@ class QQAdapter(BaseAdapter):
                 self.route_manager.register(sent_mid, target_type, target_id, msg_id)
                 if self.config.debug:
                     print(f"[QQAdapter] Message delivered to Muse (mid={sent_mid}), route registered for {target_type}:{target_id}")
+            except ApprovalBlocked as e:
+                await self._send_command_reply(target_type, target_id, str(e), msg_id)
+                return
             except Exception as e:
                 err_msg = str(e).lower()
                 if any(k in err_msg for k in ("401", "403", "unauthorized", "credential", "cookie", "handshake", "hatch_vm_auth")):
@@ -501,7 +413,7 @@ class QQAdapter(BaseAdapter):
                     self.enter_login_mode()
                     admin_target = self.config.get_default_private_target()
                     if target_type == "private" and is_admin:
-                        reply = "【系统提示】发送消息时检测到 Muse 会话凭据已失效，已进入登录回落流程。\n请直接回复您的登录邮箱（如 user@example.com）以获取验证码 ♪"
+                        reply = "【系统提示】发送消息时检测到 Muse 会话凭据已失效，已进入登录回落流程。\n请发送 /login 或 /login <邮箱> 获取验证码。"
                     else:
                         reply = "【系统提示】Muse 会话凭据已失效，服务已暂停并进入登录维护状态，已通知管理员重新登录。"
                         if admin_target and (target_type != "private" or target_id != admin_target):
