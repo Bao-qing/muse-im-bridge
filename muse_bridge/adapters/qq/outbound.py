@@ -534,6 +534,7 @@ class QQOutboundPusher:
 
                 subscribed_sids: Set[str] = set()
                 trackers: Dict[str, PushTurnTracker] = {}
+                last_ping_mono: float = time.monotonic()
 
                 # Inner persistent event loop over the single connected MuseClient
                 while self._running:
@@ -546,6 +547,9 @@ class QQOutboundPusher:
                         continue
 
                     # 1. Sync subscriptions & initial hydration for newly watched or re-activated sessions
+                    for sid in list(self._pending_subscribe):
+                        if sid in subscribed_sids and sid in self._gated:
+                            self._pending_subscribe.discard(sid)
                     need_setup = [
                         sid for sid in watched
                         if (sid not in self._gated)
@@ -596,6 +600,7 @@ class QQOutboundPusher:
 
                     # 2. Read real-time push events from active /chat/subscribe stream(s)
                     def _read_And_sync_events() -> List[Tuple[str, List[dict]]]:
+                        nonlocal last_ping_mono
                         if hasattr(client, "read_any_subscription_events"):
                             events = client.read_any_subscription_events(timeout=1.0)
                         else:
@@ -603,6 +608,15 @@ class QQOutboundPusher:
                             subs = list(getattr(client, "_subscriptions", {}).values())
                             events = subs[0].read_events(timeout=1.0) if subs else []
 
+                        now_mono = time.monotonic()
+                        if events:
+                            last_ping_mono = now_mono
+                        elif now_mono - last_ping_mono >= 30.0:
+                            last_ping_mono = now_mono
+                            if hasattr(client, "ping") and callable(getattr(client, "ping", None)):
+                                client.ping(presence="active", timeout=10.0)
+                            if hasattr(client, "read_any_subscription_events"):
+                                events = client.read_any_subscription_events(timeout=0.0)
                         if not events:
                             return []
 

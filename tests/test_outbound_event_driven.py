@@ -360,6 +360,39 @@ class TestOutboundEventDriven(unittest.IsolatedAsyncioTestCase):
         res_avatar = render_presentation_card_to_text(ev_avatar)
         self.assertEqual("【卡片提示】我的新形象换好啦：你可以分享给朋友哦！", res_avatar)
 
+    async def test_already_subscribed_session_skips_redundant_history_fetch_on_track(self):
+        pusher, mapper, muse_service, qq_client = self._make_pusher(mode="global")
+        sid = "GLOBAL"
+
+        mock_sub = mock.Mock()
+        fake_client = mock.MagicMock()
+        fake_client.__enter__.return_value = fake_client
+        fake_client.subscribe.return_value = mock_sub
+        fake_client.get_history.return_value = [{"seq": 1, "role": "user", "message_id": "u1"}]
+
+        read_calls = 0
+
+        def fake_read_events(timeout=1.0):
+            nonlocal read_calls
+            read_calls += 1
+            if read_calls == 1:
+                # Simulate user sending a message after session is already subscribed & gated
+                pusher.track_session(sid, fresh=False)
+                return []
+            pusher._running = False
+            return []
+
+        fake_client.read_any_subscription_events.side_effect = fake_read_events
+        muse_service.create_client.return_value = fake_client
+
+        pusher._running = True
+        await asyncio.wait_for(pusher._run_loop(), timeout=5.0)
+
+        # Initial setup calls subscribe + get_history once; subsequent track_session(sid)
+        # on an already-subscribed & gated session must NOT trigger another blocking get_history!
+        self.assertEqual(fake_client.subscribe.call_count, 1)
+        self.assertEqual(fake_client.get_history.call_count, 1)
+
 
 if __name__ == "__main__":
     unittest.main()
