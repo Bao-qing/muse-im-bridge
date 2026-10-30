@@ -137,7 +137,9 @@ def _make_adapter(tmp, mode, **extra):
                           delivered_file=os.path.join(tmp, "delivered.jsonl")),
         **extra,
     )
+    from muse_bridge.core.interactions import InteractionManager
     muse = mock.Mock()
+    muse.interactions = InteractionManager()
     muse.post_message = mock.Mock(side_effect=lambda sid, text, atts, thr: f"mid-{sid}-{text}")
     adapter = QQAdapter(config=cfg, muse_service=muse)
     adapter.route_manager = RouteManager(state_file=None)

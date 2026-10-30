@@ -347,14 +347,15 @@ class MuseClient:
         return status, chunks
 
     def request(self, method, path, body=b"", timeout=30,
-                include_content_type=True):
+                include_content_type=True, service="daemon"):
         """One RPC on a fresh stream. Returns the joined body bytes.
         Raises RPCError on a non-200 status, MuseError on timeout."""
         self._ensure_connected()
         self._seq += 1
         seq = self._seq
         env = http_request_envelope(seq, method, path, body,
-                                    include_content_type=include_content_type)
+                                    include_content_type=include_content_type,
+                                    service=service)
         try:
             # Large requests (image base64) must be chunked: a single
             # ~300KB transport chunk made the server close the

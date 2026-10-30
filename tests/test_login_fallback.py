@@ -115,8 +115,10 @@ class TestLoginFallback(unittest.IsolatedAsyncioTestCase):
         mock_qq_client.send_message.return_value = (200, {})
 
         login_required_called = []
+        login_required = asyncio.Event()
         def on_login_req(target):
             login_required_called.append(target)
+            login_required.set()
 
         pusher = QQOutboundPusher(
             config=qq_config,
@@ -134,10 +136,10 @@ class TestLoginFallback(unittest.IsolatedAsyncioTestCase):
                 mock_client.__enter__.return_value = mock_client
                 mock_create.return_value = mock_client
 
-                # Run loop briefly
+                # Wait for the observed callback, not executor scheduling speed.
                 pusher._running = True
                 task = asyncio.create_task(pusher._run_loop())
-                await asyncio.sleep(0.05)
+                await asyncio.wait_for(login_required.wait(), timeout=3)
                 pusher._running = False
                 task.cancel()
                 try:
@@ -176,8 +178,8 @@ class TestLoginFallback(unittest.IsolatedAsyncioTestCase):
             sent_text = mock_qq_client.send_message.call_args_list[0][0][2]
             self.assertIn("登录回落流程", sent_text)
 
-    async def test_inbound_direct_email_initiates_otp_login(self):
-        """Test sending email address directly in private chat starts OTP login session."""
+    async def test_explicit_login_initiates_otp_session(self):
+        """Explicit /login starts an owned temporary OTP interaction."""
         qq_config = self._make_qq_config()
         adapter = QQAdapter(config=qq_config, muse_service=self.muse_service)
         adapter._in_login_fallback = True
@@ -188,7 +190,7 @@ class TestLoginFallback(unittest.IsolatedAsyncioTestCase):
         with patch("muse_bridge.muse.login.MuseProtocolLogin.send_otp") as mock_send_otp:
             event = {
                 "id": "msg_002",
-                "content": "user@example.com",
+                "content": "/login user@example.com",
                 "author": {"user_openid": "ADMIN_OPENID"},
             }
             await adapter.handle_event("C2C_MESSAGE_CREATE", event)
@@ -196,7 +198,11 @@ class TestLoginFallback(unittest.IsolatedAsyncioTestCase):
             mock_send_otp.assert_called_once_with("user@example.com")
             # Login session is active
             session_key = ("private", "ADMIN_OPENID", "ADMIN_OPENID")
-            self.assertIn(session_key, adapter._login_sessions)
+            interaction = self.muse_service.interactions.current(session_key)
+            self.assertIsNotNone(interaction)
+            self.assertEqual(interaction.kind, "login")
+            self.assertEqual(interaction.state, "wait_otp")
+            self.muse_service.interactions.close()
 
     async def test_outbound_pusher_handles_404_session_not_found(self):
         """Test outbound pusher treats 404 session not found as empty and marks it gated."""

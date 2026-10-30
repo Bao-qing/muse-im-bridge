@@ -15,14 +15,39 @@ from .client import MuseClient, TurnResult
 from .client.errors import HandshakeError, TurnCancelled
 
 from ..config.models import MuseConfig
+from ..core.interactions import InteractionManager
 from ..core.message import Attachment
 from .token_manager import MuseTokenManager
+from .interactions import ApprovalBlocked, MuseInteractions
 
 
 class MuseService:
     def __init__(self, config: MuseConfig, token_manager: MuseTokenManager):
         self.config = config
         self.token_manager = token_manager
+        self.interactions = InteractionManager()
+        self.interaction_protocol = MuseInteractions(self)
+        if config.session_id:
+            self.interactions.managed_sessions.add(config.session_id)
+
+    def format_approval(self, item):
+        return self.interaction_protocol.format_approval(item)
+
+    async def submit_approval(self, item, choice, **kwargs):
+        return await self.interaction_protocol.submit_approval(item, choice, **kwargs)
+
+    def capture_credential(self, item, secret):
+        return self.interaction_protocol.capture_credential(item, secret)
+
+    def check_approval_gate(self, session_id):
+        self.interactions.managed_sessions.add(session_id)
+        try:
+            self.interaction_protocol.fetch_approvals()
+        except Exception:
+            raise ApprovalBlocked("审批状态暂不可确认，此消息未转发、未缓存；请稍后重新发送。") from None
+        pending = self.interactions.pending_approvals(session_id)
+        if pending:
+            raise ApprovalBlocked(self.format_approval(pending[0]))
 
     def create_client(self) -> MuseClient:
         """Create a new MuseClient instance with auto-refreshing credentials."""
@@ -146,6 +171,7 @@ class MuseService:
                 inline_images, inline_files, file_refs, processed_text = self.process_attachments(
                     client, atts, text, threshold_bytes
                 )
+                self.check_approval_gate(session_id)
                 sent_mid = client.send_message(
                     session_id=session_id,
                     text=processed_text,
@@ -179,6 +205,7 @@ class MuseService:
                 )
 
                 # Send message
+                self.check_approval_gate(session_id)
                 sent_mid = client.send_message(
                     session_id=session_id,
                     text=processed_text,

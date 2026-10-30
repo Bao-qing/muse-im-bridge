@@ -14,6 +14,7 @@ from typing import Optional
 from ...config.models import OneBotConfig
 from ...core.message import Attachment
 from ...muse.service import MuseService
+from ...muse.interactions import ApprovalBlocked
 from ..base import BaseAdapter
 from .client import OneBotClient
 from .gateway import OneBotGateway
@@ -30,6 +31,8 @@ class OneBotAdapter(BaseAdapter):
             on_message=self.handle_message,
         )
         self.active_session_id = self.config.session_id
+        if self.active_session_id:
+            self.muse_service.interactions.managed_sessions.add(self.active_session_id)
 
     @property
     def name(self) -> str:
@@ -91,5 +94,10 @@ class OneBotAdapter(BaseAdapter):
                 await loop.run_in_executor(None, self.client.send_group_msg, group_id, reply_text)
             elif msg_type == "private" and user_id:
                 await loop.run_in_executor(None, self.client.send_private_msg, user_id, reply_text)
+        except ApprovalBlocked as e:
+            if msg_type == "group" and group_id:
+                await loop.run_in_executor(None, self.client.send_group_msg, group_id, str(e))
+            elif msg_type == "private" and user_id:
+                await loop.run_in_executor(None, self.client.send_private_msg, user_id, str(e))
         except Exception as e:
             print(f"[OneBotAdapter] Turn failed: {e}")
