@@ -23,6 +23,7 @@ from ...core.session_map import SessionMapper
 from ...muse.service import MuseService
 from ...muse.interactions import ApprovalBlocked
 from ..base import BaseAdapter
+from .access import QQAccessRequests, valid_id
 from .client import QQClient
 from .gateway import QQGateway
 from .interactions import QQInteractions
@@ -96,6 +97,7 @@ class QQAdapter(BaseAdapter):
 
         self._in_login_fallback: bool = False
         self.interaction_router = QQInteractions(self)
+        self.access_requests = QQAccessRequests(self)
         self._chat_send_locks: Dict[Tuple[str, str], asyncio.Lock] = {}
         self._running = False
 
@@ -185,24 +187,16 @@ class QQAdapter(BaseAdapter):
     def is_allowed(self, event_type: str, d: dict) -> bool:
         """Check sender against whitelist."""
         author = d.get("author", {})
-        openid = author.get("user_openid") or author.get("member_openid") or author.get("id") or ""
-        wl = self.config.whitelist
-        if not wl:
+        if not isinstance(author, dict):
             return False
-
+        openid = author.get("user_openid") or author.get("member_openid") or author.get("id") or ""
+        if not valid_id(openid):
+            return False
         if event_type == "C2C_MESSAGE_CREATE":
-            privates = wl.get("private")
-            return isinstance(privates, list) and openid in privates
-
+            return self.access_requests.allows("private", openid, openid)
         if event_type in ("GROUP_AT_MESSAGE_CREATE", "GROUP_MESSAGE_CREATE"):
             gid = d.get("group_openid")
-            if not gid:
-                return False
-            allowed = wl.get(gid)
-            if allowed == "*":
-                return True
-            return isinstance(allowed, list) and openid in allowed
-
+            return valid_id(gid) and self.access_requests.allows("group", gid, openid)
         return False
 
     def extract_attachments(self, d: dict) -> List[Attachment]:
@@ -239,23 +233,40 @@ class QQAdapter(BaseAdapter):
                 print(f"[QQAdapter] Duplicate gateway message ignored: {msg_id}")
             return
 
+        if event_type not in {"C2C_MESSAGE_CREATE", "GROUP_AT_MESSAGE_CREATE", "GROUP_MESSAGE_CREATE"}:
+            return
+        author = d.get("author")
+        if not isinstance(author, dict):
+            return
+        user = author.get("user_openid") or author.get("member_openid") or author.get("id") or ""
+        kind = "private" if event_type == "C2C_MESSAGE_CREATE" else "group"
+        target = user if kind == "private" else d.get("group_openid")
+        if not valid_id(user) or not valid_id(target):
+            return
+        raw_content = d.get("content") or ""
+        if not isinstance(raw_content, str):
+            return
+        content = re.sub(r"<@!?\w+>", "", raw_content).strip()
+        if self.access_requests.is_command(content):
+            owner = (kind, target, user)
+            async with self.muse_service.interactions.owner_lock(owner):
+                current = self.muse_service.interactions.current(owner)
+                if current or self.interaction_router.message_references(d):
+                    await self._send_command_reply(kind, target, "请先结束当前填写，再单独发送申请命令。", msg_id)
+                    return
+                await self.access_requests.handle(kind, target, user, content, msg_id)
+            return
         if not self.is_allowed(event_type, d):
             if self.config.debug:
                 print(f"[QQAdapter] Ignored event {event_type}: sender not in whitelist")
             return
-
-        raw_content = (d.get("content") or "").strip()
-        content = re.sub(r"<@!?\w+>", "", raw_content).strip()
         attachments = self.extract_attachments(d)
 
         if not content and not attachments and not self.interaction_router.message_references(d):
             return
 
-        target_type = "private" if event_type == "C2C_MESSAGE_CREATE" else "group"
-        target_id = d.get("author", {}).get("user_openid") if target_type == "private" else d.get("group_openid")
-
-        author = d.get("author", {})
-        user_openid = author.get("user_openid") or author.get("member_openid") or author.get("id") or ""
+        target_type, target_id = kind, target
+        user_openid = user
         is_admin = self.config.is_admin(user_openid)
         owner = (target_type, target_id, user_openid)
         session_id = self.session_mapper.current(target_type, target_id) or ""

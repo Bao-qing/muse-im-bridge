@@ -11,7 +11,7 @@ from unittest import mock
 from muse_bridge.adapters.qq.adapter import QQAdapter
 from muse_bridge.adapters.qq.outbound import QQOutboundPusher
 from muse_bridge.adapters.qq.route_manager import RouteManager
-from muse_bridge.config.models import ConfigLoader, QQConfig, QQPushConfig
+from muse_bridge.config.models import AccessRequestsConfig, ConfigLoader, QQConfig, QQPushConfig
 from muse_bridge.core.session_map import MODE_GLOBAL, MODE_PER_CHAT, SessionMapper, chat_key
 
 
@@ -130,6 +130,7 @@ def _make_adapter(tmp, mode, **extra):
         whitelist={"private": ["U1"], "GA": "*", "GB": "*"},
         admin_id=["U1"], admin_only=False,
         session_id="GLOBAL", session_mode=mode,
+        access_requests=AccessRequestsConfig(state_file=os.path.join(tmp, "access.local.json")),
         session_state_file=os.path.join(tmp, "qq_session.json"),
         session_map_file=os.path.join(tmp, "map.json"),
         delivered_file=os.path.join(tmp, "delivered.jsonl"),

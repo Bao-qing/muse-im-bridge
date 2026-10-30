@@ -92,6 +92,19 @@ class QQPushConfig:
 
 
 @dataclasses.dataclass
+class AccessRequestsConfig:
+    enabled: bool = True
+    auto_approve: bool = False
+    state_file: str = "qq_access.local.json"
+
+    def __post_init__(self):
+        if type(self.enabled) is not bool or type(self.auto_approve) is not bool:
+            raise ValueError("adapters.qq.access_requests switches must be booleans")
+        if not isinstance(self.state_file, str) or not self.state_file.strip():
+            raise ValueError("adapters.qq.access_requests.state_file must be a nonempty path")
+
+
+@dataclasses.dataclass
 class QQConfig:
     enabled: bool = True
     app_id: str = ""
@@ -99,6 +112,7 @@ class QQConfig:
     admin_id: List[str] = dataclasses.field(default_factory=list)
     admin_only: bool = constants.DEFAULT_ADMIN_ONLY
     credentials_in_place: bool = False
+    access_requests: AccessRequestsConfig = dataclasses.field(default_factory=AccessRequestsConfig)
     session_id: str = ""
     whitelist: Dict[str, Union[List[str], str]] = dataclasses.field(default_factory=dict)
     push: QQPushConfig = dataclasses.field(default_factory=QQPushConfig)
@@ -350,7 +364,17 @@ class ConfigLoader:
         else:
             admin_ids = []
 
+        access_raw = q_raw.get("access_requests", {})
+        if not isinstance(access_raw, dict):
+            raise ValueError("adapters.qq.access_requests must be an object")
+        access_cfg = AccessRequestsConfig(
+            enabled=access_raw.get("enabled", True),
+            auto_approve=access_raw.get("auto_approve", False),
+            state_file=access_raw.get("state_file", "qq_access.local.json"),
+        )
+
         qq_cfg = QQConfig(
+            access_requests=access_cfg,
             enabled=q_raw.get("enabled", True),
             app_id=str(q_raw.get("app_id") or os.environ.get("QQ_APP_ID") or ""),
             app_secret=str(q_raw.get("app_secret") or os.environ.get("QQ_APP_SECRET") or ""),

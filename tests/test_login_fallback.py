@@ -8,7 +8,7 @@ import time
 import unittest
 from unittest.mock import MagicMock, patch
 
-from muse_bridge.config.models import AppConfig, GatewayConfig, MuseConfig, QQConfig, QQPushConfig
+from muse_bridge.config.models import AccessRequestsConfig, AppConfig, GatewayConfig, MuseConfig, QQConfig, QQPushConfig
 from muse_bridge.muse.token_manager import MuseTokenManager
 from muse_bridge.muse.service import MuseService
 from muse_bridge.adapters.qq.adapter import QQAdapter
@@ -51,6 +51,7 @@ class TestLoginFallback(unittest.IsolatedAsyncioTestCase):
             app_id="app_123",
             admin_id=["ADMIN_OPENID"],
             whitelist={"private": ["ADMIN_OPENID"]},
+            access_requests=AccessRequestsConfig(state_file=os.path.join(self.tmp_dir.name, "access.local.json")),
             session_state_file=self.session_state_path,
             session_map_file=self.session_map_path,
             delivered_file=self.delivered_path,
