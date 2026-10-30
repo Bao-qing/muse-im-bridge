@@ -22,6 +22,10 @@ class TestLoginFallback(unittest.IsolatedAsyncioTestCase):
         self.tmp_dir = tempfile.TemporaryDirectory()
         self.cookies_path = os.path.join(self.tmp_dir.name, "cookies.json")
         self.mint_path = os.path.join(self.tmp_dir.name, ".mint.json")
+        self.session_state_path = os.path.join(self.tmp_dir.name, "qq_session.json")
+        self.session_map_path = os.path.join(self.tmp_dir.name, "qq_session_map.json")
+        self.delivered_path = os.path.join(self.tmp_dir.name, "qq_delivered.jsonl")
+        self.push_state_path = os.path.join(self.tmp_dir.name, "qq_push_state.json")
 
         with open(self.cookies_path, "w", encoding="utf-8") as f:
             json.dump({"cookie": "hatch_sess=test_sess; muse_uid=123"}, f)
@@ -41,6 +45,24 @@ class TestLoginFallback(unittest.IsolatedAsyncioTestCase):
             session_id="test-session",
         )
         self.muse_service = MuseService(config=self.muse_config, token_manager=self.token_manager)
+
+    def _make_qq_config(self, **kwargs) -> QQConfig:
+        defaults = dict(
+            app_id="app_123",
+            admin_id=["ADMIN_OPENID"],
+            whitelist={"private": ["ADMIN_OPENID"]},
+            session_state_file=self.session_state_path,
+            session_map_file=self.session_map_path,
+            delivered_file=self.delivered_path,
+            push=QQPushConfig(
+                enabled=True,
+                target_type="private",
+                target_id="ADMIN_OPENID",
+                state_file=self.push_state_path,
+            ),
+        )
+        defaults.update(kwargs)
+        return QQConfig(**defaults)
 
     def tearDown(self):
         self.tmp_dir.cleanup()
@@ -88,12 +110,7 @@ class TestLoginFallback(unittest.IsolatedAsyncioTestCase):
 
     async def test_outbound_pusher_triggers_login_on_auth_failure(self):
         """Test outbound pusher detects 401, triggers login callback and notifies admin."""
-        qq_config = QQConfig(
-            app_id="app_123",
-            admin_id=["ADMIN_OPENID"],
-            whitelist={"private": ["ADMIN_OPENID"]},
-            push=QQPushConfig(enabled=True, target_type="private", target_id="ADMIN_OPENID"),
-        )
+        qq_config = self._make_qq_config()
         mock_qq_client = MagicMock()
         mock_qq_client.send_message.return_value = (200, {})
 
@@ -135,11 +152,8 @@ class TestLoginFallback(unittest.IsolatedAsyncioTestCase):
 
     async def test_inbound_post_message_auth_failure_triggers_login_fallback(self):
         """Test sending message encountering 401 invalidates credentials and guides admin to login."""
-        qq_config = QQConfig(
-            app_id="app_123",
-            admin_id=["ADMIN_OPENID"],
+        qq_config = self._make_qq_config(
             whitelist={"private": ["ADMIN_OPENID"], "GRP_1": "*"},
-            push=QQPushConfig(enabled=True, target_type="private", target_id="ADMIN_OPENID"),
         )
         adapter = QQAdapter(config=qq_config, muse_service=self.muse_service)
         mock_qq_client = MagicMock()
@@ -164,12 +178,7 @@ class TestLoginFallback(unittest.IsolatedAsyncioTestCase):
 
     async def test_inbound_direct_email_initiates_otp_login(self):
         """Test sending email address directly in private chat starts OTP login session."""
-        qq_config = QQConfig(
-            app_id="app_123",
-            admin_id=["ADMIN_OPENID"],
-            whitelist={"private": ["ADMIN_OPENID"]},
-            push=QQPushConfig(enabled=True, target_type="private", target_id="ADMIN_OPENID"),
-        )
+        qq_config = self._make_qq_config()
         adapter = QQAdapter(config=qq_config, muse_service=self.muse_service)
         adapter._in_login_fallback = True
         mock_qq_client = MagicMock()
@@ -191,12 +200,7 @@ class TestLoginFallback(unittest.IsolatedAsyncioTestCase):
 
     async def test_outbound_pusher_handles_404_session_not_found(self):
         """Test outbound pusher treats 404 session not found as empty and marks it gated."""
-        qq_config = QQConfig(
-            app_id="app_123",
-            admin_id=["ADMIN_OPENID"],
-            whitelist={"private": ["ADMIN_OPENID"]},
-            push=QQPushConfig(enabled=True, target_type="private", target_id="ADMIN_OPENID"),
-        )
+        qq_config = self._make_qq_config()
         mock_qq_client = MagicMock()
         pusher = QQOutboundPusher(
             config=qq_config,
@@ -235,12 +239,7 @@ class TestLoginFallback(unittest.IsolatedAsyncioTestCase):
 
     async def test_inbound_post_message_404_auto_recreates_session(self):
         """Test sending message encountering 404 automatically creates new session and posts."""
-        qq_config = QQConfig(
-            app_id="app_123",
-            admin_id=["ADMIN_OPENID"],
-            whitelist={"private": ["ADMIN_OPENID"]},
-            push=QQPushConfig(enabled=True, target_type="private", target_id="ADMIN_OPENID"),
-        )
+        qq_config = self._make_qq_config()
         adapter = QQAdapter(config=qq_config, muse_service=self.muse_service)
         mock_qq_client = MagicMock()
         mock_qq_client.send_message.return_value = (200, {})
