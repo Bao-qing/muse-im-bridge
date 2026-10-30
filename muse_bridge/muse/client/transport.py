@@ -184,6 +184,7 @@ class WS:
         ctx = ssl.create_default_context()
         ctx.set_alpn_protocols(["http/1.1"])
         self.sock = ctx.wrap_socket(s, server_hostname=host)
+        self.sock.settimeout(20.0)
         self.buf = b""
         key = base64.b64encode(os.urandom(16)).decode()
         req = (

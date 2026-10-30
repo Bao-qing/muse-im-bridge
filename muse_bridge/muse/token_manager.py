@@ -19,6 +19,7 @@ import os
 import re
 import sys
 import tempfile
+import threading
 import time
 from typing import Optional, Tuple
 
@@ -58,6 +59,7 @@ class MuseTokenManager:
         self._notary_token = ""
         self._invalid = False
         self._cookie_mtime_when_invalidated: float = 0.0
+        self._lock = threading.RLock()
         self._load_cached_mint()
 
     def _load_cached_mint(self) -> None:
@@ -270,81 +272,83 @@ class MuseTokenManager:
 
     def refresh_from_cookies(self, interactive: bool = True) -> Tuple[str, str, str]:
         """Mint new tokens using cookies and save to mint_file atomically."""
-        cookie = self.load_cookie_string()
-        if not cookie and interactive and sys.stdin.isatty():
-            print(f"[Muse] Cookies 文件 ({self.cookies_file}) 不存在或为空。")
-            try:
-                choice = input("是否立即通过纯协议登录获取新 Cookies？(y/n): ").strip().lower()
-                if choice in ("y", "yes"):
-                    from .login import run_protocol_login
-                    run_protocol_login(output_path=self.cookies_file)
-                    cookie = self.load_cookie_string()
-            except Exception as e:
-                print(f"[Muse] 登录流程失败或取消：{e}")
+        with self._lock:
+            cookie = self.load_cookie_string()
+            if not cookie and interactive and sys.stdin.isatty():
+                print(f"[Muse] Cookies 文件 ({self.cookies_file}) 不存在或为空。")
+                try:
+                    choice = input("是否立即通过纯协议登录获取新 Cookies？(y/n): ").strip().lower()
+                    if choice in ("y", "yes"):
+                        from .login import run_protocol_login
+                        run_protocol_login(output_path=self.cookies_file)
+                        cookie = self.load_cookie_string()
+                except Exception as e:
+                    print(f"[Muse] 登录流程失败或取消：{e}")
 
-        if not cookie:
-            self.invalidate()
-            raise RuntimeError(
-                f"cookies file {self.cookies_file} not found or empty (cannot refresh mint)"
-            )
-
-        if not self.vm_id:
-            derived = self.vm_id_from_token(self._token)
-            if derived:
-                self.vm_id = derived
-            else:
-                self.vm_id = self.vm_id_from_cookies(cookie)
-
-        if not self.vm_id:
-            self.invalidate()
-            raise RuntimeError("cannot resolve vm_id: not provided and not found in page HTML")
-
-        vm_address = f"wss://{self.vm_id}.metaaivm.com/"
-        token_url = f"{self.base_url}/api/hatch/token"
-        try:
-            data = self._post_json(token_url, {"vmAddress": vm_address, "vmName": self.vm_id}, cookie)
-        except Exception as e:
-            msg = str(e).lower()
-            if any(k in msg for k in ("401", "403", "unauthorized", "hatch_vm_auth")):
+            if not cookie:
                 self.invalidate()
-            raise
+                raise RuntimeError(
+                    f"cookies file {self.cookies_file} not found or empty (cannot refresh mint)"
+                )
 
-        token = (data.get("token") or "").strip()
-        notary = (data.get("notary_token") or "").strip()
-        if not token:
-            self.invalidate()
-            raise RuntimeError(f"{token_url} returned no token")
+            if not self.vm_id:
+                derived = self.vm_id_from_token(self._token)
+                if derived:
+                    self.vm_id = derived
+                else:
+                    self.vm_id = self.vm_id_from_cookies(cookie)
 
-        if not notary:
-            notary_url = f"{self.base_url}/api/hatch/noise-notary-token"
+            if not self.vm_id:
+                self.invalidate()
+                raise RuntimeError("cannot resolve vm_id: not provided and not found in page HTML")
+
+            vm_address = f"wss://{self.vm_id}.metaaivm.com/"
+            token_url = f"{self.base_url}/api/hatch/token"
             try:
-                extra = self._post_json(notary_url, {"vmName": self.vm_id}, cookie)
+                data = self._post_json(token_url, {"vmAddress": vm_address, "vmName": self.vm_id}, cookie)
             except Exception as e:
                 msg = str(e).lower()
                 if any(k in msg for k in ("401", "403", "unauthorized", "hatch_vm_auth")):
                     self.invalidate()
                 raise
-            notary = (extra.get("notaryToken") or "").strip()
 
-        if not notary:
-            self.invalidate()
-            raise RuntimeError("failed to acquire notary_token from web API")
+            token = (data.get("token") or "").strip()
+            notary = (data.get("notary_token") or "").strip()
+            if not token:
+                self.invalidate()
+                raise RuntimeError(f"{token_url} returned no token")
 
-        self._token = token
-        self._notary_token = notary
-        self._invalid = False
-        self._write_mint_atomic(token, notary)
-        return token, notary, self.vm_id
+            if not notary:
+                notary_url = f"{self.base_url}/api/hatch/noise-notary-token"
+                try:
+                    extra = self._post_json(notary_url, {"vmName": self.vm_id}, cookie)
+                except Exception as e:
+                    msg = str(e).lower()
+                    if any(k in msg for k in ("401", "403", "unauthorized", "hatch_vm_auth")):
+                        self.invalidate()
+                    raise
+                notary = (extra.get("notaryToken") or "").strip()
+
+            if not notary:
+                self.invalidate()
+                raise RuntimeError("failed to acquire notary_token from web API")
+
+            self._token = token
+            self._notary_token = notary
+            self._invalid = False
+            self._write_mint_atomic(token, notary)
+            return token, notary, self.vm_id
 
     def get_credentials(self) -> Tuple[str, str, str]:
         """Get (token, notary_token, vm_id). Refreshes automatically if stale."""
-        if not self.vm_id:
-            self.vm_id = self.vm_id_from_token(self._token)
+        with self._lock:
+            if not self.vm_id:
+                self.vm_id = self.vm_id_from_token(self._token)
 
-        if not self.is_fresh():
-            try:
-                self.refresh_from_cookies()
-            except Exception as e:
-                self.invalidate()
-                raise RuntimeError(f"failed to obtain valid Muse credentials: {e}")
-        return self._token, self._notary_token, self.vm_id
+            if not self.is_fresh():
+                try:
+                    self.refresh_from_cookies()
+                except Exception as e:
+                    self.invalidate()
+                    raise RuntimeError(f"failed to obtain valid Muse credentials: {e}")
+            return self._token, self._notary_token, self.vm_id
