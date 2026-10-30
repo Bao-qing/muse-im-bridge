@@ -239,7 +239,7 @@ class TestLoginFallback(unittest.IsolatedAsyncioTestCase):
 
     async def test_inbound_post_message_404_auto_recreates_session(self):
         """Test sending message encountering 404 automatically creates new session and posts."""
-        qq_config = self._make_qq_config()
+        qq_config = self._make_qq_config(session_id="initial-session-id")
         adapter = QQAdapter(config=qq_config, muse_service=self.muse_service)
         mock_qq_client = MagicMock()
         mock_qq_client.send_message.return_value = (200, {})
