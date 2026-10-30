@@ -43,9 +43,9 @@ class BridgeEngine:
             return
 
         print(f"[BridgeEngine] Starting {len(enabled_adapters)} adapter(s): {[a.name for a in enabled_adapters]}")
-        tasks = [asyncio.create_task(a.start()) for a in enabled_adapters]
 
-        # Verify Muse credentials on startup
+        # Verify Muse credentials on startup before launching adapters to avoid
+        # concurrent notary_token minting/handshake races with outbound pushers
         loop = asyncio.get_running_loop()
         cred_ok = await loop.run_in_executor(None, self.muse_service.verify_connection)
         qq_adapter = next((a for a in self.adapters if isinstance(a, QQAdapter)), None)
@@ -59,6 +59,8 @@ class BridgeEngine:
                     asyncio.create_task(self._notify_admin_login(admin_target))
         else:
             print("[BridgeEngine] 启动验证：Muse 会话凭据有效，认证通过。")
+
+        tasks = [asyncio.create_task(a.start()) for a in enabled_adapters]
 
         try:
             await asyncio.gather(*tasks)
