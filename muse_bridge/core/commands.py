@@ -15,6 +15,8 @@ LOCAL_COMMANDS = frozenset([
 
 HELP_TEXT = (
     "命令（/ 开头）：\n"
+    "/申请 [全员] — 申请使用；全员表示开放当前群\n"
+    "/申请审批 [编号 同意|拒绝] — 管理员私聊审批白名单\n"
     "/sessions [页] — 列出会话\n"
     "/switch <序号|id> — 切换会话\n"
     "/new — 新开会话\n"

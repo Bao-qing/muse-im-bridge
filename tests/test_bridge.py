@@ -254,8 +254,12 @@ class TestCommandHandler(unittest.TestCase):
 
 class TestQQAdapterLogic(unittest.TestCase):
     def test_whitelist_matching(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        from muse_bridge.config.models import AccessRequestsConfig
         adapter = QQAdapter(
             config=QQConfig(
+                access_requests=AccessRequestsConfig(state_file=os.path.join(temporary.name, "access.local.json")),
                 app_id="123",
                 app_secret="sec",
                 whitelist={

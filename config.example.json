@@ -18,6 +18,11 @@
       ],
       "admin_only": true,
       "credentials_in_place": false,
+      "access_requests": {
+        "enabled": true,
+        "auto_approve": false,
+        "state_file": "qq_access.local.json"
+      },
       "session_mode": "global",
       "session_bindings": {},
       "proactive_to_session_owner": true,

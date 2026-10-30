@@ -6,6 +6,7 @@ import json
 import time
 from pathlib import Path
 import unittest
+import uuid
 from unittest.mock import MagicMock, patch
 
 import test_interactions as fixtures
@@ -24,7 +25,7 @@ class TestCredentialReplies(unittest.IsolatedAsyncioTestCase):
 
     async def group(self, text, sender="ADMIN", **extra):
         await self.adapter.handle_event("GROUP_MESSAGE_CREATE", {
-            "id": str(time.time_ns()), "content": text, "group_openid": "G",
+            "id": uuid.uuid4().hex, "content": text, "group_openid": "G",
             "author": {"member_openid": sender}, **extra})
 
     async def quoted(self, text, ref="REFIDX_CARD==", sender="ADMIN", group=False):
@@ -34,7 +35,7 @@ class TestCredentialReplies(unittest.IsolatedAsyncioTestCase):
             await self.group(text, sender=sender, **event)
         else:
             await self.adapter.handle_event("C2C_MESSAGE_CREATE", {
-                "id": str(time.time_ns()), "content": text,
+                "id": uuid.uuid4().hex, "content": text,
                 "author": {"user_openid": sender}, **event})
 
     def delivered(self, card, target_type="private", target_id="ADMIN", ref="REFIDX_CARD=="):
@@ -53,7 +54,7 @@ class TestCredentialReplies(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("fictional-password", output.getvalue())
         self.assertIsNone(self.service.interactions.current(("private", "ADMIN", "ADMIN")))
         self.assertTrue(card.terminal)
-        self.assertEqual(self.text(), "凭证已保存，可以继续聊天。")
+        self.assertEqual(self.text(), "【凭证已保存】")
         self.service.post_message.assert_not_called()
         await self.send("继续聊")
         self.service.post_message.assert_called_once()

@@ -5,10 +5,11 @@ import io
 import tempfile
 import time
 import unittest
+import uuid
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
-from muse_bridge.config.models import ApprovalConfig, MuseConfig, QQConfig, QQPushConfig
+from muse_bridge.config.models import AccessRequestsConfig, ApprovalConfig, MuseConfig, QQConfig, QQPushConfig
 from muse_bridge.core.interactions import InteractionManager
 from muse_bridge.muse.service import MuseService
 from muse_bridge.adapters.qq.adapter import QQAdapter
@@ -64,6 +65,7 @@ class TestQQInteractions(unittest.IsolatedAsyncioTestCase):
         token.has_credentials.return_value = True
         self.service = MuseService(MuseConfig(cookies_file=str(root / "cookies.json")), token)
         cfg = QQConfig(app_id="app", admin_id=["ADMIN"], whitelist={"private": ["ADMIN", "OTHER"], "G": "*"},
+                       access_requests=AccessRequestsConfig(state_file=str(root / "access.local.json")),
                        session_id="s1", session_mode="global",
                        session_state_file=str(root / "session.json"),
                        session_map_file=str(root / "map.json"), delivered_file=str(root / "delivered.jsonl"),
@@ -78,7 +80,7 @@ class TestQQInteractions(unittest.IsolatedAsyncioTestCase):
         self.tmp.cleanup()
 
     async def send(self, text, sender="ADMIN", mid=None):
-        await self.adapter.handle_event("C2C_MESSAGE_CREATE", {"id": mid or str(time.time_ns()), "content": text, "author": {"user_openid": sender}})
+        await self.adapter.handle_event("C2C_MESSAGE_CREATE", {"id": mid or uuid.uuid4().hex, "content": text, "author": {"user_openid": sender}})
 
     def text(self):
         return self.adapter.client.send_message.call_args.args[2]
