@@ -78,7 +78,9 @@ def main(argv=None) -> int:
             wl_grp = len([k for k in config.qq.whitelist if k != "private"])
             print(f"QQ Adapter:     ENABLED (AppID: {config.qq.app_id})")
             print(f"  Whitelist:    {wl_priv} private user(s), {wl_grp} group(s)")
-            print(f"  Admin:        {'set' if config.qq.admin_target() else '(none: unbound pushes are dropped)'}")
+            admin = config.qq.admin_target()
+            fallback = "unbound -> admin" if config.qq.unbound_push_to_admin else "unbound dropped"
+            print(f"  Admin:        {admin or '(none)'} ({fallback})")
             print(f"  Catch-up:     {'ENABLED' if config.qq.catch_up_enabled else 'DISABLED'}")
         else:
             print("QQ Adapter:     DISABLED")
