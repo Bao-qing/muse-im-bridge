@@ -13,7 +13,6 @@ from muse_bridge.config.models import (
     MuseConfig,
     OneBotConfig,
     QQConfig,
-    QQPushConfig,
 )
 from muse_bridge.core.commands import CommandError, CommandHandler
 from muse_bridge.core.deduplicator import MessageDeduplicator
@@ -53,10 +52,8 @@ class TestConfig(unittest.TestCase):
             self.assertEqual(cfg.muse.session_id, "sess-123")
             self.assertEqual(cfg.qq.app_id, "test_app")
             self.assertEqual(cfg.qq.app_secret, "test_secret")
-            # Push defaults to first private
-            target_type, target_id = cfg.qq.resolve_push_target()
-            self.assertEqual(target_type, "private")
-            self.assertEqual(target_id, "PRIV_1")
+            # Without an admin there is no fallback; whitelist users are never used
+            self.assertIsNone(cfg.qq.admin_target())
 
     def test_admin_id_and_push_default_to_admin(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -67,8 +64,7 @@ class TestConfig(unittest.TestCase):
                         "qq": {
                             "app_id": "app",
                             "admin_id": ["ADMIN_OPENID_1", "ADMIN_OPENID_2"],
-                            "whitelist": {"private": ["OTHER_USER"], "GRP_1": "*"},
-                            "push": {"enabled": True, "target_id": None}
+                            "whitelist": {"private": ["OTHER_USER"], "GRP_1": "*"}
                         }
                     },
                     "gateway": {
@@ -79,10 +75,8 @@ class TestConfig(unittest.TestCase):
             self.assertEqual(cfg.qq.admin_id, ["ADMIN_OPENID_1", "ADMIN_OPENID_2"])
             self.assertTrue(cfg.qq.is_admin("ADMIN_OPENID_1"))
             self.assertFalse(cfg.qq.is_admin("OTHER_USER"))
-            # When push.target_id is not specified, defaults to admin!
-            target_type, target_id = cfg.qq.resolve_push_target()
-            self.assertEqual(target_type, "private")
-            self.assertEqual(target_id, "ADMIN_OPENID_1")
+            # Unbound sessions fall back to the first admin
+            self.assertEqual(cfg.qq.admin_target(), "ADMIN_OPENID_1")
             self.assertEqual(cfg.gateway.login_through_adapter, "qq")
             self.assertTrue(cfg.qq.admin_only)
 
@@ -101,16 +95,6 @@ class TestConfig(unittest.TestCase):
                 }, f)
             cfg = ConfigLoader.load(cfg_path)
             self.assertFalse(cfg.qq.admin_only)
-
-    def test_explicit_push_target_override(self):
-        qq = QQConfig(
-            app_id="app",
-            whitelist={"private": ["PRIV_1"], "GRP_1": "*"},
-            push=QQPushConfig(target_type="group", target_id="GRP_CUSTOM")
-        )
-        target_type, target_id = qq.resolve_push_target()
-        self.assertEqual(target_type, "group")
-        self.assertEqual(target_id, "GRP_CUSTOM")
 
     def test_constants_override(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -240,14 +224,13 @@ class TestCommandHandler(unittest.TestCase):
     def test_execute_new_and_current(self):
         with tempfile.TemporaryDirectory() as tmp:
             state_file = os.path.join(tmp, "session.json")
-            reply, new_id = CommandHandler.execute("new", "", None, "old-id", state_file)
+            reply, new_id = CommandHandler.execute("new", "", None, "old-id")
             self.assertIn("已开启新会话", reply)
             self.assertNotEqual(new_id, "old-id")
-            # Verify persistence
-            loaded = CommandHandler.load_session_id(state_file)
-            self.assertEqual(loaded, new_id)
+            # Persistence belongs to SessionMapper; the command writes no file
+            self.assertEqual(os.listdir(tmp), [])
 
-            reply2, cur_id = CommandHandler.execute("current", "", None, new_id, state_file)
+            reply2, cur_id = CommandHandler.execute("current", "", None, new_id)
             self.assertIn(new_id, reply2)
             self.assertEqual(cur_id, new_id)
 

@@ -12,7 +12,7 @@ from unittest.mock import MagicMock, patch
 
 from muse_bridge.adapters.qq.access import AccessRequestStore
 from muse_bridge.adapters.qq.adapter import QQAdapter
-from muse_bridge.config.models import AccessRequestsConfig, ConfigLoader, MuseConfig, QQConfig, QQPushConfig
+from muse_bridge.config.models import AccessRequestsConfig, ConfigLoader, MuseConfig, QQConfig
 from muse_bridge.muse.service import MuseService
 
 
@@ -23,9 +23,8 @@ class TestAccessRequests(unittest.IsolatedAsyncioTestCase):
         self.root = Path(self.tmp.name)
         self.config = QQConfig(app_id="APP", admin_id=["ADMIN"],
             whitelist={"private": ["KNOWN"], "OLD": ["KNOWN"]},
-            session_id="s1", session_state_file=str(self.root / "session.json"),
             session_map_file=str(self.root / "map.json"), delivered_file=str(self.root / "delivered.jsonl"),
-            push=QQPushConfig(state_file=str(self.root / "push.json")),
+            push_state_file=str(self.root / "push.json"),
             access_requests=AccessRequestsConfig(state_file=str(self.root / "access.local.json")))
         self.token = MagicMock()
         self.token.has_credentials.return_value = True
@@ -224,6 +223,7 @@ class TestAccessRequests(unittest.IsolatedAsyncioTestCase):
     async def test_pending_approval_gate_still_applies_to_new_member(self):
         self.config.access_requests.auto_approve = True
         await self.send("/申请")
+        self.adapter.session_mapper.bind("group", "G", "s1")
         self.service.interactions.add("approval", session_id="s1", ttl=0)
         with patch.object(self.service, "format_approval", return_value="pending"):
             await self.send("hello")

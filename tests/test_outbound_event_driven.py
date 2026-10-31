@@ -10,8 +10,8 @@ from unittest import mock
 
 from muse_bridge.adapters.qq.outbound import QQOutboundPusher
 from muse_bridge.adapters.qq.route_manager import RouteManager
-from muse_bridge.config.models import QQConfig, QQPushConfig
-from muse_bridge.core.session_map import MODE_GLOBAL, MODE_PER_CHAT, SessionMapper
+from muse_bridge.config.models import QQConfig
+from muse_bridge.core.session_map import SessionMapper
 from muse_bridge.muse.client.client import MuseClient, PushSubscription
 from muse_bridge.muse.client.errors import SubscribeError
 from muse_bridge.muse.client.push import PushTurnTracker
@@ -144,16 +144,18 @@ class TestOutboundEventDriven(unittest.IsolatedAsyncioTestCase):
         self._tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self._tmp.cleanup)
 
-    def _make_pusher(self, mode="per_chat", **cfg_extra):
+    def _make_pusher(self, bind_sid=None, **cfg_extra):
         cfg = QQConfig(
             app_id="1", app_secret="s",
             admin_id=["ADMIN"], whitelist={"private": ["ADMIN"]},
-            session_mode=mode, session_hot_window_s=30, session_sweep_s=60,
-            push=QQPushConfig(state_file=os.path.join(self._tmp.name, "push.json"), catch_up_enabled=False),
+            session_hot_window_s=30, session_sweep_s=60,
+            push_state_file=os.path.join(self._tmp.name, "push.json"), catch_up_enabled=False,
             **cfg_extra,
         )
-        mapper = SessionMapper(mode=mode, global_session_id="GLOBAL",
-                               state_file=os.path.join(self._tmp.name, "map.json"))
+        mapper = SessionMapper(state_file=os.path.join(self._tmp.name, "map.json"))
+        if bind_sid:
+            # One chat bound to a known session, so the dispatcher watches it.
+            mapper.bind("private", "ADMIN", bind_sid)
         dedup = mock.Mock()
         dedup.is_delivered.return_value = False
         dedup.is_processing.return_value = False
@@ -171,7 +173,6 @@ class TestOutboundEventDriven(unittest.IsolatedAsyncioTestCase):
             muse_service=muse_service,
             deduplicator=dedup,
             route_manager=route_mgr,
-            session_id="GLOBAL",
             session_mapper=mapper,
         )
         return pusher, mapper, muse_service, client
@@ -196,7 +197,7 @@ class TestOutboundEventDriven(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(QQOutboundPusher._classify_push_event(ev_interrupted), ("s1", None))
 
     async def test_lazy_session_404_handled_gracefully(self):
-        pusher, mapper, muse_service, qq_client = self._make_pusher(mode="per_chat")
+        pusher, mapper, muse_service, qq_client = self._make_pusher()
         sid, _ = mapper.resolve("group", "G1")
 
         fake_client = mock.MagicMock()
@@ -216,7 +217,7 @@ class TestOutboundEventDriven(unittest.IsolatedAsyncioTestCase):
         self.assertIn(sid, pusher._pending_subscribe)
 
     async def test_event_driven_push_triggers_dispatch(self):
-        pusher, mapper, muse_service, qq_client = self._make_pusher(mode="global")
+        pusher, mapper, muse_service, qq_client = self._make_pusher(bind_sid="GLOBAL")
         sid = "GLOBAL"
 
         mock_sub = mock.Mock()
@@ -276,7 +277,7 @@ class TestOutboundEventDriven(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(pusher.deduplicator.mark_delivered.called)
 
     async def test_expiring_client_rotates_without_login_or_duplicate_history(self):
-        pusher, mapper, service, qq = self._make_pusher(mode="global")
+        pusher, mapper, service, qq = self._make_pusher(bind_sid="GLOBAL")
         first, second = mock.MagicMock(), mock.MagicMock()
         first.credentials_current.side_effect = [True, False]
         second.credentials_current.return_value = True
@@ -298,7 +299,7 @@ class TestOutboundEventDriven(unittest.IsolatedAsyncioTestCase):
 
     async def test_gateway_rejection_reconnects_without_login(self):
         from muse_bridge.muse.client.errors import RPCError
-        pusher, mapper, service, qq = self._make_pusher(mode="global")
+        pusher, mapper, service, qq = self._make_pusher(bind_sid="GLOBAL")
         first, second = mock.MagicMock(), mock.MagicMock()
         first.credentials_current.return_value = True
         second.credentials_current.return_value = True
@@ -404,7 +405,7 @@ class TestOutboundEventDriven(unittest.IsolatedAsyncioTestCase):
         self.assertEqual("【卡片提示】我的新形象换好啦：你可以分享给朋友哦！", res_avatar)
 
     async def test_already_subscribed_session_skips_redundant_history_fetch_on_track(self):
-        pusher, mapper, muse_service, qq_client = self._make_pusher(mode="global")
+        pusher, mapper, muse_service, qq_client = self._make_pusher(bind_sid="GLOBAL")
         sid = "GLOBAL"
 
         mock_sub = mock.Mock()

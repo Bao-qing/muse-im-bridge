@@ -24,25 +24,16 @@
         "auto_approve": false,
         "state_file": "data/qq_access.local.json"
       },
-      "session_state_file": "data/qq_session.json",
       "delivered_file": "data/qq_delivered.jsonl",
       "session_map_file": "data/qq_session_map.json",
-      "session_mode": "global",
       "session_bindings": {},
-      "proactive_to_session_owner": true,
+      "push_state_file": "data/qq_push_state.json",
+      "catch_up_enabled": false,
       "whitelist": {
         "private": [
           "YOUR_C2C_OPENID"
         ],
         "YOUR_GROUP_OPENID": "*"
-      },
-      "push": {
-        "enabled": true,
-        "target_type": "private",
-        "target_id": null,
-        "catch_up_enabled": false,
-        "state_file": "data/qq_push_state.json",
-        "delivered_file": "data/qq_delivered.jsonl"
       }
     },
     "onebot": {

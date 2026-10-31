@@ -9,7 +9,7 @@ import uuid
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
-from muse_bridge.config.models import AccessRequestsConfig, ApprovalConfig, MuseConfig, QQConfig, QQPushConfig
+from muse_bridge.config.models import AccessRequestsConfig, ApprovalConfig, MuseConfig, QQConfig
 from muse_bridge.core.interactions import InteractionManager
 from muse_bridge.muse.service import MuseService
 from muse_bridge.adapters.qq.adapter import QQAdapter
@@ -66,10 +66,9 @@ class TestQQInteractions(unittest.IsolatedAsyncioTestCase):
         self.service = MuseService(MuseConfig(cookies_file=str(root / "cookies.json")), token)
         cfg = QQConfig(app_id="app", admin_id=["ADMIN"], whitelist={"private": ["ADMIN", "OTHER"], "G": "*"},
                        access_requests=AccessRequestsConfig(state_file=str(root / "access.local.json")),
-                       session_id="s1", session_mode="global",
-                       session_state_file=str(root / "session.json"),
+                       session_bindings={"private:ADMIN": "s1", "private:OTHER": "s1", "group:G": "s1"},
                        session_map_file=str(root / "map.json"), delivered_file=str(root / "delivered.jsonl"),
-                       push=QQPushConfig(state_file=str(root / "push.json")))
+                       push_state_file=str(root / "push.json"))
         self.adapter = QQAdapter(cfg, self.service)
         self.adapter.client = MagicMock()
         self.adapter.client.send_message.return_value = (200, {})

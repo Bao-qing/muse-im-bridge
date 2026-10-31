@@ -21,7 +21,7 @@ from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 from ...config.models import QQConfig
 from ...core.deduplicator import MessageDeduplicator
 from ...core.message import chunk_text
-from ...core.session_map import MODE_GLOBAL, SessionMapper
+from ...core.session_map import SessionMapper
 from ...core.state_file import ensure_parent
 from ...muse.client.errors import ConnectionLost, HandshakeError, MuseError, RPCError, SubscribeError, LoginRequired, is_runtime_auth_error
 from ...muse.client.push import PushTurnTracker
@@ -160,7 +160,6 @@ class QQOutboundPusher:
         muse_service: MuseService,
         deduplicator: MessageDeduplicator,
         route_manager: RouteManager,
-        session_id: str = "",
         session_mapper: Optional[SessionMapper] = None,
         on_login_required: Optional[Callable[[Optional[str]], None]] = None,
     ):
@@ -170,10 +169,7 @@ class QQOutboundPusher:
         self.deduplicator = deduplicator
         self.route_manager = route_manager
         self._on_login_required = on_login_required
-        # Without an explicit mapper behave exactly like the legacy single-session pusher.
-        self.session_mapper = session_mapper or SessionMapper(
-            mode=MODE_GLOBAL, global_session_id=session_id
-        )
+        self.session_mapper = session_mapper or SessionMapper()
 
         self._running = False
         self._login_alerted: bool = False
@@ -189,18 +185,6 @@ class QQOutboundPusher:
         self._pending_subscribe: Set[str] = set()     # sessions that need /chat/subscribe opened
         self._uncreated_sessions: Set[str] = set()    # lazy sessions (404 until first message is posted)
         self._load_state()
-
-    # -- legacy accessor: the single global session ------------------------
-    @property
-    def session_id(self) -> str:
-        return self.session_mapper.global_session_id
-
-    @session_id.setter
-    def session_id(self, value: str) -> None:
-        if not self.session_mapper.per_chat:
-            self.session_mapper._global_sid = value
-            if value:
-                self._pending_subscribe.add(value)
 
     def track_session(self, session_id: str, fresh: bool = False) -> None:
         """Called by the adapter right after creating or posting into ``session_id``.
@@ -221,7 +205,7 @@ class QQOutboundPusher:
         self._hot_until[session_id] = time.monotonic() + max(5, self.config.session_hot_window_s)
 
     def _load_state(self) -> None:
-        state_file = self.config.push.state_file
+        state_file = self.config.push_state_file
         if state_file and os.path.exists(state_file):
             try:
                 with open(state_file, "r", encoding="utf-8") as f:
@@ -233,7 +217,7 @@ class QQOutboundPusher:
                 pass
 
     def _save_state(self) -> None:
-        state_file = self.config.push.state_file
+        state_file = self.config.push_state_file
         if not state_file:
             return
         tmp = f"{state_file}.tmp.{os.getpid()}"
@@ -260,8 +244,8 @@ class QQOutboundPusher:
 
     async def start(self) -> None:
         self._running = True
-        default_type, default_id = self.config.resolve_push_target()
-        logger.info('Started event-driven outbound dispatcher (Default push target: %s:%s)', default_type, default_id)
+        logger.info('Started event-driven outbound dispatcher (unbound sessions fall back to admin: %s)',
+                    "yes" if self.config.admin_target() else "no")
 
         while self._running:
             try:
@@ -328,9 +312,6 @@ class QQOutboundPusher:
     def _sessions_to_fetch(self, client) -> List[str]:
         """Compatibility helper for initial / fallback session inspection."""
         watched = self.session_mapper.session_ids()
-        if not self.session_mapper.per_chat:
-            return watched
-
         if not watched:
             return []
 
@@ -404,7 +385,7 @@ class QQOutboundPusher:
         self._save_state()
 
     async def _notify_login_required(self) -> None:
-        admin_target = self.config.get_default_private_target()
+        admin_target = self.config.admin_target()
         if admin_target:
             try:
                 loop = asyncio.get_running_loop()
@@ -437,9 +418,9 @@ class QQOutboundPusher:
                 seen_ids=self._seen_ids,
                 last_ts=self._last_ts,
                 now=time.time(),
-                enabled=self.config.push.catch_up_enabled,
-                window_s=self.config.push.catch_up_window_s,
-                max_messages=self.config.push.catch_up_max_messages,
+                enabled=self.config.catch_up_enabled,
+                window_s=self.config.catch_up_window_s,
+                max_messages=self.config.catch_up_max_messages,
             )
             self._seen_ids = seen_ids
             if action == "baseline":
@@ -530,7 +511,7 @@ class QQOutboundPusher:
                     await self._run_legacy_poll_once(client)
                     now = time.monotonic()
                     is_hot = any(now < self._hot_until.get(s, 0.0) for s in self.session_mapper.session_ids())
-                    sleep_s = 1.0 if is_hot else max(1.0, float(self.config.push.recheck_sleep_s))
+                    sleep_s = 1.0 if is_hot else max(1.0, float(self.config.recheck_sleep_s))
                     await asyncio.sleep(sleep_s)
                     continue
 
@@ -624,7 +605,7 @@ class QQOutboundPusher:
                         if not events:
                             return []
 
-                        default_sid = next(iter(subscribed_sids)) if len(subscribed_sids) == 1 else self.session_id
+                        default_sid = next(iter(subscribed_sids)) if len(subscribed_sids) == 1 else None
                         dirty_sids: Set[str] = set()
 
                         for ev in events:
@@ -701,16 +682,16 @@ class QQOutboundPusher:
             await self._hydrate_and_dispatch(sid, hist, is_initial_gate=(sid not in self._gated))
 
     def _proactive_target(self, session_id: Optional[str]) -> Tuple[str, str]:
-        """Destination for events that match no inbound route (reminders etc.)."""
-        if (
-            session_id
-            and self.session_mapper.per_chat
-            and self.config.proactive_to_session_owner
-        ):
+        """Destination for events that match no inbound route (reminders etc.).
+
+        The chat bound to the session, else the first admin privately; an empty
+        id means there is nowhere to deliver.
+        """
+        if session_id:
             owners = self.session_mapper.owners(session_id)
             if owners:
                 return owners[0]
-        return self.config.resolve_push_target()
+        return "private", self.config.admin_target() or ""
 
     async def notify_interaction(self, item, text):
         # Routing is not authorization; only configured admins can decide.
@@ -855,7 +836,7 @@ class QQOutboundPusher:
                 reply_msg_id = route.msg_id
                 route_type = "interactive_reply"
             else:
-                # Proactive push: session owner (per_chat) or the configured push target
+                # Proactive push: the chat bound to the session, else the admin
                 target_type, target_id = self._proactive_target(session_id)
                 route_type = "proactive_push"
                 reply_msg_id = None
@@ -867,7 +848,8 @@ class QQOutboundPusher:
                         reply_msg_id = route.msg_id
 
             if not target_id:
-                logger.debug('No target found for message %s, skipping.', mid)
+                logger.warning('Message %s of session %s has no bound chat and no admin is configured; dropped.',
+                               mid, (session_id or "")[:8])
                 continue
 
             # Mark processing
@@ -967,8 +949,8 @@ class QQOutboundPusher:
             if not (200 <= code < 300):
                 # If active send to group fails with permission error (40034105), fall back to admin private
                 if target_type == "group" and any(k in str(body) for k in ("40034105", "无权限", "主动消息失败")):
-                    admin_type, admin_id = self.config.resolve_push_target()
-                    if admin_id and (admin_type != target_type or admin_id != target_id):
+                    admin_type, admin_id = "private", self.config.admin_target()
+                    if admin_id:
                         logger.debug('Group active send rejected (%s); falling back to admin %s:%s', code, admin_type, admin_id)
                         delivered_type, delivered_id = admin_type, admin_id
                         code, body = await loop.run_in_executor(

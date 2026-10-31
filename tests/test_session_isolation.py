@@ -11,8 +11,8 @@ from unittest import mock
 from muse_bridge.adapters.qq.adapter import QQAdapter
 from muse_bridge.adapters.qq.outbound import QQOutboundPusher
 from muse_bridge.adapters.qq.route_manager import RouteManager
-from muse_bridge.config.models import AccessRequestsConfig, ConfigLoader, QQConfig, QQPushConfig
-from muse_bridge.core.session_map import MODE_GLOBAL, MODE_PER_CHAT, SessionMapper, chat_key
+from muse_bridge.config.models import AccessRequestsConfig, ConfigLoader, QQConfig
+from muse_bridge.core.session_map import SessionMapper, chat_key
 
 
 class TestSessionMapper(unittest.TestCase):
@@ -20,67 +20,45 @@ class TestSessionMapper(unittest.TestCase):
         self._tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self._tmp.cleanup)
         self.map_file = os.path.join(self._tmp.name, "map.json")
-        self.global_file = os.path.join(self._tmp.name, "global.json")
 
     def _ids(self):
         counter = iter(range(1, 100))
         return lambda: f"sid-{next(counter)}"
 
-    def test_invalid_mode_rejected(self):
-        with self.assertRaises(ValueError):
-            SessionMapper(mode="weird")
-
-    def test_global_mode_shares_one_session(self):
-        m = SessionMapper(mode=MODE_GLOBAL, global_session_id="G", state_file=self.map_file)
-        self.assertEqual(m.resolve("group", "A"), ("G", False))
-        self.assertEqual(m.resolve("private", "U"), ("G", False))
-        self.assertEqual(m.session_ids(), ["G"])
-        self.assertEqual(m.owners("G"), [])
-        self.assertFalse(os.path.exists(self.map_file))
-
-    def test_global_bind_persists_to_global_file(self):
-        m = SessionMapper(mode=MODE_GLOBAL, global_session_id="G", global_state_file=self.global_file)
-        m.bind("group", "A", "NEW")
-        self.assertEqual(m.resolve("private", "U")[0], "NEW")
-        with open(self.global_file, encoding="utf-8") as f:
-            self.assertEqual(json.load(f)["session_id"], "NEW")
-
     def test_per_chat_isolates_and_is_stable(self):
-        m = SessionMapper(mode=MODE_PER_CHAT, global_session_id="G",
-                          state_file=self.map_file, id_factory=self._ids())
+        m = SessionMapper(state_file=self.map_file, id_factory=self._ids())
         a, created_a = m.resolve("group", "A")
         b, created_b = m.resolve("group", "B")
         u, created_u = m.resolve("private", "U")
         self.assertTrue(created_a and created_b and created_u)
         self.assertEqual(len({a, b, u}), 3)
-        self.assertNotIn("G", {a, b, u})
         # Stable on repeat
         self.assertEqual(m.resolve("group", "A"), (a, False))
         # Same id string in different chat types stays separate
         self.assertNotEqual(m.resolve("group", "X")[0], m.resolve("private", "X")[0])
 
     def test_per_chat_persists_across_restart(self):
-        m1 = SessionMapper(mode=MODE_PER_CHAT, state_file=self.map_file, id_factory=self._ids())
+        m1 = SessionMapper(state_file=self.map_file, id_factory=self._ids())
         a, _ = m1.resolve("group", "A")
-        m2 = SessionMapper(mode=MODE_PER_CHAT, state_file=self.map_file, id_factory=self._ids())
+        m2 = SessionMapper(state_file=self.map_file, id_factory=self._ids())
         self.assertEqual(m2.resolve("group", "A"), (a, False))
 
     def test_config_bindings_seed_but_runtime_wins(self):
-        m = SessionMapper(mode=MODE_PER_CHAT, state_file=self.map_file,
+        m = SessionMapper(state_file=self.map_file,
                           bindings={chat_key("group", "A"): "PRE"}, id_factory=self._ids())
         self.assertEqual(m.resolve("group", "A"), ("PRE", False))
         m.bind("group", "A", "SWITCHED")
-        m2 = SessionMapper(mode=MODE_PER_CHAT, state_file=self.map_file,
+        m2 = SessionMapper(state_file=self.map_file,
                            bindings={chat_key("group", "A"): "PRE"}, id_factory=self._ids())
         self.assertEqual(m2.resolve("group", "A")[0], "SWITCHED")
 
     def test_current_does_not_create(self):
-        m = SessionMapper(mode=MODE_PER_CHAT, state_file=self.map_file, id_factory=self._ids())
+        m = SessionMapper(state_file=self.map_file, id_factory=self._ids())
         self.assertEqual(m.current("group", "A"), "")
         self.assertEqual(m.session_ids(), [])
 
     def test_bind_only_affects_that_chat(self):
-        m = SessionMapper(mode=MODE_PER_CHAT, state_file=self.map_file, id_factory=self._ids())
+        m = SessionMapper(state_file=self.map_file, id_factory=self._ids())
         a, _ = m.resolve("group", "A")
         b, _ = m.resolve("group", "B")
         m.bind("group", "A", "OTHER")
@@ -89,7 +67,7 @@ class TestSessionMapper(unittest.TestCase):
         self.assertEqual(set(m.session_ids()), {"OTHER", b})
 
     def test_owners_reverse_lookup(self):
-        m = SessionMapper(mode=MODE_PER_CHAT, state_file=self.map_file, id_factory=self._ids())
+        m = SessionMapper(state_file=self.map_file, id_factory=self._ids())
         a, _ = m.resolve("group", "A")
         self.assertEqual(m.owners(a), [("group", "A")])
         self.assertEqual(m.owners("nope"), [])
@@ -103,39 +81,64 @@ class TestSessionConfig(unittest.TestCase):
                 json.dump({"muse": {"client_ip": "1.1.1.1"}, "adapters": {"qq": qq}}, f)
             return ConfigLoader.load(p)
 
-    def test_defaults_keep_legacy_global_mode(self):
-        cfg = self._load({"app_id": "a"})
-        self.assertEqual(cfg.qq.session_mode, "global")
-        self.assertTrue(cfg.qq.proactive_to_session_owner)
-
-    def test_per_chat_options_loaded(self):
+    def test_session_options_loaded(self):
         cfg = self._load({
             "app_id": "a",
-            "session_mode": "Per_Chat",
             "session_map_file": "m.json",
             "session_bindings": {"group:G1": "S1"},
-            "proactive_to_session_owner": False,
             "session_hot_window_s": 10,
         })
-        self.assertEqual(cfg.qq.session_mode, "per_chat")
         self.assertEqual(cfg.qq.session_map_file, "m.json")
         self.assertEqual(cfg.qq.session_bindings, {"group:G1": "S1"})
-        self.assertFalse(cfg.qq.proactive_to_session_owner)
         self.assertEqual(cfg.qq.session_hot_window_s, 10)
 
+    def test_push_behavior_defaults(self):
+        cfg = self._load({"app_id": "a"})
+        self.assertEqual(cfg.qq.push_state_file, "data/qq_push_state.json")
+        self.assertFalse(cfg.qq.catch_up_enabled)
+        self.assertEqual(cfg.qq.catch_up_window_s, 6 * 3600)
+        self.assertEqual(cfg.qq.catch_up_max_messages, 5)
+        self.assertEqual(cfg.qq.recheck_sleep_s, 5)
+        self.assertEqual(cfg.qq.in_flight_ttl_s, 300)
+        self.assertEqual(cfg.qq.processing_ttl_s, 300)
 
-def _make_adapter(tmp, mode, **extra):
+    def test_flat_push_keys_loaded_and_old_push_block_ignored(self):
+        cfg = self._load({
+            "app_id": "a",
+            "push_state_file": "p.json",
+            "catch_up_enabled": True,
+            "catch_up_window_s": 60,
+            "catch_up_max_messages": 2,
+            "recheck_sleep_s": 7,
+            "in_flight_ttl_s": 11,
+            "processing_ttl_s": 12,
+            "session_mode": "global",
+            "push": {"target_type": "group", "target_id": "G", "state_file": "old.json",
+                     "catch_up_enabled": False, "catch_up_window_s": 999},
+        })
+        q = cfg.qq
+        self.assertEqual(q.push_state_file, "p.json")
+        self.assertTrue(q.catch_up_enabled)
+        self.assertEqual((q.catch_up_window_s, q.catch_up_max_messages), (60, 2))
+        self.assertEqual((q.recheck_sleep_s, q.in_flight_ttl_s, q.processing_ttl_s), (7, 11, 12))
+        self.assertFalse(hasattr(q, "push"))
+        self.assertFalse(hasattr(q, "session_mode"))
+
+    def test_admin_target_skips_wildcard_and_empty(self):
+        self.assertEqual(QQConfig(admin_id=["", "*", "A1", "A2"]).admin_target(), "A1")
+        self.assertIsNone(QQConfig(admin_id=["*"]).admin_target())
+        self.assertIsNone(QQConfig().admin_target())
+
+
+def _make_adapter(tmp, **extra):
     cfg = QQConfig(
         app_id="1", app_secret="s",
         whitelist={"private": ["U1"], "GA": "*", "GB": "*"},
         admin_id=["U1"], admin_only=False,
-        session_id="GLOBAL", session_mode=mode,
         access_requests=AccessRequestsConfig(state_file=os.path.join(tmp, "access.local.json")),
-        session_state_file=os.path.join(tmp, "qq_session.json"),
         session_map_file=os.path.join(tmp, "map.json"),
         delivered_file=os.path.join(tmp, "delivered.jsonl"),
-        push=QQPushConfig(state_file=os.path.join(tmp, "push.json"),
-                          delivered_file=os.path.join(tmp, "delivered.jsonl")),
+        push_state_file=os.path.join(tmp, "push.json"),
         **extra,
     )
     from muse_bridge.core.interactions import InteractionManager
@@ -158,7 +161,7 @@ def _group_event(gid, uid, text, mid):
 class TestInboundIsolation(unittest.IsolatedAsyncioTestCase):
     async def test_per_chat_routes_groups_to_different_sessions(self):
         with tempfile.TemporaryDirectory() as tmp:
-            adapter, muse = _make_adapter(tmp, "per_chat")
+            adapter, muse = _make_adapter(tmp)
             await adapter.handle_event("GROUP_MESSAGE_CREATE", _group_event("GA", "x", "hi A", "m1"))
             await adapter.handle_event("GROUP_MESSAGE_CREATE", _group_event("GB", "y", "hi B", "m2"))
             await adapter.handle_event("GROUP_MESSAGE_CREATE", _group_event("GA", "z", "again A", "m3"))
@@ -180,17 +183,18 @@ class TestInboundIsolation(unittest.IsolatedAsyncioTestCase):
             # outbound watches all three
             self.assertEqual(set(adapter.session_mapper.session_ids()), {sa1, sb, sp})
 
-    async def test_global_mode_unchanged(self):
+    async def test_switch_to_shared_session_joins_chats(self):
         with tempfile.TemporaryDirectory() as tmp:
-            adapter, muse = _make_adapter(tmp, "global")
+            adapter, muse = _make_adapter(tmp)
+            adapter.session_mapper.bind("group", "GA", "SHARED")
+            adapter.session_mapper.bind("group", "GB", "SHARED")
             await adapter.handle_event("GROUP_MESSAGE_CREATE", _group_event("GA", "x", "hi A", "m1"))
             await adapter.handle_event("GROUP_MESSAGE_CREATE", _group_event("GB", "y", "hi B", "m2"))
-            self.assertEqual([c.args[0] for c in muse.post_message.call_args_list], ["GLOBAL", "GLOBAL"])
-            self.assertFalse(os.path.exists(os.path.join(tmp, "map.json")))
+            self.assertEqual([c.args[0] for c in muse.post_message.call_args_list], ["SHARED", "SHARED"])
 
     async def test_new_command_rebinds_only_this_chat(self):
         with tempfile.TemporaryDirectory() as tmp:
-            adapter, muse = _make_adapter(tmp, "per_chat")
+            adapter, muse = _make_adapter(tmp)
             await adapter.handle_event("GROUP_MESSAGE_CREATE", _group_event("GA", "x", "a", "m1"))
             await adapter.handle_event("GROUP_MESSAGE_CREATE", _group_event("GB", "y", "b", "m2"))
             before_a = adapter.session_mapper.current("group", "GA")
@@ -201,7 +205,7 @@ class TestInboundIsolation(unittest.IsolatedAsyncioTestCase):
 
     async def test_switch_command_baselines_target_session(self):
         with tempfile.TemporaryDirectory() as tmp:
-            adapter, muse = _make_adapter(tmp, "per_chat")
+            adapter, muse = _make_adapter(tmp)
             fake_client = mock.MagicMock()
             fake_client.list_sessions.return_value = [
                 {"session_id": "EXIST-1111", "updated_at_ms": 5, "title": "t"},
@@ -214,7 +218,7 @@ class TestInboundIsolation(unittest.IsolatedAsyncioTestCase):
     async def test_admin_cmd_blocked_for_non_admin_when_admin_only(self):
         """Regression: is_admin used to be an undefined name (NameError)."""
         with tempfile.TemporaryDirectory() as tmp:
-            adapter, muse = _make_adapter(tmp, "per_chat")
+            adapter, muse = _make_adapter(tmp)
             adapter.config.admin_only = True
             await adapter.handle_event("GROUP_MESSAGE_CREATE", _group_event("GA", "x", "/new", "m1"))
             text = adapter.client.send_message.call_args_list[-1].args[2]
@@ -242,33 +246,26 @@ class _FakeMuseClient:
         return self._hist.get(sid, [])
 
 
-def _pusher(tmp, mode="per_chat", **cfg_extra):
+def _pusher(tmp, **cfg_extra):
+    cfg_extra.setdefault("admin_id", ["ADMIN"])
     cfg = QQConfig(
         app_id="1", app_secret="s",
-        admin_id=["ADMIN"], whitelist={"private": ["ADMIN"]},
-        session_mode=mode, session_hot_window_s=30, session_sweep_s=60,
-        push=QQPushConfig(state_file=os.path.join(tmp, "push.json")),
+        whitelist={"private": ["ADMIN", "WL_USER"]},
+        session_hot_window_s=30, session_sweep_s=60,
+        push_state_file=os.path.join(tmp, "push.json"),
         **cfg_extra,
     )
-    mapper = SessionMapper(mode=mode, global_session_id="GLOBAL",
-                           state_file=os.path.join(tmp, "map.json"))
+    mapper = SessionMapper(state_file=os.path.join(tmp, "map.json"))
     dedup = mock.Mock()
     dedup.is_delivered.return_value = False
     dedup.is_processing.return_value = False
     p = QQOutboundPusher(config=cfg, client=mock.Mock(), muse_service=mock.Mock(),
                          deduplicator=dedup, route_manager=RouteManager(state_file=None),
-                         session_id="GLOBAL", session_mapper=mapper)
+                         session_mapper=mapper)
     return p, mapper
 
 
 class TestOutboundChangeDetection(unittest.TestCase):
-    def test_global_mode_fetches_single_session_every_tick(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            p, _ = _pusher(tmp, mode="global")
-            c = _FakeMuseClient({})
-            self.assertEqual(p._sessions_to_fetch(c), ["GLOBAL"])
-            self.assertEqual(p._sessions_to_fetch(c), ["GLOBAL"])
-
     def test_per_chat_only_fetches_changed_sessions(self):
         with tempfile.TemporaryDirectory() as tmp:
             p, m = _pusher(tmp)
@@ -366,22 +363,35 @@ class TestOutboundRouting(unittest.IsolatedAsyncioTestCase):
             self.assertEqual((kw["target_type"], kw["target_id"]), ("group", "GA"))
             self.assertEqual(kw["route"].msg_id, "msg_id_123")
 
-    async def test_proactive_to_admin_when_owner_routing_disabled(self):
+    async def test_proactive_for_unbound_session_goes_to_admin(self):
         with tempfile.TemporaryDirectory() as tmp:
-            p, m = _pusher(tmp, proactive_to_session_owner=False)
-            a, _ = m.resolve("group", "GA")
+            p, _ = _pusher(tmp)
             p._send_to_qq = mock.AsyncMock(return_value=True)
-            await p._scan_and_dispatch([self._assistant("r2", "提醒")], a)
+            await p._scan_and_dispatch([self._assistant("r3", "提醒")], "UNBOUND")
             kw = p._send_to_qq.call_args.kwargs
             self.assertEqual((kw["target_type"], kw["target_id"]), ("private", "ADMIN"))
 
-    async def test_global_mode_proactive_still_admin(self):
+    async def test_unbound_without_admin_is_dropped_with_warning(self):
         with tempfile.TemporaryDirectory() as tmp:
-            p, _ = _pusher(tmp, mode="global")
+            p, _ = _pusher(tmp, admin_id=[])
             p._send_to_qq = mock.AsyncMock(return_value=True)
-            await p._scan_and_dispatch([self._assistant("r3", "提醒")], "GLOBAL")
-            kw = p._send_to_qq.call_args.kwargs
-            self.assertEqual((kw["target_type"], kw["target_id"]), ("private", "ADMIN"))
+            with self.assertLogs("muse_bridge", level="WARNING") as logs:
+                await p._scan_and_dispatch([self._assistant("r5", "提醒")], "UNBOUND")
+            p._send_to_qq.assert_not_called()
+            p.deduplicator.mark_processing.assert_not_called()
+            self.assertTrue(any("no admin" in line for line in logs.output))
+
+    async def test_group_rejection_falls_back_to_admin(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            p, m = _pusher(tmp)
+            a, _ = m.resolve("group", "GA")
+            p.client.send_message = mock.Mock(side_effect=[(400, '{"code": 40034105}'), (200, "ok")])
+            await p._scan_and_dispatch([self._assistant("r6", "群提醒")], a)
+            calls = p.client.send_message.call_args_list
+            self.assertEqual(calls[0].args[:2], ("group", "GA"))
+            self.assertEqual(calls[1].args[:2], ("private", "ADMIN"))
+            self.assertIn("【群消息提醒】", calls[1].args[2])
+            self.assertEqual(len(calls), 2)
 
     async def test_interactive_reply_uses_route_not_owner(self):
         with tempfile.TemporaryDirectory() as tmp:

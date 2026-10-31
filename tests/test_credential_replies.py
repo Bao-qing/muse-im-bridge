@@ -264,8 +264,7 @@ class TestCredentialReplies(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(await pusher._send_to_qq("group", "G", "card", [], [], [], credential=card))
         self.assertIs(self.service.interactions.referenced_credential("group", "G", [("ref", "DELIVERED==")]), card)
         self.adapter.client.send_message.side_effect = [(403, {"code": 40034105}), (200, {"ext_info": {"ref_idx": "FALLBACK=="}})]
-        with patch.object(self.adapter.config, "resolve_push_target", return_value=("private", "ADMIN")):
-            self.assertTrue(await pusher._send_to_qq("group", "G", "card", [], [], [], credential=card))
+        self.assertTrue(await pusher._send_to_qq("group", "G", "card", [], [], [], credential=card))
         self.assertIs(self.service.interactions.referenced_credential("private", "ADMIN", [("ref", "FALLBACK==")]), card)
         self.assertIsNone(self.service.interactions.referenced_credential("group", "G", [("ref", "FALLBACK==")]))
         self.adapter.client.send_message.side_effect = None
