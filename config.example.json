@@ -17,6 +17,7 @@
         "YOUR_ADMIN_OPENID"
       ],
       "admin_only": true,
+      "unbound_push_to_admin": true,
       "credentials_in_place": false,
       "approvals_in_place": false,
       "access_requests": {

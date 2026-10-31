@@ -684,14 +684,17 @@ class QQOutboundPusher:
     def _proactive_target(self, session_id: Optional[str]) -> Tuple[str, str]:
         """Destination for events that match no inbound route (reminders etc.).
 
-        The chat bound to the session, else the first admin privately; an empty
-        id means there is nowhere to deliver.
+        The chat bound to the session, else the first admin privately when
+        ``unbound_push_to_admin`` is on; an empty id means there is nowhere to
+        deliver.
         """
         if session_id:
             owners = self.session_mapper.owners(session_id)
             if owners:
                 return owners[0]
-        return "private", self.config.admin_target() or ""
+        if self.config.unbound_push_to_admin:
+            return "private", self.config.admin_target() or ""
+        return "private", ""
 
     async def notify_interaction(self, item, text):
         # Routing is not authorization; only configured admins can decide.
@@ -848,8 +851,10 @@ class QQOutboundPusher:
                         reply_msg_id = route.msg_id
 
             if not target_id:
-                logger.warning('Message %s of session %s has no bound chat and no admin is configured; dropped.',
-                               mid, (session_id or "")[:8])
+                reason = ("no admin is configured" if self.config.unbound_push_to_admin
+                          else "unbound_push_to_admin is disabled")
+                logger.warning('Message %s of session %s has no bound chat (%s); dropped.',
+                               mid, (session_id or "")[:8], reason)
                 continue
 
             # Mark processing

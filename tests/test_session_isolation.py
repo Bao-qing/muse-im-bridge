@@ -129,6 +129,16 @@ class TestSessionConfig(unittest.TestCase):
         self.assertIsNone(QQConfig(admin_id=["*"]).admin_target())
         self.assertIsNone(QQConfig().admin_target())
 
+    def test_unbound_push_to_admin_flag_defaults_and_validates(self):
+        self.assertTrue(QQConfig().unbound_push_to_admin)
+        with self.assertRaises(ValueError):
+            QQConfig(unbound_push_to_admin="false")
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "config.json")
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump({"adapters": {"qq": {"unbound_push_to_admin": False}}}, f)
+            self.assertFalse(ConfigLoader.load(path).qq.unbound_push_to_admin)
+
 
 def _make_adapter(tmp, **extra):
     cfg = QQConfig(
@@ -370,6 +380,15 @@ class TestOutboundRouting(unittest.IsolatedAsyncioTestCase):
             await p._scan_and_dispatch([self._assistant("r3", "提醒")], "UNBOUND")
             kw = p._send_to_qq.call_args.kwargs
             self.assertEqual((kw["target_type"], kw["target_id"]), ("private", "ADMIN"))
+
+    async def test_unbound_push_disabled_is_dropped_even_with_admin(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            p, _ = _pusher(tmp, unbound_push_to_admin=False)
+            p._send_to_qq = mock.AsyncMock(return_value=True)
+            with self.assertLogs("muse_bridge", level="WARNING") as logs:
+                await p._scan_and_dispatch([self._assistant("r6", "提醒")], "UNBOUND")
+            p._send_to_qq.assert_not_called()
+            self.assertTrue(any("unbound_push_to_admin is disabled" in line for line in logs.output))
 
     async def test_unbound_without_admin_is_dropped_with_warning(self):
         with tempfile.TemporaryDirectory() as tmp:

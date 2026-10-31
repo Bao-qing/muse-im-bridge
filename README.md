@@ -334,13 +334,14 @@ QQ 适配器中每个群、每个私聊用户各自绑定一个 Muse 会话，�
 - `session_map_file`（默认 `data/qq_session_map.json`）：`群/私聊 -> Muse session_id` 映射，重启后保持。
 - `session_bindings`：预置绑定，键为 `group:<group_openid>` 或 `private:<user_openid>`，值为已有的 Muse `session_id`。
 - `session_hot_window_s` / `session_sweep_s`：出站检测参数（见下）。
+- `unbound_push_to_admin`（默认 `true`）：会话没有绑定聊天时，主动消息是否私聊发给第一个管理员。设为 `false` 后这类消息直接丢弃（审批卡、凭证卡等仍会发给管理员，因为需要管理员操作）。
 
 出站消息的投递顺序：
 
 1. 有对应提问的回复，被动回复到提问所在的群/私聊。
 2. 提醒等无对应提问的主动消息，推到该会话绑定的群/私聊（多个聊天共用时取映射中的第一个）。群主动消息被 QQ 拒绝时改发管理员私聊。
 3. 会话没有绑定任何聊天时，私聊发给第一个管理员（`admin_id[0]`）。
-4. 未配置管理员时丢弃并记录 warning 日志，不会发给白名单中的其他用户。
+4. 未配置管理员，或设置了 `unbound_push_to_admin: false` 时丢弃并记录 warning 日志，不会发给白名单中的其他用户。
 
 行为说明：
 
