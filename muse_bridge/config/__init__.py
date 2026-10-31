@@ -6,7 +6,6 @@ from .models import (
     MuseConfig,
     OneBotConfig,
     QQConfig,
-    QQPushConfig,
 )
 
 __all__ = [
@@ -15,6 +14,5 @@ __all__ = [
     "LoggingConfig",
     "MuseConfig",
     "QQConfig",
-    "QQPushConfig",
     "OneBotConfig",
 ]

@@ -8,7 +8,8 @@ import time
 import unittest
 from unittest.mock import MagicMock, patch
 
-from muse_bridge.config.models import AccessRequestsConfig, AppConfig, GatewayConfig, MuseConfig, QQConfig, QQPushConfig
+from muse_bridge.config.models import AccessRequestsConfig, AppConfig, GatewayConfig, MuseConfig, QQConfig
+from muse_bridge.core.session_map import SessionMapper
 from muse_bridge.muse.token_manager import MuseTokenManager
 from muse_bridge.muse.client.errors import LoginRequired, HandshakeError, RPCError
 from muse_bridge.muse.service import MuseService
@@ -23,7 +24,6 @@ class TestLoginFallback(unittest.IsolatedAsyncioTestCase):
         self.tmp_dir = tempfile.TemporaryDirectory()
         self.cookies_path = os.path.join(self.tmp_dir.name, "cookies.json")
         self.mint_path = os.path.join(self.tmp_dir.name, ".mint.json")
-        self.session_state_path = os.path.join(self.tmp_dir.name, "qq_session.json")
         self.session_map_path = os.path.join(self.tmp_dir.name, "qq_session_map.json")
         self.delivered_path = os.path.join(self.tmp_dir.name, "qq_delivered.jsonl")
         self.push_state_path = os.path.join(self.tmp_dir.name, "qq_push_state.json")
@@ -53,15 +53,9 @@ class TestLoginFallback(unittest.IsolatedAsyncioTestCase):
             admin_id=["ADMIN_OPENID"],
             whitelist={"private": ["ADMIN_OPENID"]},
             access_requests=AccessRequestsConfig(state_file=os.path.join(self.tmp_dir.name, "access.local.json")),
-            session_state_file=self.session_state_path,
             session_map_file=self.session_map_path,
             delivered_file=self.delivered_path,
-            push=QQPushConfig(
-                enabled=True,
-                target_type="private",
-                target_id="ADMIN_OPENID",
-                state_file=self.push_state_path,
-            ),
+            push_state_file=self.push_state_path,
         )
         defaults.update(kwargs)
         return QQConfig(**defaults)
@@ -128,7 +122,7 @@ class TestLoginFallback(unittest.IsolatedAsyncioTestCase):
             muse_service=self.muse_service,
             deduplicator=MessageDeduplicator(),
             route_manager=RouteManager(),
-            session_id="test-session",
+            session_mapper=SessionMapper(bindings={"private:ADMIN_OPENID": "test-session"}),
             on_login_required=on_login_req,
         )
 
@@ -218,7 +212,7 @@ class TestLoginFallback(unittest.IsolatedAsyncioTestCase):
             muse_service=self.muse_service,
             deduplicator=MessageDeduplicator(),
             route_manager=RouteManager(),
-            session_id="new-empty-session",
+            session_mapper=SessionMapper(bindings={"private:ADMIN_OPENID": "new-empty-session"}),
         )
 
         with patch.object(self.muse_service, "create_client") as mock_create:
@@ -249,13 +243,13 @@ class TestLoginFallback(unittest.IsolatedAsyncioTestCase):
 
     async def test_inbound_post_message_404_auto_recreates_session(self):
         """Test sending message encountering 404 automatically creates new session and posts."""
-        qq_config = self._make_qq_config(session_id="initial-session-id")
+        qq_config = self._make_qq_config(session_bindings={"private:ADMIN_OPENID": "initial-session-id"})
         adapter = QQAdapter(config=qq_config, muse_service=self.muse_service)
         mock_qq_client = MagicMock()
         mock_qq_client.send_message.return_value = (200, {})
         adapter.client = mock_qq_client
 
-        old_sid = adapter.active_session_id
+        old_sid = adapter.session_mapper.current("private", "ADMIN_OPENID")
         calls = []
 
         def mock_post(sid, text, *args, **kwargs):
@@ -275,8 +269,8 @@ class TestLoginFallback(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(len(calls), 2)
             self.assertEqual(calls[0], old_sid)
             self.assertNotEqual(calls[1], old_sid)
-            # Active session was updated
-            self.assertEqual(adapter.active_session_id, calls[1])
+            # This chat is rebound to the recreated session
+            self.assertEqual(adapter.session_mapper.current("private", "ADMIN_OPENID"), calls[1])
 
 
 if __name__ == "__main__":

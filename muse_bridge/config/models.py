@@ -74,24 +74,6 @@ class MuseConfig:
 
 
 @dataclasses.dataclass
-class QQPushConfig:
-    enabled: bool = True
-    target_type: str = "private"  # "private" or "group"
-    target_id: Optional[str] = None  # None -> auto-select first private openid from whitelist
-    catch_up_enabled: bool = constants.DEFAULT_CATCH_UP_ENABLED
-    catch_up_window_s: int = constants.DEFAULT_CATCH_UP_WINDOW_S
-    catch_up_max_messages: int = constants.DEFAULT_CATCH_UP_MAX_MESSAGES
-    in_flight_ttl_s: int = constants.DEFAULT_IN_FLIGHT_TTL_S
-    processing_ttl_s: int = constants.DEFAULT_PROCESSING_TTL_S
-    periodic_scan_s: int = constants.DEFAULT_PERIODIC_SCAN_S
-    turn_end_fallback_s: int = constants.DEFAULT_TURN_END_FALLBACK_S
-    recheck_sleep_s: int = constants.DEFAULT_RECHECK_SLEEP_S
-    reconnect_sleep_s: int = constants.DEFAULT_RECONNECT_SLEEP_S
-    state_file: str = "data/qq_push_state.json"
-    delivered_file: str = "data/qq_delivered.jsonl"
-
-
-@dataclasses.dataclass
 class AccessRequestsConfig:
     enabled: bool = True
     auto_approve: bool = False
@@ -112,30 +94,32 @@ class QQConfig:
     admin_id: List[str] = dataclasses.field(default_factory=list)
     admin_only: bool = constants.DEFAULT_ADMIN_ONLY
     credentials_in_place: bool = False
+    approvals_in_place: bool = False
     access_requests: AccessRequestsConfig = dataclasses.field(default_factory=AccessRequestsConfig)
-    session_id: str = ""
     whitelist: Dict[str, Union[List[str], str]] = dataclasses.field(default_factory=dict)
-    push: QQPushConfig = dataclasses.field(default_factory=QQPushConfig)
-    session_state_file: str = "data/qq_session.json"
     delivered_file: str = "data/qq_delivered.jsonl"
     proxy_url: Optional[str] = None
     download_proxy: str = ""
     debug: bool = False
 
-    # Session isolation: "global" (all chats share one Muse session, legacy)
-    # or "per_chat" (each group / private user gets its own Muse session).
-    session_mode: str = "global"
+    # Each group / private user gets its own Muse session.
     session_map_file: str = "data/qq_session_map.json"
     # Optional pre-seeded bindings, e.g. {"group:<openid>": "<muse session id>"}
     session_bindings: Dict[str, str] = dataclasses.field(default_factory=dict)
-    # per_chat only: route unsolicited events (reminders, background tasks)
-    # to the chat that owns the session instead of the admin private chat.
-    proactive_to_session_owner: bool = True
-    # per_chat only: keep fetching a session's history this long after the last
-    # detected activity (covers streaming replies), and do a full sweep every
+    # Keep fetching a session's history this long after the last detected
+    # activity (covers streaming replies), and do a full sweep every
     # `session_sweep_s` as a safety net.
     session_hot_window_s: int = 45
     session_sweep_s: int = 60
+
+    # Outbound push: watermark file, startup catch-up and delivery timing.
+    push_state_file: str = "data/qq_push_state.json"
+    catch_up_enabled: bool = constants.DEFAULT_CATCH_UP_ENABLED
+    catch_up_window_s: int = constants.DEFAULT_CATCH_UP_WINDOW_S
+    catch_up_max_messages: int = constants.DEFAULT_CATCH_UP_MAX_MESSAGES
+    recheck_sleep_s: int = constants.DEFAULT_RECHECK_SLEEP_S
+    in_flight_ttl_s: int = constants.DEFAULT_IN_FLIGHT_TTL_S
+    processing_ttl_s: int = constants.DEFAULT_PROCESSING_TTL_S
 
     # Chunking & budget
     chunk_chars: int = constants.DEFAULT_CHUNK_CHARS
@@ -165,72 +149,16 @@ class QQConfig:
     def __post_init__(self):
         if type(self.credentials_in_place) is not bool:
             raise ValueError("adapters.qq.credentials_in_place must be a boolean")
+        if type(self.approvals_in_place) is not bool:
+            raise ValueError("adapters.qq.approvals_in_place must be a boolean")
 
     def is_admin(self, user_openid: str) -> bool:
         """Whether the user openid belongs to an administrator."""
         return bool(user_openid and user_openid in self.admin_id)
 
-    def get_default_private_target(self) -> Optional[str]:
-        """Derive the first private target: admin_id first, then whitelist."""
-        if self.admin_id:
-            for a in self.admin_id:
-                if a and a != "*":
-                    return a
-        if not self.whitelist:
-            return None
-        privates = self.whitelist.get("private")
-        if isinstance(privates, list) and privates:
-            for p in privates:
-                if isinstance(p, str) and p and p != "*":
-                    return p
-        return None
-
-    def get_default_group_target(self) -> Optional[str]:
-        """Derive the first group openid from the whitelist."""
-        if not self.whitelist:
-            return None
-        for k in self.whitelist:
-            if k != "private" and isinstance(k, str) and k:
-                return k
-        return None
-
-    def get_candidate_push_targets(self) -> List[tuple[str, str]]:
-        """Return candidate push targets in order: specified target -> admin -> private -> group."""
-        candidates = []
-        if self.push.target_id:
-            candidates.append((self.push.target_type, self.push.target_id))
-            return candidates
-
-        # If not explicitly specified, default to the admin in private chat
-        if self.admin_id:
-            for a in self.admin_id:
-                if a and a != "*":
-                    candidates.append(("private", a))
-            if candidates:
-                return candidates
-
-        privates = self.whitelist.get("private")
-        if isinstance(privates, list):
-            for p in privates:
-                if isinstance(p, str) and p and p != "*":
-                    candidates.append(("private", p))
-
-        for k in self.whitelist:
-            if k != "private" and isinstance(k, str) and k:
-                candidates.append(("group", k))
-
-        return candidates
-
-    def resolve_push_target(self) -> tuple[str, str]:
-        """Resolve push target (type, target_id).
-
-        Defaults to the first administrator openid in private chat.
-        Falls back to whitelist private or group openid if no admin is configured.
-        """
-        candidates = self.get_candidate_push_targets()
-        if candidates:
-            return candidates[0]
-        return "private", ""
+    def admin_target(self) -> Optional[str]:
+        """First administrator openid: private fallback for messages with no chat."""
+        return next((a for a in self.admin_id if a and a != "*"), None)
 
 
 @dataclasses.dataclass
@@ -375,24 +303,6 @@ class ConfigLoader:
         # 2. QQ config (check adapters.qq or qq_official / qq)
         adapters_raw = raw_data.get("adapters", {})
         q_raw = adapters_raw.get("qq") or raw_data.get("qq_official") or raw_data.get("qq") or {}
-        p_raw = q_raw.get("push") or adapters_raw.get("qq_push") or {}
-
-        push_cfg = QQPushConfig(
-            enabled=p_raw.get("enabled", True),
-            target_type=p_raw.get("target_type", "private"),
-            target_id=p_raw.get("target_id") or p_raw.get("target_user_openid") or p_raw.get("target_group_openid"),
-            catch_up_enabled=bool(_get_val(p_raw, "catch_up_enabled", constants.DEFAULT_CATCH_UP_ENABLED)),
-            catch_up_window_s=int(_get_val(p_raw, "catch_up_window_s", constants.DEFAULT_CATCH_UP_WINDOW_S)),
-            catch_up_max_messages=int(_get_val(p_raw, "catch_up_max_messages", constants.DEFAULT_CATCH_UP_MAX_MESSAGES)),
-            in_flight_ttl_s=int(_get_val(p_raw, "in_flight_ttl_s", constants.DEFAULT_IN_FLIGHT_TTL_S)),
-            processing_ttl_s=int(_get_val(p_raw, "processing_ttl_s", constants.DEFAULT_PROCESSING_TTL_S)),
-            periodic_scan_s=int(_get_val(p_raw, "periodic_scan_s", constants.DEFAULT_PERIODIC_SCAN_S)),
-            turn_end_fallback_s=int(_get_val(p_raw, "turn_end_fallback_s", constants.DEFAULT_TURN_END_FALLBACK_S)),
-            recheck_sleep_s=int(_get_val(p_raw, "recheck_sleep_s", constants.DEFAULT_RECHECK_SLEEP_S)),
-            reconnect_sleep_s=int(_get_val(p_raw, "reconnect_sleep_s", constants.DEFAULT_RECONNECT_SLEEP_S)),
-            state_file=p_raw.get("state_file", "data/qq_push_state.json"),
-            delivered_file=p_raw.get("delivered_file", "data/qq_delivered.jsonl"),
-        )
 
         admin_raw = q_raw.get("admin_id") or []
         if isinstance(admin_raw, list):
@@ -419,22 +329,25 @@ class ConfigLoader:
             admin_id=admin_ids,
             admin_only=bool(_get_val(q_raw, "admin_only", constants.DEFAULT_ADMIN_ONLY)),
             credentials_in_place=q_raw.get("credentials_in_place", False),
-            session_id=str(q_raw.get("session_id") or muse_cfg.session_id or ""),
+            approvals_in_place=q_raw.get("approvals_in_place", False),
             whitelist=q_raw.get("whitelist") or {},
-            push=push_cfg,
-            session_state_file=q_raw.get("session_state_file", "data/qq_session.json"),
             delivered_file=q_raw.get("delivered_file", "data/qq_delivered.jsonl"),
             proxy_url=q_raw.get("proxy_url") or muse_cfg.proxy_url,
             download_proxy=q_raw.get("download_proxy") or "",
             debug=q_raw.get("debug", False) or _env_bool("QQ_DEBUG", False),
-            session_mode=str(q_raw.get("session_mode") or "global").strip().lower(),
             session_map_file=q_raw.get("session_map_file", "data/qq_session_map.json"),
             session_bindings={
                 str(k): str(v) for k, v in (q_raw.get("session_bindings") or {}).items() if k and v
             },
-            proactive_to_session_owner=bool(q_raw.get("proactive_to_session_owner", True)),
             session_hot_window_s=int(q_raw.get("session_hot_window_s", 45)),
             session_sweep_s=int(q_raw.get("session_sweep_s", 60)),
+            push_state_file=q_raw.get("push_state_file", "data/qq_push_state.json"),
+            catch_up_enabled=bool(_get_val(q_raw, "catch_up_enabled", constants.DEFAULT_CATCH_UP_ENABLED)),
+            catch_up_window_s=int(_get_val(q_raw, "catch_up_window_s", constants.DEFAULT_CATCH_UP_WINDOW_S)),
+            catch_up_max_messages=int(_get_val(q_raw, "catch_up_max_messages", constants.DEFAULT_CATCH_UP_MAX_MESSAGES)),
+            recheck_sleep_s=int(_get_val(q_raw, "recheck_sleep_s", constants.DEFAULT_RECHECK_SLEEP_S)),
+            in_flight_ttl_s=int(_get_val(q_raw, "in_flight_ttl_s", constants.DEFAULT_IN_FLIGHT_TTL_S)),
+            processing_ttl_s=int(_get_val(q_raw, "processing_ttl_s", constants.DEFAULT_PROCESSING_TTL_S)),
             chunk_chars=int(_get_val(q_raw, "chunk_chars", constants.DEFAULT_CHUNK_CHARS)),
             max_chunks=int(_get_val(q_raw, "max_chunks", constants.DEFAULT_MAX_CHUNKS)),
             max_active_chunks=int(_get_val(q_raw, "max_active_chunks", constants.DEFAULT_MAX_ACTIVE_CHUNKS)),
