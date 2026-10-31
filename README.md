@@ -28,7 +28,7 @@ muse_bridge/
 │   │   │   ├── adapter.py    # QQAdapter 总控（协调网关与主动推送子组件）
 │   │   │   ├── client.py     # QQ OpenAPI 客户端（鉴权、发消息、上传富媒体）
 │   │   │   ├── gateway.py    # QQ WebSocket 网关（心跳与事件分发）
-│   │   │   ├── push.py       # QQPushService（主动推送子组件：默认推送到第一私聊）
+│   │   │   ├── outbound.py   # QQOutboundPusher（出站推送：发回会话绑定的聊天，未绑定时发管理员）
 │   │   │   └── ws_transport.py # 兼容 QQ 101 Connection:close 的底层 WS 客户端
 │   │   └── onebot/           # OneBot v11 (NapCat) 适配器
 │   │       ├── adapter.py    # OneBotAdapter 总控
@@ -97,12 +97,6 @@ cp config.example.json config.json
           "YOUR_PRIVATE_OPENID"
         ],
         "YOUR_GROUP_OPENID": "*"
-      },
-      "push": {
-        "enabled": true,
-        "target_type": "private",
-        "target_id": null,
-        "catch_up_enabled": false
       }
     },
     "onebot": {
@@ -147,7 +141,7 @@ python -m unittest discover tests
   "muse": {
     "cookies_file": "cookies.json",                 // [可选] 网页 cookies 路径，用于自动提取 vm_id 和静默续期 token (默认: "cookies.json")
     "mint_file": ".mint.json",                     // [可选] 缓存的 mint token 路径 (默认: ".mint.json")
-    "session_id": "YOUR_MUSE_SESSION_ID",          // [必填] Muse 目标会话 UUID
+    "session_id": "YOUR_MUSE_SESSION_ID",          // [可选] OneBot 默认使用的 Muse 会话 UUID；QQ 按聊天自动建会话，不使用此项
     "vm_id": "",                                   // [可选] 虚拟机 ID，留空则自动从 cookies 或 mint token 解析
     "host": "hatch.metaaivm.com",                  // [可选] Muse 网关域名 (默认: "hatch.metaaivm.com")
     "client_ip": "",                               // [可选] 出口公网 IP，留空则启动时自动探测
@@ -177,16 +171,16 @@ python -m unittest discover tests
         ],
         "YOUR_GROUP_OPENID": "*"                   // 允许互动的群 OpenID: "*" 表示群员全员开放，或配置指定成员 OpenID 列表
       },
-      "push": {                                    // [可选] 主动推送子组件配置
-        "enabled": true,                           // 是否启用主动推送 (默认: true)
-        "target_type": "private",                  // 推送目标类型: "private" (私聊) 或 "group" (群聊) (默认: "private")
-        "target_id": null,                         // 推送目标 ID: 留空 null 则默认自动推送到管理员 (admin_id[0]) 或第一私聊
-        "catch_up_enabled": false,                 // 启动时是否追赶离线期间产生的历史未推送消息 (默认: false，全量标为已读)
-        "catch_up_window_s": 21600,                // 追赶允许的最大离线时间窗口 (秒，默认: 21600 = 6小时)
-        "catch_up_max_messages": 5,                // 追赶单次补推的最大消息条数 (默认: 5，防止刷屏)
-        "state_file": "data/qq_push_state.json",        // 推送水位持久化文件路径 (默认: "data/qq_push_state.json")
-        "delivered_file": "data/qq_delivered.jsonl"     // 已投递消息去重记录文件路径 (默认: "data/qq_delivered.jsonl")
-      },
+      "session_map_file": "data/qq_session_map.json", // [可选] 群/私聊 -> Muse 会话映射文件 (默认: "data/qq_session_map.json")
+      "session_bindings": {},                      // [可选] 预置绑定，如 {"group:<group_openid>": "<session_id>"}
+      "delivered_file": "data/qq_delivered.jsonl", // [可选] 已投递消息去重记录文件路径 (默认: "data/qq_delivered.jsonl")
+      "push_state_file": "data/qq_push_state.json", // [可选] 推送水位持久化文件路径 (默认: "data/qq_push_state.json")
+      "catch_up_enabled": false,                   // [可选] 启动时是否补推离线期间产生的未推送消息 (默认: false，全量标为已读)
+      "catch_up_window_s": 21600,                  // [可选] 补推允许的最大离线时间窗口 (秒，默认: 21600 = 6小时)
+      "catch_up_max_messages": 5,                  // [可选] 单次补推的最大消息条数 (默认: 5，防止刷屏)
+      "recheck_sleep_s": 5,                        // [可选] 会话空闲时的出站复查间隔 (秒，默认: 5)
+      "in_flight_ttl_s": 300,                      // [可选] 发送中消息的去重锁有效期 (秒，默认: 300)
+      "processing_ttl_s": 300,                     // [可选] 处理中消息的去重锁有效期 (秒，默认: 300)
       "ws_guid": "258EAFA5-E914-47DA-95CA-C5AB0DC85B11", // [可选] QQ Gateway 握手 GUID
       "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/155.0.0.0 Safari/537.36", // [可选] 全局统一 HTTP/WS User-Agent
       "chunk_chars": 1200,                         // [可选] 单条消息文本最大切片字符数 (默认: 1200)
@@ -200,7 +194,6 @@ python -m unittest discover tests
       "gateway_dedup_s": 120,                      // [可选] QQ 网关事件去重窗口秒数 (默认: 120)
       "download_timeout_s": 60,                    // [可选] 附件下载超时时间 (秒，默认: 60)
       "download_proxy": "",                        // [可选] 针对受阻域名的专用代理前缀，例如 "https://proxy.example.com/https/"
-      "session_state_file": "data/qq_session.json", // [可选] /switch 与 /new 命令持久化记录文件路径 (默认: "data/qq_session.json")
       "debug": false                               // [可选] 旧兼容开关，仅在 logging.level 未指定时选用 DEBUG (默认: false)
     },
     "onebot": {
@@ -289,17 +282,16 @@ python tools/login.py --config config.json --output cookies.json
 | 文件 | 内容 | 配置项 |
 | :--- | :--- | :--- |
 | `data/qq_access.local.json` | 动态白名单授权与申请记录 | `adapters.qq.access_requests.state_file` |
-| `data/qq_delivered.jsonl` | 已投递消息去重记录（追加写入） | `adapters.qq.delivered_file` / `adapters.qq.push.delivered_file` |
-| `data/qq_push_state.json` | 主动推送水位与已见消息 | `adapters.qq.push.state_file` |
+| `data/qq_delivered.jsonl` | 已投递消息去重记录（追加写入） | `adapters.qq.delivered_file` |
+| `data/qq_push_state.json` | 主动推送水位与已见消息 | `adapters.qq.push_state_file` |
 | `data/qq_routes.json` | 消息 ID -> QQ 目标路由（重启后仍可被动回复） | `RouteManager` 默认值 |
-| `data/qq_session.json` | `global` 模式下的当前 Muse 会话 | `adapters.qq.session_state_file` |
-| `data/qq_session_map.json` | `per_chat` 模式下群/私聊到会话的映射 | `adapters.qq.session_map_file` |
+| `data/qq_session_map.json` | 群/私聊到 Muse 会话的映射 | `adapters.qq.session_map_file` |
 
 `data/` 已在 `.gitignore` 中忽略。从旧版升级时，将根目录下的同名文件移入 `data/` 即可保留原有状态（不移动则按空状态重新开始）。
 
 重复待办合并；每人新申请间隔至少一分钟，已处理申请重提需等待十分钟，待办七天过期。管理员通知失败时保留待办，可稍后重发申请或由管理员查询；通知和授权结果不等同 QQ 一定送达。
 
-申请只开通聊天访问，不改变 `session_mode`：`global` 仍共享 Muse 会话，需群间隔离时使用 `per_chat`。登录、凭证、Muse 原生审批仍沿用各自管理员权限。
+申请只开通聊天访问；获批的群/私聊同样拥有独立的 Muse 会话。登录、凭证、Muse 原生审批仍沿用各自管理员权限。
 
 ## 登录、凭证与审批交互
 
@@ -333,21 +325,22 @@ QQ 私聊不等同网页安全输入：密码和验证码仍经过 QQ 链路。�
 - 凭证 capture 返回有效 ID 才记录完成；网页成功回调也只更新本地展示，不额外猜测远端卡片完成接口。桥接在 `cookies_file + .captures.local.json` 中原子保存目标/会话/卡片/授权上下文的 SHA-256 回执，以防重启重开已成功提交的同一卡片。文件不含账号、密码、验证码、授权原文或 capture ID；删除该回执文件会丢失本地完成去重，损坏或不可读时拒绝启动。远端 `credential_capture_completed` 状态仍以服务器事件为准。
 - 审批使用独立 Sentinel 状态协调（约三秒一次，发送前再次核对）；聊天出站仍为事件驱动。尚未把未证实的 `approvals.snapshot` 订阅来源写死。重启从远端恢复待审批，状态查询失败时不放行普通消息。
 
-## 会话隔离（`session_mode`）
+## 会话隔离
 
-QQ 适配器支持两种会话模式，通过 `adapters.qq.session_mode` 选择：
+QQ 适配器中每个群、每个私聊用户各自绑定一个 Muse 会话，互不可见。需要多个聊天共用同一会话时，在各聊天中 `/switch` 到同一个会话 ID，或用 `session_bindings` 预置。
 
-| 模式 | 行为 |
-| :--- | :--- |
-| `global`（默认） | 所有群聊/私聊共用同一个 Muse 会话（`data/qq_session.json` / `muse.session_id`），与旧版完全一致 |
-| `per_chat` | 每个群、每个私聊用户各自独立一个 Muse 会话，互不可见 |
-
-`per_chat` 相关选项：
+相关选项：
 
 - `session_map_file`（默认 `data/qq_session_map.json`）：`群/私聊 -> Muse session_id` 映射，重启后保持。
 - `session_bindings`：预置绑定，键为 `group:<group_openid>` 或 `private:<user_openid>`，值为已有的 Muse `session_id`。
-- `proactive_to_session_owner`（默认 `true`）：提醒等无对应提问的主动消息，推回该会话所属的群/私聊；设为 `false` 则仍推给管理员私聊。
 - `session_hot_window_s` / `session_sweep_s`：出站检测参数（见下）。
+
+出站消息的投递顺序：
+
+1. 有对应提问的回复，被动回复到提问所在的群/私聊。
+2. 提醒等无对应提问的主动消息，推到该会话绑定的群/私聊（多个聊天共用时取映射中的第一个）。群主动消息被 QQ 拒绝时改发管理员私聊。
+3. 会话没有绑定任何聊天时，私聊发给第一个管理员（`admin_id[0]`）。
+4. 未配置管理员时丢弃并记录 warning 日志，不会发给白名单中的其他用户。
 
 行为说明：
 
