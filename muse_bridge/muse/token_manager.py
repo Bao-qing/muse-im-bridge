@@ -17,13 +17,16 @@ import base64
 import json
 import os
 import re
-import sys
+import hashlib
+import math
 import tempfile
 import threading
 import time
 from typing import Optional, Tuple
 
 import httpx
+
+from .client.errors import CredentialRefreshError, LoginRequired
 
 _BASE_HEADERS = {
     "User-Agent": (
@@ -53,12 +56,16 @@ class MuseTokenManager:
         self.mint_file = mint_file
         self.cookies_file = cookies_file
         self.vm_id = vm_id
+        self._explicit_vm = bool(vm_id)
         self.base_url = base_url.rstrip("/")
 
         self._token = ""
         self._notary_token = ""
         self._invalid = False
-        self._cookie_mtime_when_invalidated: float = 0.0
+        self._invalid_cookie_digest = None
+        self._mint_rejected = False
+        self._retry_after = 0.0
+        self._refresh_error = None
         self._lock = threading.RLock()
         self._load_cached_mint()
 
@@ -186,7 +193,7 @@ class MuseTokenManager:
                 resp = client.get(f"{self.base_url}/", headers=headers)
                 html = resp.text
         except Exception:
-            return ""
+            raise CredentialRefreshError("resolve_vm") from None
         hits = _VM_HOST_RE.findall(html)
         if not hits:
             return ""
@@ -194,17 +201,27 @@ class MuseTokenManager:
 
     def _post_json(self, url: str, payload: dict, cookie: str, timeout: int = 20) -> dict:
         headers = self._get_headers(cookie)
+        stage = url.rsplit("/", 1)[-1]
         try:
             with httpx.Client(http2=True, timeout=timeout) as client:
                 resp = client.post(url, headers=headers, json=payload)
                 if resp.status_code != 200:
-                    detail = resp.text[:200]
-                    raise RuntimeError(f"HTTP {resp.status_code}: {detail}")
-                return resp.json()
-        except RuntimeError:
+                    try:
+                        body = resp.json()
+                        code = body.get("code", "") if isinstance(body, dict) else ""
+                    except ValueError:
+                        code = ""
+                    # Never include arbitrary response bodies or credential-bearing URLs.
+                    code = code if isinstance(code, str) and re.fullmatch(r"[a-zA-Z0-9_-]{1,80}", code) else ""
+                    raise CredentialRefreshError(stage, resp.status_code, code)
+                data = resp.json()
+                if not isinstance(data, dict):
+                    raise CredentialRefreshError(stage)
+                return data
+        except CredentialRefreshError:
             raise
-        except Exception as e:
-            raise RuntimeError(f"request to {url} failed: {e}")
+        except Exception:
+            raise CredentialRefreshError(stage) from None
 
     def _write_mint_atomic(self, token: str, notary: str) -> None:
         if not self.mint_file:
@@ -215,6 +232,8 @@ class MuseTokenManager:
             with os.fdopen(fd, "w", encoding="utf-8") as fh:
                 json.dump({"token": token, "notary_token": notary}, fh, ensure_ascii=False, indent=2)
                 fh.write("\n")
+                fh.flush()
+                os.fsync(fh.fileno())
             try:
                 os.chmod(tmp, 0o600)
             except OSError:
@@ -227,128 +246,133 @@ class MuseTokenManager:
                 except OSError:
                     pass
 
-    def invalidate(self) -> None:
-        """Mark cached tokens and cookies as invalid and remove cached mint file."""
-        self._token = ""
-        self._notary_token = ""
-        self._invalid = True
-        if self.cookies_file and os.path.exists(self.cookies_file):
-            try:
-                self._cookie_mtime_when_invalidated = os.path.getmtime(self.cookies_file)
-            except OSError:
-                self._cookie_mtime_when_invalidated = time.time()
-        else:
-            self._cookie_mtime_when_invalidated = time.time()
+    @staticmethod
+    def _cookie_digest(cookie):
+        return hashlib.sha256(cookie.encode("utf-8")).digest()
 
-        if self.mint_file and os.path.exists(self.mint_file):
-            try:
-                os.remove(self.mint_file)
-            except OSError:
-                pass
+    def invalidate(self) -> None:
+        """Mark a confirmed missing/rejected cookie session as requiring login."""
+        with self._lock:
+            self._invalid = True
+            self._invalid_cookie_digest = self._cookie_digest(self.load_cookie_string())
+            self._mint_rejected = True
+            self._retry_after = 0.0
+            self._token = self._notary_token = ""
+            if self.mint_file:
+                try:
+                    os.remove(self.mint_file)
+                except OSError:
+                    pass
+
+    def invalidate_mint(self, token=None, notary=None) -> None:
+        """Reject only the failed snapshot; a late failure cannot reject newer mint."""
+        with self._lock:
+            if (token is None or token == self._token) and (notary is None or notary == self._notary_token):
+                self._mint_rejected = True
+
+    @classmethod
+    def credentials_expiry(cls, token, notary):
+        expiry = cls.notary_expiry(notary)
+        try:
+            payload = token.split(".")[1]
+            value = json.loads(base64.urlsafe_b64decode(payload + "=" * (-len(payload) % 4))).get("exp")
+            if type(value) in (int, float) and math.isfinite(value) and value > 0:
+                expiry = min(expiry, value) if expiry is not None else value
+        except Exception:
+            pass
+        return expiry
 
     def is_fresh(self) -> bool:
-        if self._invalid:
+        if self._invalid or self._mint_rejected or not self._token or not self._notary_token:
             return False
-        if not self._token or not self._notary_token:
-            return False
-        exp = self.notary_expiry(self._notary_token)
+        exp = self.credentials_expiry(self._token, self._notary_token)
         return exp is None or time.time() < exp - 60
 
     def has_credentials(self) -> bool:
-        """Check whether we have usable cached tokens or an existing cookies file."""
-        if self._invalid:
-            if self._cookie_mtime_when_invalidated and self.cookies_file and os.path.exists(self.cookies_file):
-                try:
-                    if os.path.getmtime(self.cookies_file) > self._cookie_mtime_when_invalidated:
-                        self._invalid = False
-                except OSError:
-                    pass
-            if self._invalid:
-                return False
-
-        if self._token and self._notary_token and self.is_fresh():
-            return True
-        return bool(self.load_cookie_string())
-
-    def refresh_from_cookies(self, interactive: bool = True) -> Tuple[str, str, str]:
-        """Mint new tokens using cookies and save to mint_file atomically."""
+        """Availability is not proof of validity, but temporary failures never lock cookies."""
         with self._lock:
             cookie = self.load_cookie_string()
-            if not cookie and interactive and sys.stdin.isatty():
-                print(f"[Muse] Cookies 文件 ({self.cookies_file}) 不存在或为空。")
-                try:
-                    choice = input("是否立即通过纯协议登录获取新 Cookies？(y/n): ").strip().lower()
-                    if choice in ("y", "yes"):
-                        from .login import run_protocol_login
-                        run_protocol_login(output_path=self.cookies_file)
-                        cookie = self.load_cookie_string()
-                except Exception as e:
-                    print(f"[Muse] 登录流程失败或取消：{e}")
+            if self._invalid:
+                if self._cookie_digest(cookie) == self._invalid_cookie_digest:
+                    return False
+                self._invalid = False
+                self._retry_after = 0.0
+            return self.is_fresh() or bool(cookie)
 
+    def credentials_current(self, token, notary, vm_id) -> bool:
+        with self._lock:
+            return (token, notary, vm_id) == (self._token, self._notary_token, self.vm_id) and self.is_fresh()
+
+    def refresh_from_cookies(self, interactive: bool = False, *, rejected_token=None, rejected_notary=None) -> Tuple[str, str, str]:
+        """Single-flight renewal; never prompts for OTP or conflates mint and cookie rejection."""
+        with self._lock:
+            changed = ((rejected_token is not None and rejected_token != self._token)
+                       or (rejected_notary is not None and rejected_notary != self._notary_token))
+            if changed and self.is_fresh():
+                return self._token, self._notary_token, self.vm_id
+            if not self.has_credentials():
+                self.invalidate()
+                raise LoginRequired("Muse Cookie 缺失或会话已失效，请管理员私聊 /login。")
+            if time.monotonic() < self._retry_after:
+                raise self._refresh_error
+            cookie = self.load_cookie_string()
             if not cookie:
                 self.invalidate()
-                raise RuntimeError(
-                    f"cookies file {self.cookies_file} not found or empty (cannot refresh mint)"
-                )
-
-            if not self.vm_id:
-                derived = self.vm_id_from_token(self._token)
-                if derived:
-                    self.vm_id = derived
-                else:
-                    self.vm_id = self.vm_id_from_cookies(cookie)
-
-            if not self.vm_id:
-                self.invalidate()
-                raise RuntimeError("cannot resolve vm_id: not provided and not found in page HTML")
-
-            vm_address = f"wss://{self.vm_id}.metaaivm.com/"
-            token_url = f"{self.base_url}/api/hatch/token"
+                raise LoginRequired("Muse Cookie 缺失，请管理员私聊 /login。")
             try:
-                data = self._post_json(token_url, {"vmAddress": vm_address, "vmName": self.vm_id}, cookie)
-            except Exception as e:
-                msg = str(e).lower()
-                if any(k in msg for k in ("401", "403", "unauthorized", "hatch_vm_auth")):
-                    self.invalidate()
+                vm_id = self.vm_id or self.vm_id_from_token(self._token) or self.vm_id_from_cookies(cookie)
+                if not vm_id:
+                    raise CredentialRefreshError("resolve_vm")
+                for attempt in range(2):
+                    try:
+                        data = self._post_json(f"{self.base_url}/api/hatch/token",
+                            {"vmAddress": f"wss://{vm_id}.metaaivm.com/", "vmName": vm_id}, cookie)
+                        token = data.get("token")
+                        notary = data.get("notary_token")
+                        if not isinstance(token, str) or not token.strip():
+                            raise CredentialRefreshError("missing_token")
+                        if not notary:
+                            extra = self._post_json(f"{self.base_url}/api/hatch/noise-notary-token", {"vmName": vm_id}, cookie)
+                            notary = extra.get("notaryToken")
+                        if not isinstance(notary, str) or not notary.strip():
+                            raise CredentialRefreshError("missing_notary")
+                        token, notary = token.strip(), notary.strip()
+                        expiry = self.credentials_expiry(token, notary)
+                        if expiry is not None and time.time() >= expiry - 60:
+                            raise CredentialRefreshError("expired_mint")
+                        break
+                    except CredentialRefreshError as exc:
+                        if exc.code.startswith("hatch_vm_auth"):
+                            if exc.code == "hatch_vm_auth_no_match" and not self._explicit_vm and attempt == 0:
+                                vm_id = self.vm_id_from_cookies(cookie)
+                                if vm_id:
+                                    continue
+                            raise
+                        if exc.status == 401:
+                            self.invalidate()
+                            raise LoginRequired("Muse Cookie 会话已失效，请管理员私聊 /login。") from None
+                        raise
+                self._write_mint_atomic(token, notary)
+            except LoginRequired:
                 raise
-
-            token = (data.get("token") or "").strip()
-            notary = (data.get("notary_token") or "").strip()
-            if not token:
-                self.invalidate()
-                raise RuntimeError(f"{token_url} returned no token")
-
-            if not notary:
-                notary_url = f"{self.base_url}/api/hatch/noise-notary-token"
-                try:
-                    extra = self._post_json(notary_url, {"vmName": self.vm_id}, cookie)
-                except Exception as e:
-                    msg = str(e).lower()
-                    if any(k in msg for k in ("401", "403", "unauthorized", "hatch_vm_auth")):
-                        self.invalidate()
-                    raise
-                notary = (extra.get("notaryToken") or "").strip()
-
-            if not notary:
-                self.invalidate()
-                raise RuntimeError("failed to acquire notary_token from web API")
-
-            self._token = token
-            self._notary_token = notary
-            self._invalid = False
-            self._write_mint_atomic(token, notary)
-            return token, notary, self.vm_id
+            except Exception as exc:
+                error = exc if isinstance(exc, CredentialRefreshError) else CredentialRefreshError("refresh")
+                self._retry_after = time.monotonic() + 3.0
+                self._refresh_error = error
+                raise error from None
+            self._token, self._notary_token, self.vm_id = token, notary, vm_id
+            self._invalid = self._mint_rejected = False
+            self._retry_after = 0.0
+            self._refresh_error = None
+            return token, notary, vm_id
 
     def get_credentials(self) -> Tuple[str, str, str]:
-        """Get (token, notary_token, vm_id). Refreshes automatically if stale."""
+        """Get usable mint; only confirmed cookie failure can require login."""
         with self._lock:
+            if not self.has_credentials():
+                raise LoginRequired("Muse Cookie 缺失或会话已失效，请管理员私聊 /login。")
             if not self.vm_id:
                 self.vm_id = self.vm_id_from_token(self._token)
-
             if not self.is_fresh():
-                try:
-                    self.refresh_from_cookies()
-                except Exception as e:
-                    self.invalidate()
-                    raise RuntimeError(f"failed to obtain valid Muse credentials: {e}")
+                return self.refresh_from_cookies()
             return self._token, self._notary_token, self.vm_id

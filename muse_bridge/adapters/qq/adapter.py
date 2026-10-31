@@ -22,6 +22,7 @@ from ...core.message import Attachment
 from ...core.session_map import SessionMapper
 from ...muse.service import MuseService
 from ...muse.interactions import ApprovalBlocked
+from ...muse.client.errors import LoginRequired, CredentialRefreshError, HandshakeError, ConnectionLost, is_runtime_auth_error
 from ..base import BaseAdapter
 from .access import QQAccessRequests, valid_id
 from .client import QQClient
@@ -276,7 +277,10 @@ class QQAdapter(BaseAdapter):
             print(f"[QQAdapter] Local interaction from {target_type}:{target_id}: [redacted]")
             return
 
-        needs_login = self._in_login_fallback or not self.muse_service.token_manager.has_credentials()
+        available = await asyncio.to_thread(self.muse_service.token_manager.has_credentials)
+        if available and self._in_login_fallback:
+            self.exit_login_mode()
+        needs_login = not available
         if needs_login and not content.startswith("/"):
             text = "Muse 认证不可用，请管理员私聊发送 /login 或 /login <邮箱>。"
             await self._send_command_reply(target_type, target_id, text, msg_id)
@@ -309,8 +313,8 @@ class QQAdapter(BaseAdapter):
                 chat_session_id = "（尚未创建，发送第一条消息后自动建立）"
             try:
                 if cmd_name not in ("help", "__help__", "__usage_hint__", "new"):
-                    client = self.muse_service.create_client()
-                    client.connect()
+                    client = await asyncio.to_thread(self.muse_service.create_client)
+                    await asyncio.to_thread(client.connect)
                 # session_state_file=None: persistence is handled by SessionMapper.bind
                 reply, new_sid = await loop.run_in_executor(
                     None,
@@ -338,13 +342,13 @@ class QQAdapter(BaseAdapter):
                 await self._send_command_reply(target_type, target_id, str(e), msg_id)
                 return
             except Exception as e:
-                err_msg = str(e).lower()
-                if any(k in err_msg for k in ("401", "403", "unauthorized", "credential", "cookie", "handshake", "hatch_vm_auth")):
-                    self.muse_service.token_manager.invalidate()
+                if isinstance(e, LoginRequired):
                     self.enter_login_mode()
-                    reply = "【系统提示】执行指令时检测到 Muse 会话凭据已失效，已进入登录回落流程。\n请管理员在此私聊发送 /login <您的邮箱>进行登录认证。"
+                    reply = "Muse Cookie 会话已失效，请管理员私聊 /login。"
                 else:
-                    reply = f"命令执行出错：{e}"
+                    if is_runtime_auth_error(e) and client is not None:
+                        await asyncio.to_thread(self.muse_service.token_manager.invalidate_mint, client.token, client.notary_token)
+                    reply = "命令结果未确认，请稍后核对；不会自动重复执行。"
             finally:
                 if client:
                     try:
@@ -418,9 +422,8 @@ class QQAdapter(BaseAdapter):
                 return
             except Exception as e:
                 err_msg = str(e).lower()
-                if any(k in err_msg for k in ("401", "403", "unauthorized", "credential", "cookie", "handshake", "hatch_vm_auth")):
-                    print(f"[QQAdapter] Credential expired while sending message to Muse: {e}")
-                    self.muse_service.token_manager.invalidate()
+                if isinstance(e, LoginRequired):
+                    print("[QQAdapter] Cookie 会话不可用，需要管理员登录。")
                     self.enter_login_mode()
                     admin_target = self.config.get_default_private_target()
                     if target_type == "private" and is_admin:
@@ -433,6 +436,10 @@ class QQAdapter(BaseAdapter):
                                 self._notify_admin_login(admin_target),
                             )
                     await self._send_command_reply(target_type, target_id, reply, msg_id)
+                    return
+                if isinstance(e, (CredentialRefreshError, HandshakeError, ConnectionLost)) or is_runtime_auth_error(e):
+                    await self._send_command_reply(target_type, target_id,
+                        "连接暂不可用，消息结果未确认；未自动重发，请稍后核对。", msg_id)
                     return
                 if "status 404" in err_msg or "session not found" in err_msg or "not_found" in err_msg:
                     # Session expired / deleted on Muse: auto-recreate a new session!

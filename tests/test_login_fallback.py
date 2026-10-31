@@ -10,6 +10,7 @@ from unittest.mock import MagicMock, patch
 
 from muse_bridge.config.models import AccessRequestsConfig, AppConfig, GatewayConfig, MuseConfig, QQConfig, QQPushConfig
 from muse_bridge.muse.token_manager import MuseTokenManager
+from muse_bridge.muse.client.errors import LoginRequired, HandshakeError, RPCError
 from muse_bridge.muse.service import MuseService
 from muse_bridge.adapters.qq.adapter import QQAdapter
 from muse_bridge.adapters.qq.outbound import QQOutboundPusher
@@ -86,16 +87,16 @@ class TestLoginFallback(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(self.token_manager.has_credentials())
 
     def test_muse_service_verify_connection_failure(self):
-        """Test verify_connection invalidates credentials on 401 handshake error."""
+        """A failed gateway handshake is not proof that the cookies expired."""
         with patch.object(self.muse_service, "create_client") as mock_create:
             mock_client = MagicMock()
             mock_client.__enter__.return_value = mock_client
             mock_client.connect.side_effect = RuntimeError("handshake failed: WS upgrade failed: HTTP/1.1 401 Unauthorized")
             mock_create.return_value = mock_client
 
-            ok = self.muse_service.verify_connection()
-            self.assertFalse(ok)
-            self.assertFalse(self.token_manager.has_credentials())
+            with self.assertRaises(RuntimeError):
+                self.muse_service.verify_connection()
+            self.assertTrue(self.token_manager.has_credentials())
 
     def test_muse_service_verify_connection_success(self):
         """Test verify_connection returns True on successful handshake."""
@@ -110,7 +111,7 @@ class TestLoginFallback(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(self.token_manager.has_credentials())
 
     async def test_outbound_pusher_triggers_login_on_auth_failure(self):
-        """Test outbound pusher detects 401, triggers login callback and notifies admin."""
+        """Only confirmed cookie-session failure triggers the login notification."""
         qq_config = self._make_qq_config()
         mock_qq_client = MagicMock()
         mock_qq_client.send_message.return_value = (200, {})
@@ -131,7 +132,7 @@ class TestLoginFallback(unittest.IsolatedAsyncioTestCase):
             on_login_required=on_login_req,
         )
 
-        with patch.object(pusher, "_fetch_session", side_effect=RuntimeError("WS upgrade failed: HTTP/1.1 401 Unauthorized")):
+        with patch.object(pusher, "_fetch_session", side_effect=LoginRequired("Cookie session rejected")):
             with patch.object(self.muse_service, "create_client") as mock_create:
                 mock_client = MagicMock()
                 mock_client.__enter__.return_value = mock_client
@@ -150,11 +151,12 @@ class TestLoginFallback(unittest.IsolatedAsyncioTestCase):
 
                 self.assertTrue(len(login_required_called) > 0)
                 self.assertEqual(login_required_called[0], "ADMIN_OPENID")
-                self.assertFalse(self.token_manager.has_credentials())
+                # The real manager sets its cookie verdict before raising LoginRequired;
+                # this injected exception exercises only the delivery boundary.
                 mock_qq_client.send_message.assert_called()
 
     async def test_inbound_post_message_auth_failure_triggers_login_fallback(self):
-        """Test sending message encountering 401 invalidates credentials and guides admin to login."""
+        """Gateway rejection does not invalidate cookies or replay the message."""
         qq_config = self._make_qq_config(
             whitelist={"private": ["ADMIN_OPENID"], "GRP_1": "*"},
         )
@@ -164,7 +166,7 @@ class TestLoginFallback(unittest.IsolatedAsyncioTestCase):
         adapter.client = mock_qq_client
 
         # Mock post_message failure with 401
-        with patch.object(self.muse_service, "post_message", side_effect=RuntimeError("HTTP/1.1 401 Unauthorized")):
+        with patch.object(self.muse_service, "post_message", side_effect=RPCError("POST", "/chat", 401)) as post:
             event = {
                 "id": "msg_001",
                 "content": "Hello Muse",
@@ -172,12 +174,13 @@ class TestLoginFallback(unittest.IsolatedAsyncioTestCase):
             }
             await adapter.handle_event("C2C_MESSAGE_CREATE", event)
 
-            self.assertTrue(adapter._in_login_fallback)
-            self.assertFalse(self.token_manager.has_credentials())
-            # Sent reply prompting admin to enter login email
+            self.assertFalse(adapter._in_login_fallback)
+            self.assertTrue(self.token_manager.has_credentials())
+            post.assert_called_once()
             mock_qq_client.send_message.assert_called()
             sent_text = mock_qq_client.send_message.call_args_list[0][0][2]
-            self.assertIn("登录回落流程", sent_text)
+            self.assertNotIn("/login", sent_text)
+            self.assertIn("未自动重发", sent_text)
 
     async def test_explicit_login_initiates_otp_session(self):
         """Explicit /login starts an owned temporary OTP interaction."""
@@ -230,16 +233,16 @@ class TestLoginFallback(unittest.IsolatedAsyncioTestCase):
             res = pusher._fetch_session(mock_client, "new-empty-session")
             self.assertEqual(res, [])
 
-            # Run one tick of run_loop
+            # Stop only after hydration, not after an arbitrary thread-scheduling delay.
+            hydrate = pusher._hydrate_and_dispatch
+
+            async def hydrate_and_stop(*args, **kwargs):
+                await hydrate(*args, **kwargs)
+                pusher._running = False
+
             pusher._running = True
-            task = asyncio.create_task(pusher._run_loop())
-            await asyncio.sleep(0.05)
-            pusher._running = False
-            task.cancel()
-            try:
-                await task
-            except asyncio.CancelledError:
-                pass
+            with patch.object(pusher, "_hydrate_and_dispatch", side_effect=hydrate_and_stop):
+                await asyncio.wait_for(pusher._run_loop(), timeout=3.0)
 
             # The new session should now be marked gated so it is not re-fetched constantly
             self.assertIn("new-empty-session", pusher._gated)

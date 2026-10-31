@@ -47,9 +47,15 @@ class BridgeEngine:
         # Verify Muse credentials on startup before launching adapters to avoid
         # concurrent notary_token minting/handshake races with outbound pushers
         loop = asyncio.get_running_loop()
-        cred_ok = await loop.run_in_executor(None, self.muse_service.verify_connection)
+        try:
+            cred_ok = await loop.run_in_executor(None, self.muse_service.verify_connection)
+            login_required = not cred_ok
+        except Exception as exc:
+            cred_ok = False
+            login_required = False
+            print(f"[BridgeEngine] 启动验证暂不可用 ({type(exc).__name__})，保留 Cookie，后台重试。")
         qq_adapter = next((a for a in self.adapters if isinstance(a, QQAdapter)), None)
-        if not cred_ok:
+        if login_required:
             print("[BridgeEngine] 启动验证：Muse 会话凭据未就绪或已失效，进入登录回落流程。")
             if qq_adapter:
                 qq_adapter.enter_login_mode()
@@ -57,7 +63,7 @@ class BridgeEngine:
                 admin_target = self.config.qq.get_default_private_target()
                 if admin_target:
                     asyncio.create_task(self._notify_admin_login(admin_target))
-        else:
+        elif cred_ok:
             print("[BridgeEngine] 启动验证：Muse 会话凭据有效，认证通过。")
 
         if cred_ok:

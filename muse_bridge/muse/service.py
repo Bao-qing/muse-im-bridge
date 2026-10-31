@@ -12,7 +12,7 @@ import time
 from typing import Any, Callable, Dict, List, Optional
 
 from .client import MuseClient, TurnResult
-from .client.errors import HandshakeError, TurnCancelled
+from .client.errors import HandshakeError, TurnCancelled, LoginRequired, is_runtime_auth_error
 
 from ..config.models import MuseConfig
 from ..core.interactions import InteractionManager
@@ -70,29 +70,38 @@ class MuseService:
         def connect_with_retry():
             try:
                 orig_connect()
-            except Exception as e:
-                msg = str(e).lower()
-                if any(k in msg for k in ("handshake", "401", "403", "unauthorized", "notary", "ws upgrade failed")):
-                    # Refresh tokens from cookies and retry once
-                    try:
-                        new_t, new_n, new_vm = self.token_manager.refresh_from_cookies()
-                        client.token = new_t
-                        client.notary_token = new_n
-                        client.vm_id = new_vm
-                        client._ws = None
-                        orig_connect()
-                        return
-                    except Exception as refresh_err:
-                        self.token_manager.invalidate()
-                        raise RuntimeError(f"handshake failed ({e}) and token refresh failed ({refresh_err})") from e
+            except HandshakeError as exc:
+                client.close()
+                # Network/Noise failure is retryable, but is not evidence of rejected mint.
+                if exc.status not in (401, 403):
+                    raise
+                self.token_manager.invalidate_mint(client.token, client.notary_token)
+                new_t, new_n, new_vm = self.token_manager.refresh_from_cookies(False, rejected_token=client.token, rejected_notary=client.notary_token)
+                client.token, client.notary_token, client.vm_id = new_t, new_n, new_vm
+                try:
+                    orig_connect()
+                except Exception:
+                    client.close()
+                    raise
+
+        orig_request = client.request
+
+        def request_without_replay(*args, **kwargs):
+            try:
+                return orig_request(*args, **kwargs)
+            except Exception as exc:
+                if is_runtime_auth_error(exc):
+                    self.token_manager.invalidate_mint(client.token, client.notary_token)
                 raise
 
+        client.request = request_without_replay
         client.connect = connect_with_retry
+        client.credentials_current = lambda: self.token_manager.credentials_current(client.token, client.notary_token, client.vm_id)
         return client
 
     def verify_connection(self) -> bool:
         """Verify Muse credentials by attempting a connection.
-        Returns True if connected and authenticated; False if invalid or expired.
+        Returns False only for missing/rejected cookies; temporary errors propagate.
         """
         if not self.token_manager.has_credentials():
             return False
@@ -100,11 +109,10 @@ class MuseService:
             with self.create_client() as client:
                 client.connect()
                 return True
-        except Exception as e:
-            msg = str(e).lower()
-            if any(k in msg for k in ("401", "403", "unauthorized", "handshake", "cookie", "credential", "hatch_vm_auth")):
-                self.token_manager.invalidate()
+        except LoginRequired:
             return False
+        # A temporary failure is not a negative authentication verdict.
+        # Let startup distinguish it from a missing/rejected cookie session.
 
     def process_attachments(
         self,
@@ -181,9 +189,9 @@ class MuseService:
                 )
                 return sent_mid
         except Exception as e:
-            msg = str(e).lower()
-            if any(k in msg for k in ("401", "403", "unauthorized", "handshake", "cookie", "credential", "hatch_vm_auth")):
-                self.token_manager.invalidate()
+            if is_runtime_auth_error(e) and "client" in locals():
+                self.token_manager.invalidate_mint(client.token, client.notary_token)
+            # Never replay a possibly accepted POST; recover for the next operation.
             raise
 
     def send_turn(
@@ -237,9 +245,9 @@ class MuseService:
                 client.mark_seen(session_id)
                 return turn
         except Exception as e:
-            msg = str(e).lower()
-            if any(k in msg for k in ("401", "403", "unauthorized", "handshake", "cookie", "credential", "hatch_vm_auth")):
-                self.token_manager.invalidate()
+            if is_runtime_auth_error(e) and "client" in locals():
+                self.token_manager.invalidate_mint(client.token, client.notary_token)
+            # Never replay a possibly accepted POST; recover for the next operation.
             raise
 
     def read_workspace_bytes(self, paths: List[str], cap: int = 25 * 1024 * 1024) -> Dict[str, Optional[bytes]]:

@@ -55,7 +55,10 @@ muse_bridge/
    - 所有内部运行参数（如分块字符数、每轮消息上限、图片/文件限制、超时时间等）均有内置默认常量，用户如需调整可在配置文件相应位置或 `overrides` 中覆盖。
    - 敏感信息（AppID, Secret, Token, Cookies, OpenID）绝不硬编码，示例模板均使用标准占位符。
 4. **Muse 凭证静默续期**：
-   - 配合 `cookies.json`，在启动和运行过程中自动推导 `vm_id` 并从接口换取 `.mint.json` 中的 `token` 与 `notary_token`，在临近过期或遭遇服务端 401/403 握手拒绝时全自动刷新并重连。
+   - 配合 `cookies.json`，在启动和运行过程中自动推导 `vm_id` 并从接口换取 `.mint.json` 中的 `token` 与 `notary_token`。按 JWT 的 `exp`（若有）与 notary 的 `timeout` 中较早时间提前续期，持久订阅也会轮换连接；JWT 没有 `exp` 时不猜测固定寿命。
+   - 网关拒绝运行凭据时先用现有 Cookie 刷新；网络超时、5xx、普通 403、缓存写入失败不会把 Cookie 标为过期。`hatch_vm_auth_no_match` 会为自动解析的 VM 重新定位一次，不覆盖显式配置的 VM。
+   - 只有 Cookie 缺失，或 Cookie 支持的 mint 接口确认会话失效（排除 VM 认证错误的 401）才要求管理员 `/login`；后台不会弹终端登录提示或自行发送验证码。替换 Cookie 内容后自动恢复尝试，无需删除 mint。
+   - 临时刷新失败短暂退避后重试，并发恢复复用已更新的凭据；可能已发出的消息、凭证与审批不会因认证恢复而自动重放。
 5. **消息不漏不重**：
    - 采用完善的 3 状态机模型（`Absent -> Processing -> Delivered / Rollback`），无论是被动回复还是主动推送，均做严格原子标记，杜绝重复回复，遇到错误立即回滚。
 

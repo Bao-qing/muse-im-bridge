@@ -9,6 +9,7 @@ import re
 import tempfile
 import time
 
+from ...muse.client.errors import LoginRequired
 from ...muse.login import MuseProtocolLogin
 
 
@@ -192,10 +193,15 @@ class QQInteractions:
             await self.reply(owner, "验证码确认失败，请重试或 /cancel；输入未转发到 Muse。", msg_id)
             return
         self.manager.finish(item)
+        self.adapter.exit_login_mode()
         try:
             await asyncio.to_thread(self.adapter.muse_service.token_manager.refresh_from_cookies, False)
+        except LoginRequired:
+            self.adapter.enter_login_mode()
+            await self.reply(owner, "登录会话未生效，请重新 /login；输入未转发到 Muse。", msg_id)
+            return
         except Exception:
-            await self.reply(owner, "验证码通过且 Cookie 已保存，但运行凭据尚未刷新成功。请检查服务配置或账号 VM 状态。", msg_id)
+            await self.reply(owner, "Cookie 已保存，连接暂未恢复；稍后会自动重试，无需重复登录。", msg_id)
             return
         self.adapter.exit_login_mode()
         await self.reply(owner, "【登录成功】Cookie 与运行凭据已更新；/chat 返回聊天。", msg_id)
