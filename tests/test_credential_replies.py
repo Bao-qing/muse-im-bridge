@@ -237,18 +237,24 @@ class TestCredentialReplies(unittest.IsolatedAsyncioTestCase):
         self.service.post_message.assert_not_called()
         self.assertEqual(self.text(), "待审批")
 
-    async def test_cancelled_and_expired_focus_do_not_release(self):
-        card = self.card()
+    async def test_cancel_returns_to_chat_and_expiry_intercepts_once(self):
+        owner = ("private", "ADMIN", "ADMIN")
+        card = self.card(session_id="s2")
         await self.send(f"/凭证 {card.id}")
         await self.send("/cancel")
-        await self.send("late-password")
-        self.assertIs(self.service.interactions.current(("private", "ADMIN", "ADMIN")), card)
-        next_card = self.card()
+        self.assertEqual(card.state, "cancelled")
+        self.assertIsNone(self.service.interactions.current(owner))
+        await self.send("after cancel")
+        self.service.post_message.assert_called_once()
+        next_card = self.card(session_id="s2")
         await self.send(f"/凭证 {next_card.id}")
         next_card.expires_at = time.time() - 1
         await self.send("late-password")
         self.assertEqual(next_card.state, "expired")
-        self.service.post_message.assert_not_called()
+        self.assertIn("过期", self.text())
+        self.assertEqual(self.service.post_message.call_count, 1)
+        await self.send("next chat")
+        self.assertEqual(self.service.post_message.call_count, 2)
 
     async def test_outbound_records_only_successful_actual_destination(self):
         card = self.card()

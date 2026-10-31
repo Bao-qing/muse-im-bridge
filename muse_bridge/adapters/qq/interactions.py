@@ -16,6 +16,10 @@ from ...observability import get_logger, safe_error, trace_event
 
 logger = get_logger(__name__)
 
+# An expired flow intercepts one late message within this window, so a secret
+# typed just after the timeout is not forwarded; later messages are chat.
+LATE_INPUT_GRACE_S = 300
+
 
 class QQInteractions:
     def __init__(self, adapter):
@@ -63,7 +67,7 @@ class QQInteractions:
                 if referenced is not None:
                     await self.start_credential(referenced, owner, content, msg_id, is_admin, session_id)
                     return True
-                if (current and current.kind == "credential") or self.credential_candidates(owner, session_id):
+                if (current and not current.terminal and current.kind == "credential") or self.credential_candidates(owner, session_id):
                     await self.reply(owner, "未找到对应凭证，请发送 /凭证 编号。", msg_id)
                     return True
             if command == "/login":
@@ -81,10 +85,14 @@ class QQInteractions:
                     await self.reply(owner, "【登录】请输入登录邮箱；/cancel 取消。", msg_id)
                 return True
 
-            if command in {"/cancel", "取消", "退出"}:
-                if current and current.kind != "approval":
-                    self.manager.finish(current, "cancelled")
-                    await self.reply(owner, "输入流程已结束；/chat 返回聊天。迟到的敏感输入仍会被拦截。", msg_id)
+            active = current is not None and not current.terminal
+            # Bare words only cancel an active flow; otherwise they are chat.
+            if command == "/cancel" or (active and content.strip() in {"取消", "退出"}):
+                if current:
+                    if active:
+                        self.manager.finish(current, "cancelled")
+                    self.manager.release(owner)
+                    await self.reply(owner, "输入流程已结束，后续消息正常转发。", msg_id)
                 elif self.pending(session_id):
                     await self.show_approval(owner, session_id, msg_id)
                 else:
@@ -108,12 +116,18 @@ class QQInteractions:
                 await self.handle_approval(owner, command, args, session_id, msg_id, is_admin)
                 return True
 
+            if current and current.terminal:
+                self.manager.release(owner)
+                if current.state == "expired" and time.time() - current.expires_at < LATE_INPUT_GRACE_S:
+                    await self.reply(owner, "输入流程已过期，此消息未转发；之后的消息正常转发。", msg_id)
+                    return True
+                current = None
+
             if current:
-                if current.terminal:
-                    await self.reply(owner, "输入流程已结束或过期，此消息未转发。使用 /chat 返回聊天，或显式开始新流程。", msg_id)
-                elif current.kind == "login":
+                if current.kind == "login":
                     if not is_admin or owner[0] != "private":
                         self.manager.finish(current, "cancelled")
+                        self.manager.release(owner)
                         await self.reply(owner, "当前用户无权继续登录。", msg_id)
                     elif current.state == "wait_email":
                         await self._send_otp(current, content, owner, msg_id)
@@ -124,11 +138,13 @@ class QQInteractions:
                 elif current.kind == "credential":
                     if owner[0] != "private" and current.session_id != session_id:
                         self.manager.finish(current, "cancelled")
+                        self.manager.release(owner)
                         await self.reply(owner, "聊天已切换，请重新选择凭证。", msg_id)
                     else:
                         await self.credential_input(current, owner, content, msg_id, is_admin)
                 return True
 
+            # A pending credential card is an open flow: a two-line answer fills it.
             if len(content.splitlines()) == 2:
                 candidates = self.credential_candidates(owner, session_id)
                 if candidates:
@@ -138,15 +154,13 @@ class QQInteractions:
                         await self.reply(owner, "请回复要填写的凭证卡，或先发送 /凭证 编号。", msg_id)
                     return True
 
+            # Muse refuses chat while this session has a pending approval.
             pending = self.pending(session_id)
             if pending:
                 if content.strip().isdigit() and len(pending) == 1:
                     await self.handle_approval(owner, "/审批", f"{pending[0].id} {content.strip()}", session_id, msg_id, is_admin)
                 else:
                     await self.show_approval(owner, session_id, msg_id)
-                return True
-            if re.fullmatch(r"[0-9]{6}", content):
-                await self.reply(owner, "没有可用的验证码输入流程，此消息未转发；请先 /login。", msg_id)
                 return True
             return False
 
@@ -199,6 +213,7 @@ class QQInteractions:
             await self.reply(owner, "验证码确认失败，请重试或 /cancel；输入未转发到 Muse。", msg_id)
             return
         self.manager.finish(item)
+        self.manager.release(owner)
         self.adapter.exit_login_mode()
         try:
             await asyncio.to_thread(self.adapter.muse_service.token_manager.refresh_from_cookies, False)
@@ -213,7 +228,7 @@ class QQInteractions:
             return
         self.adapter.exit_login_mode()
         trace_event("qq.interactions", "login.completed", interaction_id=item.id, state=item.state)
-        await self.reply(owner, "【登录成功】Cookie 与运行凭据已更新；/chat 返回聊天。", msg_id)
+        await self.reply(owner, "【登录成功】Cookie 与运行凭据已更新，后续消息正常转发。", msg_id)
 
     async def show_approval(self, owner, session_id, msg_id, *, all_sessions=False):
         pending = self.manager.pending_approvals() if all_sessions else self.pending(session_id)
@@ -371,6 +386,7 @@ class QQInteractions:
             return
         if item.expires_at and time.time() >= item.expires_at:
             self.manager.finish(item, "expired")
+            self.manager.release(owner)
             await self.reply(owner, "填写已过期，请重新选择凭证。", msg_id)
             return
         previous = item.state

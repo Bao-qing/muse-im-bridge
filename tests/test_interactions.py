@@ -187,6 +187,47 @@ class TestQQInteractions(unittest.IsolatedAsyncioTestCase):
         self.service.post_message.assert_not_called()
         self.assertIn("过期", self.text())
 
+    async def test_six_digits_without_flow_are_chat(self):
+        await self.send("669136")
+        self.service.post_message.assert_called_once()
+        self.adapter.client.send_message.assert_not_called()
+
+    async def test_cancel_words_without_flow_are_chat(self):
+        await self.send("取消")
+        await self.send("退出")
+        self.assertEqual(self.service.post_message.call_count, 2)
+        self.adapter.client.send_message.assert_not_called()
+
+    async def test_bare_cancel_word_ends_active_login(self):
+        await self.send("/login")
+        item = self.service.interactions.current(("private", "ADMIN", "ADMIN"))
+        await self.send("取消")
+        self.assertEqual(item.state, "cancelled")
+        self.service.post_message.assert_not_called()
+        await self.send("669136")
+        self.service.post_message.assert_called_once()
+
+    async def test_finished_login_releases_focus(self):
+        owner = ("private", "ADMIN", "ADMIN")
+        protocol = MagicMock()
+        protocol.extract_cookies.return_value = {"cookie": "hatch_sess=fresh"}
+        item = self.service.interactions.add("login", owner=owner, state="wait_otp", context={"auth": protocol})
+        self.service.interactions.activate(item, owner)
+        with patch.object(self.service.token_manager, "refresh_from_cookies"):
+            await self.send("123456")
+        self.assertTrue(item.terminal)
+        self.service.post_message.assert_not_called()
+        await self.send("654321")
+        self.service.post_message.assert_called_once()
+
+    async def test_expired_login_intercepts_only_within_grace(self):
+        owner = ("private", "ADMIN", "ADMIN")
+        item = self.service.interactions.add("login", owner=owner, state="wait_otp")
+        self.service.interactions.activate(item, owner)
+        item.expires_at = time.time() - 3600
+        await self.send("123456")
+        self.service.post_message.assert_called_once()
+
     async def test_inactive_credential_does_not_block_chat(self):
         self.service.interactions.add("credential", session_id="s1", context={"page_url":"https://example.test/"})
         await self.send("继续聊天")

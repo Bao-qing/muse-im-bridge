@@ -253,7 +253,7 @@ class QQAdapter(BaseAdapter):
             owner = (kind, target, user)
             async with self.muse_service.interactions.owner_lock(owner):
                 current = self.muse_service.interactions.current(owner)
-                if current or self.interaction_router.message_references(d):
+                if (current and not current.terminal) or self.interaction_router.message_references(d):
                     await self._send_command_reply(kind, target, "请先结束当前填写，再单独发送申请命令。", msg_id)
                     return
                 await self.access_requests.handle(kind, target, user, content, msg_id)
