@@ -9,6 +9,33 @@ class MuseError(Exception):
 class HandshakeError(MuseError):
     """Noise handshake or WebSocket upgrade failed."""
 
+    def __init__(self, message, status=None):
+        self.status = status
+        super().__init__(message)
+
+
+class WebSocketUpgradeError(MuseError):
+    def __init__(self, status):
+        self.status = status
+        super().__init__(f"WebSocket upgrade rejected (HTTP {status})")
+
+
+class LoginRequired(MuseError):
+    """Only missing cookies or a rejected cookie-backed session requires login."""
+
+
+class CredentialRefreshError(MuseError):
+    def __init__(self, stage, status=None, code=""):
+        self.stage = stage
+        self.status = status
+        self.code = code
+        super().__init__(f"Muse credential refresh unavailable ({stage}, HTTP {status or '-'}, code {code or '-'})")
+
+
+def is_runtime_auth_error(exc):
+    """A gateway rejection can invalidate mint, never the cookie session."""
+    return getattr(exc, "status", None) in (401, 403)
+
 
 class RPCError(MuseError):
     """A gateway RPC returned a non-200 status."""
@@ -36,6 +63,10 @@ class TurnCancelled(MuseError):
 
 class SubscribeError(MuseError):
     """Opening a /chat/subscribe stream failed (e.g. session not found)."""
+
+    def __init__(self, message, status=None):
+        self.status = status
+        super().__init__(message)
 
 
 class PushFailed(MuseError):

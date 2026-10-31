@@ -19,6 +19,8 @@ bytes 4..12, deviating from the Noise spec's little-endian layout.
 Handshake nonces are all 0, so this only matters for transport frames,
 but getting it wrong breaks the whole session.
 """
+from .errors import WebSocketUpgradeError
+
 import base64
 import hashlib
 import hmac as hmac_mod
@@ -200,7 +202,10 @@ class WS:
         resp = self._read_until(self.sock, b"\r\n\r\n")
         head = resp.split(b"\r\n\r\n")[0].decode(errors="replace")
         if " 101" not in head.split("\r\n")[0]:
-            raise RuntimeError(f"WS upgrade failed: {head[:300]}")
+            self.sock.close()
+            status_line = head.split("\r\n", 1)[0].split()
+            status = int(status_line[1]) if len(status_line) > 1 and status_line[1].isdigit() else None
+            raise WebSocketUpgradeError(status)
         self.buf = resp.split(b"\r\n\r\n", 1)[1]
 
     @staticmethod

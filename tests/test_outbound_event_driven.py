@@ -275,6 +275,49 @@ class TestOutboundEventDriven(unittest.IsolatedAsyncioTestCase):
         self.assertIn("a1", pusher._seen_ids)
         self.assertTrue(pusher.deduplicator.mark_delivered.called)
 
+    async def test_expiring_client_rotates_without_login_or_duplicate_history(self):
+        pusher, mapper, service, qq = self._make_pusher(mode="global")
+        first, second = mock.MagicMock(), mock.MagicMock()
+        first.credentials_current.side_effect = [True, False]
+        second.credentials_current.return_value = True
+        for client in (first, second):
+            client.get_history.return_value = [{"seq": 1, "role": "assistant", "message_id": "old", "display_text": "old"}]
+        first.read_any_subscription_events.return_value = []
+        def stop(**kwargs):
+            pusher._running = False
+            return []
+        second.read_any_subscription_events.side_effect = stop
+        service.create_client.side_effect = [first, second]
+        pusher._running = True
+        await asyncio.wait_for(pusher._run_loop(), 3)
+        self.assertEqual(service.create_client.call_count, 2)
+        first.close.assert_called_once()
+        second.subscribe.assert_called_once_with("GLOBAL")
+        qq.send_message.assert_not_called()
+        service.token_manager.invalidate.assert_not_called()
+
+    async def test_gateway_rejection_reconnects_without_login(self):
+        from muse_bridge.muse.client.errors import RPCError
+        pusher, mapper, service, qq = self._make_pusher(mode="global")
+        first, second = mock.MagicMock(), mock.MagicMock()
+        first.credentials_current.return_value = True
+        second.credentials_current.return_value = True
+        first.subscribe.side_effect = RPCError("GET", "/chat/subscribe", 401)
+        second.get_history.return_value = []
+        def stop(**kwargs):
+            pusher._running = False
+            return []
+        second.read_any_subscription_events.side_effect = stop
+        service.create_client.side_effect = [first, second]
+        pusher._notify_login_required = mock.AsyncMock()
+        pusher._running = True
+        with mock.patch("muse_bridge.adapters.qq.outbound.asyncio.sleep", new=mock.AsyncMock()):
+            await asyncio.wait_for(pusher._run_loop(), 3)
+        service.token_manager.invalidate_mint.assert_called_once_with(first.token, first.notary_token)
+        service.token_manager.invalidate.assert_not_called()
+        pusher._notify_login_required.assert_not_called()
+        first.close.assert_called_once()
+
     def test_widget_option_and_card_rendering(self):
         from muse_bridge.muse.client.render import (
             render_widget_to_text,

@@ -274,11 +274,14 @@ class MuseClient:
             f"request_id={uuid.uuid4()}",
         ]
         url = f"wss://{self.host}/v1/noise?" + "&".join(params)
+        ws = None
         try:
             ws = WS(url, proxy_url=self.proxy_url, direct=self.direct)
             send_cs, recv_cs = noise_handshake(ws)
         except Exception as e:
-            raise HandshakeError(f"gateway handshake failed: {e}") from e
+            if ws is not None:
+                ws.close()
+            raise HandshakeError(f"gateway handshake failed ({type(e).__name__})", status=getattr(e, "status", None)) from None
         self._ws = ws
         self._send_cs = send_cs
         self._recv_cs = recv_cs
@@ -805,7 +808,7 @@ class MuseClient:
             if kind == "response":
                 status = detail.get("status")
                 if status != 200:
-                    raise SubscribeError(f"subscribe status {status}")
+                    raise SubscribeError(f"subscribe status {status}", status=status)
                 if detail.get("body"):
                     buf += detail["body"]
                 if detail.get("end_body"):

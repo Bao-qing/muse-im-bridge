@@ -85,6 +85,25 @@ class TestQQInteractions(unittest.IsolatedAsyncioTestCase):
     def text(self):
         return self.adapter.client.send_message.call_args.args[2]
 
+    async def test_command_connection_runs_outside_event_loop(self):
+        import threading
+        event_thread = threading.get_ident()
+        connection_threads = []
+        client = MagicMock()
+
+        def create_client():
+            connection_threads.append(threading.get_ident())
+            return client
+
+        client.connect.side_effect = lambda: connection_threads.append(threading.get_ident())
+        with patch.object(self.service, "create_client", side_effect=create_client):
+            with patch("muse_bridge.adapters.qq.adapter.CommandHandler.execute", return_value=("done", "s1")):
+                await self.send("/sessions")
+        self.assertEqual(len(connection_threads), 2)
+        self.assertNotIn(event_thread, connection_threads)
+        client.close.assert_called_once()
+        self.assertEqual(self.text(), "done")
+
     async def test_bare_email_is_chat_not_login(self):
         with patch("muse_bridge.muse.login.MuseProtocolLogin.send_otp") as otp:
             await self.send("user@example.com")
@@ -92,12 +111,49 @@ class TestQQInteractions(unittest.IsolatedAsyncioTestCase):
         self.service.post_message.assert_called_once()
 
     async def test_fallback_bare_email_does_not_send_otp(self):
+        self.service.token_manager.has_credentials.return_value = False
         self.adapter.enter_login_mode()
         with patch("muse_bridge.muse.login.MuseProtocolLogin.send_otp") as otp:
             await self.send("user@example.com")
             otp.assert_not_called()
         self.service.post_message.assert_not_called()
         self.assertIn("/login", self.text())
+
+    async def test_recovered_cookie_releases_old_login_fallback(self):
+        self.adapter.enter_login_mode()
+        self.service.token_manager.has_credentials.return_value = True
+        await self.send("hello after recovery")
+        self.assertFalse(self.adapter._in_login_fallback)
+        self.service.post_message.assert_called_once()
+
+    async def test_saved_cookie_with_temporary_mint_failure_does_not_require_new_otp(self):
+        owner = ("private", "ADMIN", "ADMIN")
+        protocol = MagicMock()
+        protocol.extract_cookies.return_value = {"cookie": "hatch_sess=recovered"}
+        item = self.service.interactions.add("login", owner=owner, state="wait_otp", context={"auth": protocol})
+        self.service.interactions.activate(item, owner)
+        self.adapter.enter_login_mode()
+        with patch.object(self.service.token_manager, "refresh_from_cookies", side_effect=TimeoutError("temporary")):
+            await self.send("123456")
+        self.assertTrue(item.terminal)
+        self.assertFalse(self.adapter._in_login_fallback)
+        self.assertIn("无需重复登录", self.text())
+        self.service.post_message.assert_not_called()
+
+    async def test_saved_cookie_rejected_by_server_requires_login(self):
+        from muse_bridge.muse.client.errors import LoginRequired
+        owner = ("private", "ADMIN", "ADMIN")
+        protocol = MagicMock()
+        protocol.extract_cookies.return_value = {"cookie": "hatch_sess=rejected"}
+        item = self.service.interactions.add("login", owner=owner, state="wait_otp", context={"auth": protocol})
+        self.service.interactions.activate(item, owner)
+        with patch.object(self.service.token_manager, "refresh_from_cookies", side_effect=LoginRequired("rejected")):
+            await self.send("123456")
+        self.assertTrue(item.terminal)
+        self.assertTrue(self.adapter._in_login_fallback)
+        self.assertIn("重新 /login", self.text())
+        self.assertNotIn("无需重复登录", self.text())
+        self.service.post_message.assert_not_called()
 
     async def test_explicit_login_prompts_then_captures_email(self):
         with patch("muse_bridge.muse.login.MuseProtocolLogin.send_otp") as otp:

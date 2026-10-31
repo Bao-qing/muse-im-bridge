@@ -22,7 +22,7 @@ from ...config.models import QQConfig
 from ...core.deduplicator import MessageDeduplicator
 from ...core.message import chunk_text
 from ...core.session_map import MODE_GLOBAL, SessionMapper
-from ...muse.client.errors import ConnectionLost, HandshakeError, MuseError, RPCError, SubscribeError
+from ...muse.client.errors import ConnectionLost, HandshakeError, MuseError, RPCError, SubscribeError, LoginRequired, is_runtime_auth_error
 from ...muse.client.push import PushTurnTracker
 from ...muse.client.render import (
     extract_files,
@@ -455,8 +455,7 @@ class QQOutboundPusher:
 
     @staticmethod
     def _is_auth_error(exc: Exception) -> bool:
-        msg = str(exc).lower()
-        return any(k in msg for k in ("credential", "cookie", "handshake", "unauthorized", "401", "hatch_vm_auth"))
+        return isinstance(exc, LoginRequired) or is_runtime_auth_error(exc)
 
     @staticmethod
     def _classify_push_event(ev: dict, default_sid: Optional[str] = None) -> Tuple[Optional[str], Optional[str]]:
@@ -505,7 +504,7 @@ class QQOutboundPusher:
         loop = asyncio.get_running_loop()
 
         while self._running:
-            if not self.muse_service.token_manager.has_credentials():
+            if not await asyncio.to_thread(self.muse_service.token_manager.has_credentials):
                 if not self._login_alerted:
                     self._login_alerted = True
                     print("[QQOutbound] Muse 尚未登录或凭据失效，暂停出站监听，触发回落登录...")
@@ -517,8 +516,12 @@ class QQOutboundPusher:
             try:
                 def _connect_client():
                     c = self.muse_service.create_client()
-                    c.connect()
-                    return c
+                    try:
+                        c.connect()
+                        return c
+                    except Exception:
+                        c.close()
+                        raise
 
                 client = await loop.run_in_executor(None, _connect_client)
                 self._login_alerted = False
@@ -538,7 +541,9 @@ class QQOutboundPusher:
 
                 # Inner persistent event loop over the single connected MuseClient
                 while self._running:
-                    if not self.muse_service.token_manager.has_credentials():
+                    if not await asyncio.to_thread(self.muse_service.token_manager.has_credentials):
+                        break
+                    if hasattr(client, "credentials_current") and await asyncio.to_thread(client.credentials_current) is False:
                         break
 
                     watched = self.session_mapper.session_ids()
@@ -657,16 +662,16 @@ class QQOutboundPusher:
             except asyncio.CancelledError:
                 break
             except Exception as e:
-                if self._is_auth_error(e):
-                    self.muse_service.token_manager.invalidate()
+                if isinstance(e, LoginRequired):
                     if not self._login_alerted:
                         self._login_alerted = True
-                        print(f"[QQOutbound] 获取 Muse 消息时凭据失效 ({e})，触发回落登录流程...")
+                        print("[QQOutbound] Cookie 会话不可用，等待管理员登录。")
                         await self._notify_login_required()
                     await asyncio.sleep(10.0)
                     continue
-                if self.config.debug:
-                    print(f"[QQOutbound] Subscribe stream error ({e}), reconnecting in 3s...")
+                if is_runtime_auth_error(e) and client is not None:
+                    await asyncio.to_thread(self.muse_service.token_manager.invalidate_mint, client.token, client.notary_token)
+                print(f"[QQOutbound] 连接暂不可用 ({type(e).__name__}, HTTP {getattr(e, 'status', None) or '-'})，保留 Cookie，3 秒后重连。")
                 await asyncio.sleep(3.0)
                 continue
             finally:
