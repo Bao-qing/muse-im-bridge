@@ -13,8 +13,12 @@ import os
 import signal
 import sys
 
-from muse_bridge.config.models import ConfigLoader
+from muse_bridge.config.models import ConfigLoader, LoggingConfig
 from muse_bridge.engine import BridgeEngine
+from muse_bridge.observability import configure_logging, get_logger, safe_error
+
+
+logger = get_logger(__name__)
 
 
 def parse_args(argv=None):
@@ -40,12 +44,14 @@ def parse_args(argv=None):
 def main(argv=None) -> int:
     args = parse_args(argv)
 
-    # 1. Load configuration
+    # 1. Bootstrap safely without files; loading may already detect egress IP.
+    configure_logging(LoggingConfig(file=""))
     try:
         config = ConfigLoader.load(args.config)
     except Exception as e:
-        print(f"Error loading configuration: {e}", file=sys.stderr)
+        logger.error("Error loading configuration: %s", safe_error(e))
         return 1
+    configure_logging(config.logging, legacy_debug=config.debug)
 
     # 2. Login mode
     if args.login:
@@ -54,7 +60,7 @@ def main(argv=None) -> int:
             run_protocol_login(output_path=config.muse.cookies_file)
             return 0
         except Exception as e:
-            print(f"[MuseLogin] 登录失败：{e}", file=sys.stderr)
+            logger.error("[MuseLogin] 登录失败：%s", safe_error(e))
             return 1
 
     # 3. Check mode: print sanitized status
@@ -95,7 +101,7 @@ def main(argv=None) -> int:
     main_task = loop.create_task(engine.start())
 
     def _shutdown():
-        print("\nShutdown signal received. Stopping...")
+        logger.info("Shutdown signal received. Stopping...")
         loop.create_task(engine.stop())
         main_task.cancel()
 

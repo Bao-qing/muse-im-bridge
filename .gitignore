@@ -14,15 +14,18 @@ tools/req_*.json
 *.local.json
 
 # Runtime logs & state files
+logs/
 *.log
+*.log.[0-9]*
 *.jsonl
+*.jsonl.[0-9]*
 *.jsonl.tmp
 qq_delivered.jsonl*
 qq_push_state.json*
 qq_session.json*
 qq_session_map.json*
 qq_routes.json*
-.data/
+data/
 
 # Python artifacts
 __pycache__/

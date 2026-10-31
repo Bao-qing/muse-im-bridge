@@ -18,9 +18,21 @@ import select
 import socket
 import ssl
 import threading
+import time
 from urllib.parse import unquote, urlparse
 
 from ...config import constants
+from ...observability import get_logger, new_id, safe_error, safe_url, trace_event
+
+logger = get_logger(__name__)
+
+
+def _trace_ws(event, connection_id, **fields):
+    # Never log raw frame bodies, fragmented text, close reasons or proxy auth.
+    try:
+        trace_event("qq.ws", event, connection_id=connection_id, **fields)
+    except Exception:
+        pass
 
 # Default fallbacks (configurable in config.json)
 WS_GUID = constants.DEFAULT_WS_GUID
@@ -60,73 +72,90 @@ def _blocking_handshake(
     ws_guid: str = constants.DEFAULT_WS_GUID,
     user_agent: str = constants.DEFAULT_USER_AGENT,
 ):
-    if proxy_url:
-        p = urlparse(proxy_url)
-        s = socket.create_connection((p.hostname, p.port or 3128), timeout=20)
-        req = f"CONNECT {host}:{port} HTTP/1.1\r\nHost: {host}:{port}\r\n"
-        if p.username:
-            auth = base64.b64encode(f"{unquote(p.username)}:{unquote(p.password or '')}".encode()).decode()
-            req += f"Proxy-Authorization: Basic {auth}\r\n"
-        req += "\r\n"
+    connection_id, request_id = new_id(), new_id()
+    started = time.perf_counter()
+    _trace_ws("handshake.start", connection_id, request_id=request_id,
+              url=safe_url(f"wss://{host}:{port}{path}"), proxy=bool(proxy_url))
+    try:
+        if proxy_url:
+            p = urlparse(proxy_url)
+            s = socket.create_connection((p.hostname, p.port or 3128), timeout=20)
+            req = f"CONNECT {host}:{port} HTTP/1.1\r\nHost: {host}:{port}\r\n"
+            if p.username:
+                auth = base64.b64encode(f"{unquote(p.username)}:{unquote(p.password or '')}".encode()).decode()
+                req += f"Proxy-Authorization: Basic {auth}\r\n"
+            req += "\r\n"
+            s.sendall(req.encode())
+            buf = b""
+            while b"\r\n\r\n" not in buf:
+                chunk = s.recv(4096)
+                if not chunk:
+                    raise QQWSError("proxy CONNECT: connection closed")
+                buf += chunk
+            if b" 200 " not in buf.splitlines()[0]:
+                raise QQWSError(f"proxy CONNECT failed: {buf.splitlines()[0]}")
+        else:
+            s = socket.create_connection((host, port), timeout=20)
+
+        ctx = ssl.create_default_context()
+        ctx.set_alpn_protocols(["http/1.1"])
+        try:
+            s = ctx.wrap_socket(s, server_hostname=host)
+        except Exception as e:
+            raise QQWSError(f"TLS handshake failed: {e}")
+
+        key = base64.b64encode(os.urandom(16)).decode()
+        req = (
+            f"GET {path} HTTP/1.1\r\n"
+            f"Host: {host}\r\n"
+            f"Upgrade: websocket\r\n"
+            f"Connection: Upgrade\r\n"
+            f"Sec-WebSocket-Key: {key}\r\n"
+            f"Sec-WebSocket-Version: 13\r\n"
+            f"User-Agent: {user_agent}\r\n\r\n"
+        )
         s.sendall(req.encode())
+
         buf = b""
         while b"\r\n\r\n" not in buf:
             chunk = s.recv(4096)
             if not chunk:
-                raise QQWSError("proxy CONNECT: connection closed")
+                raise QQWSError("handshake: EOF before end of HTTP headers")
             buf += chunk
-        if b" 200 " not in buf.splitlines()[0]:
-            raise QQWSError(f"proxy CONNECT failed: {buf.splitlines()[0]}")
-    else:
-        s = socket.create_connection((host, port), timeout=20)
+        header_bytes, leftover = buf.split(b"\r\n\r\n", 1)
+        status_line = header_bytes.splitlines()[0].decode("latin-1", "replace")
+        _trace_ws("handshake.response", connection_id, request_id=request_id,
+                  status=int(status_line[9:12]) if status_line[9:12].isascii() and status_line[9:12].isdigit() else None,
+                  header_bytes=len(header_bytes), leftover_bytes=len(leftover),
+                  duration_ms=(time.perf_counter() - started) * 1000)
+        if " 101 " not in status_line:
+            raise QQWSError(f"handshake: expected 101, got {status_line!r}")
 
-    ctx = ssl.create_default_context()
-    ctx.set_alpn_protocols(["http/1.1"])
-    try:
-        s = ctx.wrap_socket(s, server_hostname=host)
-    except Exception as e:
-        raise QQWSError(f"TLS handshake failed: {e}")
+        headers = {}
+        for line in header_bytes.splitlines()[1:]:
+            if b":" in line:
+                k, v = line.split(b":", 1)
+                headers[k.strip().lower().decode("latin-1")] = v.strip().decode("latin-1")
+        expected = _expected_accept(key, ws_guid)
+        if actual := headers.get("sec-websocket-accept"):
+            if actual != expected:
+                raise QQWSError(f"bad Sec-WebSocket-Accept: got {actual!r}, expected {expected!r}")
+        else:
+            raise QQWSError("missing Sec-WebSocket-Accept header")
 
-    key = base64.b64encode(os.urandom(16)).decode()
-    req = (
-        f"GET {path} HTTP/1.1\r\n"
-        f"Host: {host}\r\n"
-        f"Upgrade: websocket\r\n"
-        f"Connection: Upgrade\r\n"
-        f"Sec-WebSocket-Key: {key}\r\n"
-        f"Sec-WebSocket-Version: 13\r\n"
-        f"User-Agent: {user_agent}\r\n\r\n"
-    )
-    s.sendall(req.encode())
-
-    buf = b""
-    while b"\r\n\r\n" not in buf:
-        chunk = s.recv(4096)
-        if not chunk:
-            raise QQWSError("handshake: EOF before end of HTTP headers")
-        buf += chunk
-    header_bytes, leftover = buf.split(b"\r\n\r\n", 1)
-    status_line = header_bytes.splitlines()[0].decode("latin-1", "replace")
-    if " 101 " not in status_line:
-        raise QQWSError(f"handshake: expected 101, got {status_line!r}")
-
-    headers = {}
-    for line in header_bytes.splitlines()[1:]:
-        if b":" in line:
-            k, v = line.split(b":", 1)
-            headers[k.strip().lower().decode("latin-1")] = v.strip().decode("latin-1")
-    expected = _expected_accept(key, ws_guid)
-    if actual := headers.get("sec-websocket-accept"):
-        if actual != expected:
-            raise QQWSError(f"bad Sec-WebSocket-Accept: got {actual!r}, expected {expected!r}")
-    else:
-        raise QQWSError("missing Sec-WebSocket-Accept header")
-
-    return s, leftover
+        _trace_ws("handshake.end", connection_id, request_id=request_id, status=101,
+                  headers={name: "[REDACTED]" for name in headers},
+                  duration_ms=(time.perf_counter() - started) * 1000)
+        return s, leftover
+    except BaseException as e:
+        _trace_ws("handshake.error", connection_id, request_id=request_id,
+                  error=safe_error(e), duration_ms=(time.perf_counter() - started) * 1000)
+        raise
 
 
 class QQWebSocket:
     def __init__(self, sock: ssl.SSLSocket, leftover: bytes, loop: asyncio.AbstractEventLoop):
+        self._connection_id = new_id()
         self._sock = sock
         self._loop = loop
         self._send_q: queue.Queue = queue.Queue()
@@ -156,10 +185,20 @@ class QQWebSocket:
         if p.query:
             path += "?" + p.query
         loop = asyncio.get_running_loop()
-        s, leftover = await loop.run_in_executor(
-            None, _blocking_handshake, host, port, path, proxy_url, ws_guid, user_agent
-        )
-        return cls(s, leftover, loop)
+        attempt_id, started = new_id(), time.perf_counter()
+        _trace_ws("connect.start", attempt_id, url=safe_url(url))
+        try:
+            s, leftover = await loop.run_in_executor(
+                None, _blocking_handshake, host, port, path, proxy_url, ws_guid, user_agent
+            )
+        except BaseException as e:
+            _trace_ws("connect.error", attempt_id, error=safe_error(e),
+                      duration_ms=(time.perf_counter() - started) * 1000)
+            raise
+        ws = cls(s, leftover, loop)
+        _trace_ws("connect.end", ws._connection_id, attempt_id=attempt_id,
+                  duration_ms=(time.perf_counter() - started) * 1000)
+        return ws
 
     def _io_loop(self, sock: ssl.SSLSocket, initial_buf: bytes):
         buf = bytearray(initial_buf)
@@ -174,8 +213,11 @@ class QQWebSocket:
                 except queue.Empty:
                     break
                 try:
+                    _trace_ws("frame.send", self._connection_id, direction="out",
+                              opcode=data[0] & 0x0F if data else None, wire_length=len(data))
                     sock.sendall(data)
                 except Exception as e:
+                    _trace_ws("send.error", self._connection_id, error=safe_error(e))
                     self._fail(f"send failed: {e}")
                     return False
             return True
@@ -187,6 +229,7 @@ class QQWebSocket:
                 wlist = [sock] if has_send else []
                 r, w, _ = select.select(rlist, wlist, [], 0.5)
             except Exception as e:
+                _trace_ws("select.error", self._connection_id, error=safe_error(e))
                 self._fail(f"select failed: {e}")
                 break
 
@@ -199,8 +242,10 @@ class QQWebSocket:
                 except (BlockingIOError, ssl.SSLWantReadError):
                     continue
                 except Exception as e:
+                    _trace_ws("receive.error", self._connection_id, error=safe_error(e))
                     self._fail(f"recv failed: {e}")
                     break
+                _trace_ws("receive", self._connection_id, direction="in", length=len(chunk))
                 if not chunk:
                     self._fail("peer closed connection")
                     break
@@ -238,6 +283,8 @@ class QQWebSocket:
                     if mask:
                         payload = bytes(b ^ mask[i % 4] for i, b in enumerate(payload))
 
+                    _trace_ws("frame.receive", self._connection_id, direction="in",
+                              opcode=opcode, length=length, fin=fin, masked=masked)
                     if opcode == 0x8:  # CLOSE
                         self._fail("server sent close frame")
                         return
@@ -262,6 +309,8 @@ class QQWebSocket:
 
     def _fail(self, reason: str):
         if not self._closed.is_set():
+            _trace_ws("closed", self._connection_id)
+            logger.debug("QQ WebSocket closed connection_id=%s", self._connection_id)
             self._close_reason = reason
             self._closed.set()
             try:
@@ -273,6 +322,7 @@ class QQWebSocket:
     async def send_text(self, text: str):
         if self._closed.is_set():
             raise QQWSClosed(f"closed: {self._close_reason}")
+        _trace_ws("send.enqueue", self._connection_id, direction="out", opcode=1, length=len(text))
         self._send_q.put(_build_frame(0x1, text.encode("utf-8")))
 
     async def recv(self) -> str:
@@ -282,6 +332,7 @@ class QQWebSocket:
         return item
 
     async def close(self):
+        _trace_ws("close", self._connection_id)
         if not self._closed.is_set():
             try:
                 self._send_q.put(_build_frame(0x8, b""))

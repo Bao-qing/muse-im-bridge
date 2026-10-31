@@ -7,6 +7,8 @@ import os
 import uuid
 from typing import Any, List, Optional, Tuple
 
+from .state_file import ensure_parent
+
 GATEWAY_COMMANDS = frozenset(["status", "compact", "clear", "usage", "subagents", "stop"])
 LOCAL_COMMANDS = frozenset([
     "sessions", "switch", "new", "current", "delete", "rename",
@@ -205,6 +207,7 @@ class CommandHandler:
             return
         tmp = f"{path}.tmp.{os.getpid()}"
         try:
+            ensure_parent(path)
             with open(tmp, "w", encoding="utf-8") as f:
                 json.dump({"session_id": sid}, f, ensure_ascii=False, indent=2)
                 f.write("\n")

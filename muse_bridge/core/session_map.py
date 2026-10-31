@@ -17,6 +17,8 @@ import threading
 import uuid
 from typing import Callable, Dict, List, Optional, Tuple
 
+from .state_file import ensure_parent
+
 MODE_GLOBAL = "global"
 MODE_PER_CHAT = "per_chat"
 VALID_MODES = (MODE_GLOBAL, MODE_PER_CHAT)
@@ -90,6 +92,7 @@ class SessionMapper:
             return
         tmp = f"{self.state_file}.tmp.{os.getpid()}"
         try:
+            ensure_parent(self.state_file)
             with open(tmp, "w", encoding="utf-8") as f:
                 json.dump(self._map, f, ensure_ascii=False, indent=2)
                 f.write("\n")

@@ -27,6 +27,7 @@ from typing import Optional, Tuple
 import httpx
 
 from .client.errors import CredentialRefreshError, LoginRequired
+from ..observability import http_request, observed
 
 _BASE_HEADERS = {
     "User-Agent": (
@@ -190,7 +191,7 @@ class MuseTokenManager:
         headers["Sec-Fetch-Mode"] = "navigate"
         try:
             with httpx.Client(http2=True, timeout=timeout, follow_redirects=True) as client:
-                resp = client.get(f"{self.base_url}/", headers=headers)
+                resp = http_request(client, "get",f"{self.base_url}/", headers=headers)
                 html = resp.text
         except Exception:
             raise CredentialRefreshError("resolve_vm") from None
@@ -204,7 +205,7 @@ class MuseTokenManager:
         stage = url.rsplit("/", 1)[-1]
         try:
             with httpx.Client(http2=True, timeout=timeout) as client:
-                resp = client.post(url, headers=headers, json=payload)
+                resp = http_request(client, "post",url, headers=headers, json=payload)
                 if resp.status_code != 200:
                     try:
                         body = resp.json()
@@ -303,6 +304,7 @@ class MuseTokenManager:
         with self._lock:
             return (token, notary, vm_id) == (self._token, self._notary_token, self.vm_id) and self.is_fresh()
 
+    @observed("muse.login.refresh")
     def refresh_from_cookies(self, interactive: bool = False, *, rejected_token=None, rejected_notary=None) -> Tuple[str, str, str]:
         """Single-flight renewal; never prompts for OTP or conflates mint and cookie rejection."""
         with self._lock:

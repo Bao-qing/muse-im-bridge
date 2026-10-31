@@ -16,14 +16,28 @@ import sys
 # Ensure project root is in sys.path
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+from muse_bridge.config.models import ConfigLoader, LoggingConfig
 from muse_bridge.muse.login import run_protocol_login
+from muse_bridge.observability import configure_logging, get_logger, safe_error
 
 
-def main():
+logger = get_logger(__name__)
+
+
+def main(argv=None):
     parser = argparse.ArgumentParser(description="Muse 纯协议登录工具 (100% Python, 无需浏览器)")
     parser.add_argument("--email", default=None, help="登录邮箱地址")
     parser.add_argument("--output", default="cookies.json", help="输出 Cookies JSON 文件路径 (默认: cookies.json)")
-    args = parser.parse_args()
+    parser.add_argument("--config", default=None, help="配置文件路径 (默认: config.json 或 credentials.json)")
+    args = parser.parse_args(argv)
+
+    configure_logging(LoggingConfig(file=""))
+    try:
+        config = ConfigLoader.load(args.config)
+    except Exception as e:
+        logger.error("Error loading configuration: %s", safe_error(e))
+        sys.exit(1)
+    configure_logging(config.logging, legacy_debug=config.debug)
 
     try:
         run_protocol_login(
@@ -34,7 +48,7 @@ def main():
         print("\n[MuseLogin] 用户取消登录。")
         sys.exit(1)
     except Exception as e:
-        print(f"[MuseLogin] 登录失败：{e}", file=sys.stderr)
+        logger.error("[MuseLogin] 登录失败：%s", safe_error(e))
         sys.exit(1)
 
 

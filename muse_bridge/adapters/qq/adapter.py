@@ -23,6 +23,7 @@ from ...core.session_map import SessionMapper
 from ...muse.service import MuseService
 from ...muse.interactions import ApprovalBlocked
 from ...muse.client.errors import LoginRequired, CredentialRefreshError, HandshakeError, ConnectionLost, is_runtime_auth_error
+from ...observability import get_logger, safe_error, trace_event
 from ..base import BaseAdapter
 from .access import QQAccessRequests, valid_id
 from .client import QQClient
@@ -30,6 +31,8 @@ from .gateway import QQGateway
 from .interactions import QQInteractions
 from .outbound import QQOutboundPusher
 from .route_manager import RouteManager
+
+logger = get_logger(__name__)
 
 
 class QQAdapter(BaseAdapter):
@@ -124,8 +127,7 @@ class QQAdapter(BaseAdapter):
                 "【系统告警】向 Muse 发送消息时检测到凭据失效（401 Unauthorized）。\n已自动进入登录回落流程，请直接在此私聊发送：\n/login <您的邮箱>\n即可获取验证码重新登录恢复服务 ♪",
             )
         except Exception as e:
-            if self.config.debug:
-                print(f"[QQAdapter] Failed to notify admin for login: {e}")
+            logger.debug('Failed to notify admin for login: %s', safe_error(e))
 
     async def _send_command_reply(
         self,
@@ -172,7 +174,7 @@ class QQAdapter(BaseAdapter):
         if not self.is_enabled:
             return
         self._running = True
-        print(f"[QQAdapter] Starting decoupled QQ Adapter (AppID: {self.config.app_id})...")
+        logger.info('Starting decoupled QQ Adapter (AppID: %s)...', self.config.app_id)
 
         tasks = [
             asyncio.create_task(self.gateway.start()),
@@ -230,8 +232,7 @@ class QQAdapter(BaseAdapter):
     async def handle_event(self, event_type: str, d: dict) -> None:
         msg_id = d.get("id")
         if msg_id and self.deduplicator.is_duplicate_gateway_msg(msg_id):
-            if self.config.debug:
-                print(f"[QQAdapter] Duplicate gateway message ignored: {msg_id}")
+            logger.debug('Duplicate gateway message ignored: %s', msg_id)
             return
 
         if event_type not in {"C2C_MESSAGE_CREATE", "GROUP_AT_MESSAGE_CREATE", "GROUP_MESSAGE_CREATE"}:
@@ -258,8 +259,7 @@ class QQAdapter(BaseAdapter):
                 await self.access_requests.handle(kind, target, user, content, msg_id)
             return
         if not self.is_allowed(event_type, d):
-            if self.config.debug:
-                print(f"[QQAdapter] Ignored event {event_type}: sender not in whitelist")
+            logger.debug('Ignored event %s: sender not in whitelist', event_type)
             return
         attachments = self.extract_attachments(d)
 
@@ -274,7 +274,7 @@ class QQAdapter(BaseAdapter):
 
         # Consume sensitive input before any raw message logging.
         if await self.interaction_router.handle(owner, content, msg_id, is_admin, session_id, event=d):
-            print(f"[QQAdapter] Local interaction from {target_type}:{target_id}: [redacted]")
+            logger.info('Local interaction from %s:%s: [redacted]', target_type, target_id)
             return
 
         available = await asyncio.to_thread(self.muse_service.token_manager.has_credentials)
@@ -286,7 +286,7 @@ class QQAdapter(BaseAdapter):
             await self._send_command_reply(target_type, target_id, text, msg_id)
             return
 
-        print(f"[QQAdapter] Inbound ({event_type}) from {target_type}:{target_id}: {content}")
+        logger.info("Inbound event_type=%s target_type=%s target_id=%s msg_id=%s attachments=%s", event_type, target_type, target_id, msg_id, len(attachments))
 
         # 1. Local Slash Commands
         parsed = CommandHandler.parse_command(content)
@@ -369,6 +369,10 @@ class QQAdapter(BaseAdapter):
             )
             return
 
+        trace_event("qq.adapter", "message.received", payload={"content": content},
+                    session_id=session_id, target_type=target_type, target_id=target_id,
+                    msg_id=msg_id, attachment_count=len(attachments))
+
         # 2. Sequential Inbound Ingestion (Serialized per chat so slow files are never overtaken by later text!)
         chat_key = (target_type, target_id)
         chat_lock = self._chat_send_locks.setdefault(chat_key, asyncio.Lock())
@@ -397,7 +401,7 @@ class QQAdapter(BaseAdapter):
                 if self.session_mapper.per_chat:
                     if created:
                         self.outbound_pusher.track_session(session_id, fresh=True)
-                        print(f"[QQAdapter] New isolated Muse session {session_id} for {target_type}:{target_id}")
+                        logger.info('New isolated Muse session %s for %s:%s', session_id, target_type, target_id)
                     else:
                         # Pre-bound / restored session: baseline once so old history is never replayed
                         await self.outbound_pusher.ensure_baseline(session_id)
@@ -415,15 +419,16 @@ class QQAdapter(BaseAdapter):
 
                 # Register route for outbound pusher
                 self.route_manager.register(sent_mid, target_type, target_id, msg_id)
-                if self.config.debug:
-                    print(f"[QQAdapter] Message delivered to Muse (mid={sent_mid}), route registered for {target_type}:{target_id}")
+                logger.debug('Message delivered to Muse (mid=%s), route registered for %s:%s', sent_mid, target_type, target_id)
+                trace_event("qq.adapter", "route.registered", session_id=session_id, sent_mid=sent_mid,
+                            target_type=target_type, target_id=target_id, msg_id=msg_id)
             except ApprovalBlocked as e:
                 await self._send_command_reply(target_type, target_id, str(e), msg_id)
                 return
             except Exception as e:
                 err_msg = str(e).lower()
                 if isinstance(e, LoginRequired):
-                    print("[QQAdapter] Cookie 会话不可用，需要管理员登录。")
+                    logger.warning('Cookie 会话不可用，需要管理员登录。 error=%s', safe_error(e))
                     self.enter_login_mode()
                     admin_target = self.config.get_default_private_target()
                     if target_type == "private" and is_admin:
@@ -447,7 +452,7 @@ class QQAdapter(BaseAdapter):
                     if not self.session_mapper.per_chat:
                         self.active_session_id = new_sid
                         self.outbound_pusher.session_id = new_sid
-                    print(f"[QQAdapter] Session {session_id[:8]} expired/not found on Muse, auto-created new session {new_sid[:8]}")
+                    logger.warning('Session %s expired/not found on Muse, auto-created new session %s error=%s', session_id[:8], new_sid[:8], safe_error(e))
                     try:
                         sent_mid = await loop.run_in_executor(
                             None,
@@ -459,10 +464,12 @@ class QQAdapter(BaseAdapter):
                         )
                         self.outbound_pusher.track_session(new_sid, fresh=True)
                         self.route_manager.register(sent_mid, target_type, target_id, msg_id)
+                        trace_event("qq.adapter", "route.registered", session_id=new_sid, sent_mid=sent_mid,
+                                    target_type=target_type, target_id=target_id, msg_id=msg_id)
                         return
                     except Exception as retry_err:
-                        print(f"[QQAdapter] Failed to post message to new session: {retry_err}")
+                        logger.error('Failed to post message to new session: %s', safe_error(retry_err))
                         await self._send_command_reply(target_type, target_id, f"会话重建后发送出错：{retry_err}", msg_id)
                         return
-                print(f"[QQAdapter] Failed to post message to Muse: {e}")
+                logger.error('Failed to post message to Muse: %s', safe_error(e))
                 await self._send_command_reply(target_type, target_id, f"转接出错了：{e}", msg_id)

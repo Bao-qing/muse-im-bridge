@@ -20,6 +20,7 @@ Handshake nonces are all 0, so this only matters for transport frames,
 but getting it wrong breaks the whole session.
 """
 from .errors import WebSocketUpgradeError
+from ...observability import new_id, trace_event
 
 import base64
 import hashlib
@@ -157,6 +158,8 @@ def noise_handshake(ws) -> tuple:
 # ---------- WebSocket transport (via egress CONNECT proxy) ----------
 class WS:
     def __init__(self, url: str, proxy_url: str = None, direct: bool = False):
+        self._log_connection_id = new_id()
+        trace_event("muse.websocket", "connect.start", connection_id=self._log_connection_id, url=url)
         u = urlparse(url)
         host = u.hostname
         path = u.path + ("?" + u.query if u.query else "")
@@ -251,6 +254,7 @@ class WS:
             hdr = bytes([0x80 | opcode, 0x80 | 127]) + struct.pack(">Q", ln)
         masked = bytes(b ^ mask[i % 4] for i, b in enumerate(data))
         self.sock.sendall(hdr + mask + masked)
+        trace_event("muse.websocket", "frame.send", connection_id=self._log_connection_id, opcode=opcode, bytes=ln)
 
     def recv(self, timeout: float = 20.0):
         """Return (opcode, payload) of the next data/control frame."""
@@ -268,6 +272,7 @@ class WS:
             if b1 & 0x80:
                 self._read_exact(4)  # server frames are unmasked; skip if present
             payload = self._read_exact(ln) if ln else b""
+            trace_event("muse.websocket", "frame.receive", connection_id=self._log_connection_id, opcode=opcode, bytes=ln, final=bool(fin))
             if opcode == 9:  # ping
                 self.send(payload, opcode=10)
                 continue

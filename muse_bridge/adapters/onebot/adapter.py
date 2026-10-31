@@ -15,9 +15,12 @@ from ...config.models import OneBotConfig
 from ...core.message import Attachment
 from ...muse.service import MuseService
 from ...muse.interactions import ApprovalBlocked
+from ...observability import get_logger, safe_error, trace_event
 from ..base import BaseAdapter
 from .client import OneBotClient
 from .gateway import OneBotGateway
+
+logger = get_logger(__name__)
 
 
 class OneBotAdapter(BaseAdapter):
@@ -45,7 +48,7 @@ class OneBotAdapter(BaseAdapter):
     async def start(self) -> None:
         if not self.is_enabled:
             return
-        print(f"[OneBotAdapter] Starting OneBot Adapter ({self.config.base_url})...")
+        logger.info('Starting OneBot Adapter (%s)...', self.config.base_url)
         await self.gateway.start()
 
     async def stop(self) -> None:
@@ -89,6 +92,9 @@ class OneBotAdapter(BaseAdapter):
                 self.active_session_id,
                 raw_message,
             )
+            trace_event("onebot.adapter", "turn.completed", session_id=self.active_session_id,
+                        msg_id=event.get("message_id"), target_type=msg_type,
+                        group_id=group_id, user_id=user_id)
             reply_text = turn_result.text
             if msg_type == "group" and group_id:
                 await loop.run_in_executor(None, self.client.send_group_msg, group_id, reply_text)
@@ -100,4 +106,4 @@ class OneBotAdapter(BaseAdapter):
             elif msg_type == "private" and user_id:
                 await loop.run_in_executor(None, self.client.send_private_msg, user_id, str(e))
         except Exception as e:
-            print(f"[OneBotAdapter] Turn failed: {e}")
+            logger.error('Turn failed: %s', safe_error(e))

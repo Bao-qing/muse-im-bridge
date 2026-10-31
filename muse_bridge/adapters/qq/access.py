@@ -12,6 +12,8 @@ import tempfile
 import threading
 import time
 
+from ...core.state_file import ensure_parent
+
 
 def valid_id(value):
     return (isinstance(value, str) and 0 < len(value) <= 256
@@ -72,6 +74,7 @@ class AccessRequestStore:
             ids.add(row["id"])
 
     def _commit(self, data):
+        ensure_parent(self.path)
         directory = os.path.dirname(os.path.abspath(self.path))
         fd, temporary = tempfile.mkstemp(prefix=".qq-access-", suffix=".tmp", dir=directory)
         try:

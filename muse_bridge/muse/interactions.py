@@ -11,6 +11,11 @@ import threading
 import uuid
 from urllib.parse import parse_qs, quote, urlparse
 
+from ..observability import get_logger, safe_error, trace_event
+
+
+logger = get_logger(__name__)
+
 
 DECISIONS = {"allow_once", "allow_session", "allow_always", "deny_always", "deny"}
 DURABLE_SCOPES = {"destination", "destination_domain", "entity", "connector_all_actions", "recipient"}
@@ -214,6 +219,8 @@ class MuseInteractions:
             if not isinstance(result.get("id"), str) or not result["id"]:
                 raise ValueError("Invalid capture response")
             self._record_capture(c["receipt_key"])
+            trace_event("muse.interactions", "credential.captured", session_id=item.session_id,
+                        interaction_id=item.id, state="completed")
             return result["id"]
         finally:
             for field in fields:
@@ -463,6 +470,8 @@ class MuseInteractions:
                     item.state = "unknown"
                     item.context["decision_uncertain"] = True
                     return "审批结果未确认，仍保持门禁；请先在 Muse 网页核对；"
+            trace_event("muse.interactions", "approval.resolved", session_id=item.session_id,
+                        interaction_id=item.id, state=item.state)
             return f"【审批 {item.id}】{option['label']}；服务端状态：{item.state}。"
 
     async def run(self, notify, running):
@@ -487,5 +496,5 @@ class MuseInteractions:
                 raise
             except Exception as e:
                 self.manager.approvals_ready = False
-                print(f"[Interactions] Approval reconciliation unavailable ({type(e).__name__}); pending gates retained.")
+                logger.warning("Approval reconciliation unavailable; pending gates retained. error=%s", safe_error(e))
             await asyncio.sleep(3)

@@ -21,6 +21,60 @@ from typing import Any, Dict, Optional, Tuple
 
 from ...config import constants
 from ...config.constants import BLOCKED_DOWNLOAD_HOST
+from ...observability import get_logger, new_id, safe_error, safe_url, trace_event
+
+logger = get_logger(__name__)
+
+
+def _trace_headers(headers):
+    result = {}
+    for key, value in (headers or {}).items():
+        name = str(key).lower()
+        # Unknown headers can contain credentials, signed URLs or user text.
+        if name == "content-length" and str(value).isdigit():
+            result[str(key)] = str(value)
+        elif name == "content-type" and str(value) in {"application/json", "application/json; charset=utf-8",
+                                                        "application/octet-stream", "image/png", "image/jpeg"}:
+            result[str(key)] = str(value)
+        else:
+            result[str(key)] = "[REDACTED]"
+    return result
+
+
+def _trace_payload(value):
+    # Snapshot only: never alter the object handed to the HTTP client.
+    if isinstance(value, bytes):
+        try:
+            return _trace_payload(json.loads(value))
+        except (ValueError, UnicodeError):
+            return {"omitted": "unstructured", "bytes": len(value)}
+    if isinstance(value, dict):
+        if "file_data" in value:
+            return {"binary_upload": True, "omitted": "binary_upload",
+                    "encoded_length": len(value["file_data"]),
+                    "file_type": value.get("file_type"),
+                    "srv_send_msg": value.get("srv_send_msg")}
+        return {key: "[REDACTED]" if str(key).lower() == "file_info" else _trace_payload(item)
+                for key, item in value.items()}
+    if isinstance(value, (tuple, list)):
+        return [_trace_payload(item) for item in value]
+    return value
+
+
+def _trace_http(event, request_id, started, *, method, url, payload=None,
+                sensitive=False, response=None, error=None, **fields):
+    # Logging must not change HTTPError handling or consume a response stream.
+    try:
+        if response is not None:
+            fields["status"] = getattr(response, "status", getattr(response, "code", None))
+            fields["headers"] = _trace_headers(getattr(response, "headers", {}))
+        trace_event("qq.http", event, request_id=request_id, method=method,
+                    url=safe_url(url), duration_ms=(time.perf_counter() - started) * 1000,
+                    payload="[REDACTED]" if sensitive else _trace_payload(payload),
+                    sensitive=sensitive, messages=True,
+                    error=safe_error(error) if error is not None else None, **fields)
+    except Exception:
+        pass
 
 JPEG_START = b"\xff\xd8"
 JPEG_END = b"\xff\xd9"
@@ -60,10 +114,19 @@ class QQClient:
             headers={"Content-Type": "application/json", "User-Agent": self.user_agent},
         )
 
+        request_id, started = new_id(), time.perf_counter()
+        _trace_http("start", request_id, started, method="POST", url=url,
+                    payload=body, sensitive=True, headers=_trace_headers(req.headers))
         try:
             with urllib.request.urlopen(req, timeout=15) as resp:
-                data = json.loads(resp.read().decode("utf-8"))
+                raw = resp.read()
+                _trace_http("response", request_id, started, method="POST", url=url,
+                            payload=raw, sensitive=True, response=resp)
+                data = json.loads(raw.decode("utf-8"))
         except Exception as e:
+            _trace_http("error", request_id, started, method="POST", url=url,
+                        sensitive=True, error=e, response=e if isinstance(e, urllib.error.HTTPError) else None)
+            logger.error("QQ access token acquisition failed: %s", safe_error(e))
             raise RuntimeError(f"failed to acquire QQ access token: {e}")
 
         token = data.get("access_token")
@@ -82,11 +145,19 @@ class QQClient:
             url,
             headers={"Authorization": f"QQBot {token}", "User-Agent": self.user_agent},
         )
+        request_id, started = new_id(), time.perf_counter()
+        _trace_http("start", request_id, started, method="GET", url=url,
+                    headers=_trace_headers(req.headers))
         try:
             with urllib.request.urlopen(req, timeout=15) as resp:
-                data = json.loads(resp.read().decode("utf-8"))
+                raw = resp.read()
+                _trace_http("response", request_id, started, method="GET", url=url, payload=raw, response=resp)
+                data = json.loads(raw.decode("utf-8"))
                 return data.get("url") or "wss://api.sgroup.qq.com/websocket"
-        except Exception:
+        except Exception as e:
+            _trace_http("error", request_id, started, method="GET", url=url, error=e,
+                        response=e if isinstance(e, urllib.error.HTTPError) else None)
+            logger.warning("QQ gateway URL lookup failed; using fallback: %s", safe_error(e))
             return "wss://api.sgroup.qq.com/websocket"
 
     def _http_json(
@@ -104,21 +175,29 @@ class QQClient:
             "User-Agent": self.user_agent,
         }
         req = urllib.request.Request(url, data=body, method=method, headers=headers)
+        request_id, started = new_id(), time.perf_counter()
+        _trace_http("start", request_id, started, method=method, url=url, payload=payload,
+                    headers=_trace_headers(headers))
         try:
             with urllib.request.urlopen(req, timeout=timeout) as resp:
                 raw = resp.read()
+                _trace_http("response", request_id, started, method=method, url=url, payload=raw, response=resp)
                 try:
                     return resp.status, json.loads(raw.decode("utf-8"))
                 except Exception:
                     return resp.status, {"raw": raw.decode("utf-8", "ignore")}
         except urllib.error.HTTPError as e:
             raw = e.read()
+            _trace_http("error", request_id, started, method=method, url=url,
+                        payload=raw, response=e, error=e)
             try:
                 body_json = json.loads(raw.decode("utf-8"))
             except Exception:
                 body_json = {"raw": raw.decode("utf-8", "ignore")}
             return e.code, body_json
         except Exception as e:
+            _trace_http("error", request_id, started, method=method, url=url, error=e)
+            logger.error("QQ HTTP request failed: %s", safe_error(e))
             raise RuntimeError(f"request to {url} failed: {e}")
 
     def post_with_retry(self, url: str, payload: dict, timeout: int = 25) -> Tuple[int, dict]:
@@ -218,13 +297,19 @@ class QQClient:
         else:
             conn = http.client.HTTPConnection(host, port, timeout=timeout)
 
+        request_id, started = new_id(), time.perf_counter()
+        connection_id = new_id()
         try:
             headers = {
                 "User-Agent": self.user_agent,
                 "Accept": "*/*",
             }
+            _trace_http("start", request_id, started, method="GET", url=target_url,
+                        connection_id=connection_id, headers=_trace_headers(headers))
             conn.request("GET", path, headers=headers)
             resp = conn.getresponse()
+            _trace_http("response", request_id, started, method="GET", url=target_url,
+                        connection_id=connection_id, response=resp)
             if resp.status not in (200, 206):
                 raise RuntimeError(f"HTTP {resp.status} {resp.reason}")
 
@@ -232,6 +317,8 @@ class QQClient:
             expected_len = int(content_len_hdr) if content_len_hdr else None
 
             data = resp.read(max_bytes + 1)
+            _trace_http("body", request_id, started, method="GET", url=target_url,
+                        connection_id=connection_id, payload={"omitted": "binary_download", "bytes": len(data)})
             if len(data) > max_bytes:
                 raise RuntimeError(f"download exceeded limit ({max_bytes} bytes)")
             if len(data) == 0:
@@ -245,6 +332,11 @@ class QQClient:
             if data[:8] == PNG_MAGIC and not data.endswith(PNG_IEND):
                 raise RuntimeError("truncated PNG: missing IEND marker")
 
+            _trace_http("end", request_id, started, method="GET", url=target_url, connection_id=connection_id)
             return data
+        except BaseException as e:
+            _trace_http("error", request_id, started, method="GET", url=target_url,
+                        connection_id=connection_id, error=e)
+            raise
         finally:
             conn.close()

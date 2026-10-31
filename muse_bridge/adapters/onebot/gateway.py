@@ -9,8 +9,21 @@ from __future__ import annotations
 import asyncio
 import json
 import ssl
+import time
 from typing import Any, Callable, Coroutine, Optional
 from urllib.parse import urlparse
+
+from ...observability import get_logger, new_id, safe_error, safe_url, trace_event
+
+logger = get_logger(__name__)
+
+
+def _trace_gateway(event, connection_id, **fields):
+    try:
+        trace_event("onebot.gateway", event, connection_id=connection_id, **fields)
+    except Exception:
+        pass
+
 
 try:
     import websockets
@@ -32,7 +45,7 @@ class OneBotGateway:
 
     async def start(self) -> None:
         if websockets is None:
-            print("[OneBotGateway] websockets library not available; WebSocket gateway disabled.")
+            logger.warning("websockets library not available; OneBot WebSocket gateway disabled")
             return
 
         self._running = True
@@ -44,24 +57,36 @@ class OneBotGateway:
         url = f"{self.ws_url}/{token_sep}access_token={self.access_token}" if self.access_token else self.ws_url
 
         while self._running:
+            connection_id = new_id()
+            started = time.perf_counter()
             try:
+                _trace_gateway("connect.start", connection_id, url=safe_url(url))
                 async with websockets.connect(url, ssl=ssl_ctx) as ws:
-                    print(f"[OneBotGateway] Connected to OneBot WS at {self.ws_url}")
+                    logger.info("Connected to OneBot WS at %s", safe_url(self.ws_url))
+                    _trace_gateway("connect.end", connection_id,
+                                   duration_ms=(time.perf_counter() - started) * 1000)
                     while self._running:
                         msg_raw = await ws.recv()
+                        # No raw JSON, attachment, quoted message or OTP text at this layer.
+                        _trace_gateway("receive", connection_id,
+                                       direction="in", length=len(msg_raw))
                         try:
                             event = json.loads(msg_raw)
                         except Exception:
                             continue
 
                         if event.get("post_type") == "message":
+                            _trace_gateway("dispatch", connection_id,
+                                           post_type="message")
                             asyncio.create_task(self._safe_dispatch(event))
             except asyncio.CancelledError:
                 break
             except Exception as e:
+                _trace_gateway("connect.error", connection_id,
+                               error=safe_error(e), duration_ms=(time.perf_counter() - started) * 1000)
                 if not self._running:
                     break
-                print(f"[OneBotGateway] Connection error: {e}, reconnecting in 5s...")
+                logger.warning("OneBot WS connection error; reconnecting in 5s: %s", safe_error(e))
                 await asyncio.sleep(5.0)
 
     async def stop(self) -> None:
@@ -71,4 +96,4 @@ class OneBotGateway:
         try:
             await self.on_message(event)
         except Exception as e:
-            print(f"[OneBotGateway] Error dispatching message: {e}")
+            logger.error("OneBot message dispatch failed: %s", safe_error(e))

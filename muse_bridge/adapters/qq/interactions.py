@@ -11,6 +11,10 @@ import time
 
 from ...muse.client.errors import LoginRequired
 from ...muse.login import MuseProtocolLogin
+from ...observability import get_logger, safe_error, trace_event
+
+
+logger = get_logger(__name__)
 
 
 class QQInteractions:
@@ -156,7 +160,8 @@ class QQInteractions:
         item.state = "submitting"
         try:
             await asyncio.to_thread(auth.send_otp, email)
-        except Exception:
+        except Exception as exc:
+            logger.warning('send_otp unavailable: %s', safe_error(exc))
             auth.client.close()
             item.context.pop("auth", None)
             item.state = "wait_email"
@@ -188,7 +193,8 @@ class QQInteractions:
             finally:
                 if os.path.exists(temporary):
                     os.unlink(temporary)
-        except Exception:
+        except Exception as exc:
+            logger.warning('confirm_otp unavailable: %s', safe_error(exc))
             item.state = "wait_otp"
             await self.reply(owner, "验证码确认失败，请重试或 /cancel；输入未转发到 Muse。", msg_id)
             return
@@ -196,14 +202,17 @@ class QQInteractions:
         self.adapter.exit_login_mode()
         try:
             await asyncio.to_thread(self.adapter.muse_service.token_manager.refresh_from_cookies, False)
-        except LoginRequired:
+        except LoginRequired as exc:
+            logger.warning('confirm_otp unavailable: %s', safe_error(exc))
             self.adapter.enter_login_mode()
             await self.reply(owner, "登录会话未生效，请重新 /login；输入未转发到 Muse。", msg_id)
             return
-        except Exception:
+        except Exception as exc:
+            logger.warning('confirm_otp unavailable: %s', safe_error(exc))
             await self.reply(owner, "Cookie 已保存，连接暂未恢复；稍后会自动重试，无需重复登录。", msg_id)
             return
         self.adapter.exit_login_mode()
+        trace_event("qq.interactions", "login.completed", interaction_id=item.id, state=item.state)
         await self.reply(owner, "【登录成功】Cookie 与运行凭据已更新；/chat 返回聊天。", msg_id)
 
     async def show_approval(self, owner, session_id, msg_id, *, all_sessions=False):
@@ -242,7 +251,8 @@ class QQInteractions:
             return
         try:
             text = await self.adapter.muse_service.submit_approval(item, choice, expected_fingerprint=fingerprint)
-        except Exception:
+        except Exception as exc:
+            logger.warning('handle_approval unavailable: %s', safe_error(exc))
             text = "审批结果暂未确认，未放行、未补发任何消息，请重新查看审批。"
         await self.reply(owner, text, msg_id)
         if not item.terminal:
@@ -367,7 +377,8 @@ class QQInteractions:
         item.state = "submitting"
         try:
             await asyncio.to_thread(self.adapter.muse_service.capture_credential, item, secret)
-        except Exception:
+        except Exception as exc:
+            logger.warning('capture unavailable: %s', safe_error(exc))
             if not item.terminal:
                 item.state = previous
             await self.reply(owner, "保存结果未确认，请用相同内容重试，或 /cancel 取消。", msg_id, item=item)
