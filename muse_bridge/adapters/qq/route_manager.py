@@ -16,6 +16,8 @@ import os
 import time
 from typing import Dict, Optional
 
+from ...core.state_file import ensure_parent
+
 
 @dataclasses.dataclass
 class RouteInfo:
@@ -36,7 +38,7 @@ class RouteInfo:
 
 
 class RouteManager:
-    def __init__(self, state_file: Optional[str] = "qq_routes.json", ttl_s: float = 600.0):
+    def __init__(self, state_file: Optional[str] = "data/qq_routes.json", ttl_s: float = 600.0):
         self.state_file = state_file
         self.ttl_s = ttl_s
         self._routes: Dict[str, RouteInfo] = {}  # user_mid -> RouteInfo
@@ -61,6 +63,7 @@ class RouteManager:
             return
         tmp = f"{self.state_file}.tmp.{os.getpid()}"
         try:
+            ensure_parent(self.state_file)
             with open(tmp, "w", encoding="utf-8") as f:
                 data = {k: v.to_dict() for k, v in self._routes.items()}
                 json.dump(data, f, ensure_ascii=False, indent=2)

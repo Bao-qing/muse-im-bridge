@@ -11,6 +11,10 @@ from .adapters.qq import QQAdapter
 from .config.models import AppConfig
 from .muse.service import MuseService
 from .muse.token_manager import MuseTokenManager
+from .observability import get_logger, safe_error
+
+
+logger = get_logger(__name__)
 
 
 class BridgeEngine:
@@ -39,10 +43,10 @@ class BridgeEngine:
         self._running = True
         enabled_adapters = [a for a in self.adapters if a.is_enabled]
         if not enabled_adapters:
-            print("[BridgeEngine] No adapters enabled. Nothing to run.")
+            logger.warning("No adapters enabled. Nothing to run.")
             return
 
-        print(f"[BridgeEngine] Starting {len(enabled_adapters)} adapter(s): {[a.name for a in enabled_adapters]}")
+        logger.info("Starting %s adapter(s): %s", len(enabled_adapters), [a.name for a in enabled_adapters])
 
         # Verify Muse credentials on startup before launching adapters to avoid
         # concurrent notary_token minting/handshake races with outbound pushers
@@ -53,10 +57,10 @@ class BridgeEngine:
         except Exception as exc:
             cred_ok = False
             login_required = False
-            print(f"[BridgeEngine] 启动验证暂不可用 ({type(exc).__name__})，保留 Cookie，后台重试。")
+            logger.warning("启动验证暂不可用，保留 Cookie，后台重试。 error=%s", safe_error(exc))
         qq_adapter = next((a for a in self.adapters if isinstance(a, QQAdapter)), None)
         if login_required:
-            print("[BridgeEngine] 启动验证：Muse 会话凭据未就绪或已失效，进入登录回落流程。")
+            logger.warning("启动验证：Muse 会话凭据未就绪或已失效，进入登录回落流程。")
             if qq_adapter:
                 qq_adapter.enter_login_mode()
             if self.config.gateway.login_through_adapter == "qq":
@@ -64,13 +68,13 @@ class BridgeEngine:
                 if admin_target:
                     asyncio.create_task(self._notify_admin_login(admin_target))
         elif cred_ok:
-            print("[BridgeEngine] 启动验证：Muse 会话凭据有效，认证通过。")
+            logger.info('启动验证：Muse 会话凭据有效，认证通过。')
 
         if cred_ok:
             try:
                 await self.muse_service.interaction_protocol.reconcile()
-            except Exception:
-                print("[BridgeEngine] 审批状态尚未就绪，普通消息保持门禁。")
+            except Exception as exc:
+                logger.warning("审批状态尚未就绪，普通消息保持门禁。 error=%s", safe_error(exc))
 
         tasks = [asyncio.create_task(a.start()) for a in enabled_adapters]
         tasks.append(asyncio.create_task(self.muse_service.interaction_protocol.run(
@@ -103,13 +107,12 @@ class BridgeEngine:
                 )
                 qq_adapter.enter_login_mode(admin_target)
             except Exception as e:
-                if self.config.debug:
-                    print(f"[BridgeEngine] Failed to notify admin for login: {e}")
+                logger.debug('Failed to notify admin for login: %s', safe_error(e))
 
     async def stop(self) -> None:
         self._running = False
         self.muse_service.interactions.close()
-        print("[BridgeEngine] Stopping all adapters...")
+        logger.info('Stopping all adapters...')
         stop_tasks = [a.stop() for a in self.adapters if a.is_enabled]
         if stop_tasks:
             await asyncio.gather(*stop_tasks, return_exceptions=True)

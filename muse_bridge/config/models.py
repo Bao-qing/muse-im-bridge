@@ -87,15 +87,15 @@ class QQPushConfig:
     turn_end_fallback_s: int = constants.DEFAULT_TURN_END_FALLBACK_S
     recheck_sleep_s: int = constants.DEFAULT_RECHECK_SLEEP_S
     reconnect_sleep_s: int = constants.DEFAULT_RECONNECT_SLEEP_S
-    state_file: str = "qq_push_state.json"
-    delivered_file: str = "qq_delivered.jsonl"
+    state_file: str = "data/qq_push_state.json"
+    delivered_file: str = "data/qq_delivered.jsonl"
 
 
 @dataclasses.dataclass
 class AccessRequestsConfig:
     enabled: bool = True
     auto_approve: bool = False
-    state_file: str = "qq_access.local.json"
+    state_file: str = "data/qq_access.local.json"
 
     def __post_init__(self):
         if type(self.enabled) is not bool or type(self.auto_approve) is not bool:
@@ -116,8 +116,8 @@ class QQConfig:
     session_id: str = ""
     whitelist: Dict[str, Union[List[str], str]] = dataclasses.field(default_factory=dict)
     push: QQPushConfig = dataclasses.field(default_factory=QQPushConfig)
-    session_state_file: str = "qq_session.json"
-    delivered_file: str = "qq_delivered.jsonl"
+    session_state_file: str = "data/qq_session.json"
+    delivered_file: str = "data/qq_delivered.jsonl"
     proxy_url: Optional[str] = None
     download_proxy: str = ""
     debug: bool = False
@@ -125,7 +125,7 @@ class QQConfig:
     # Session isolation: "global" (all chats share one Muse session, legacy)
     # or "per_chat" (each group / private user gets its own Muse session).
     session_mode: str = "global"
-    session_map_file: str = "qq_session_map.json"
+    session_map_file: str = "data/qq_session_map.json"
     # Optional pre-seeded bindings, e.g. {"group:<openid>": "<muse session id>"}
     session_bindings: Dict[str, str] = dataclasses.field(default_factory=dict)
     # per_chat only: route unsolicited events (reminders, background tasks)
@@ -250,12 +250,50 @@ class GatewayConfig:
 
 
 @dataclasses.dataclass
+class LoggingConfig:
+    level: str = "INFO"
+    console: bool = True
+    file: Optional[str] = "logs/bridge.log"
+    trace: bool = False
+    trace_file: Optional[str] = "logs/trace.jsonl"
+    payload_limit: int = 65536
+    max_bytes: int = 10485760
+    backup_count: int = 5
+
+    def __post_init__(self):
+        if not isinstance(self.level, str):
+            raise ValueError("logging.level must be a string")
+        self.level = self.level.strip().upper()
+        if self.level not in {"TRACE", "DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL", "OFF"}:
+            raise ValueError("logging.level must be TRACE, DEBUG, INFO, WARNING, ERROR, CRITICAL, or OFF")
+        for name in ("console", "trace"):
+            if type(getattr(self, name)) is not bool:
+                raise ValueError(f"logging.{name} must be a boolean")
+        for name, minimum in (("payload_limit", 0), ("max_bytes", 1), ("backup_count", 1)):
+            value = getattr(self, name)
+            if type(value) is not int or value < minimum:
+                raise ValueError(f"logging.{name} must be an integer >= {minimum}")
+        for name in ("file", "trace_file"):
+            value = getattr(self, name)
+            if value is not None and not isinstance(value, str):
+                raise ValueError(f"logging.{name} must be a path string or null")
+            if isinstance(value, str) and ("\x00" in value or (value and not value.strip())):
+                raise ValueError(f"logging.{name} must be a valid path or empty")
+        if self.trace:
+            if not self.trace_file:
+                raise ValueError("logging.trace_file must be nonempty when logging.trace is true")
+            if self.file and os.path.normcase(os.path.realpath(self.file)) == os.path.normcase(os.path.realpath(self.trace_file)):
+                raise ValueError("logging.trace_file must differ from logging.file")
+
+
+@dataclasses.dataclass
 class AppConfig:
     muse: MuseConfig = dataclasses.field(default_factory=MuseConfig)
     qq: QQConfig = dataclasses.field(default_factory=QQConfig)
     onebot: OneBotConfig = dataclasses.field(default_factory=OneBotConfig)
     gateway: GatewayConfig = dataclasses.field(default_factory=GatewayConfig)
     debug: bool = False
+    logging: LoggingConfig = dataclasses.field(default_factory=LoggingConfig)
 
 
 class ConfigLoader:
@@ -352,8 +390,8 @@ class ConfigLoader:
             turn_end_fallback_s=int(_get_val(p_raw, "turn_end_fallback_s", constants.DEFAULT_TURN_END_FALLBACK_S)),
             recheck_sleep_s=int(_get_val(p_raw, "recheck_sleep_s", constants.DEFAULT_RECHECK_SLEEP_S)),
             reconnect_sleep_s=int(_get_val(p_raw, "reconnect_sleep_s", constants.DEFAULT_RECONNECT_SLEEP_S)),
-            state_file=p_raw.get("state_file", "qq_push_state.json"),
-            delivered_file=p_raw.get("delivered_file", "qq_delivered.jsonl"),
+            state_file=p_raw.get("state_file", "data/qq_push_state.json"),
+            delivered_file=p_raw.get("delivered_file", "data/qq_delivered.jsonl"),
         )
 
         admin_raw = q_raw.get("admin_id") or []
@@ -370,7 +408,7 @@ class ConfigLoader:
         access_cfg = AccessRequestsConfig(
             enabled=access_raw.get("enabled", True),
             auto_approve=access_raw.get("auto_approve", False),
-            state_file=access_raw.get("state_file", "qq_access.local.json"),
+            state_file=access_raw.get("state_file", "data/qq_access.local.json"),
         )
 
         qq_cfg = QQConfig(
@@ -384,13 +422,13 @@ class ConfigLoader:
             session_id=str(q_raw.get("session_id") or muse_cfg.session_id or ""),
             whitelist=q_raw.get("whitelist") or {},
             push=push_cfg,
-            session_state_file=q_raw.get("session_state_file", "qq_session.json"),
-            delivered_file=q_raw.get("delivered_file", "qq_delivered.jsonl"),
+            session_state_file=q_raw.get("session_state_file", "data/qq_session.json"),
+            delivered_file=q_raw.get("delivered_file", "data/qq_delivered.jsonl"),
             proxy_url=q_raw.get("proxy_url") or muse_cfg.proxy_url,
             download_proxy=q_raw.get("download_proxy") or "",
             debug=q_raw.get("debug", False) or _env_bool("QQ_DEBUG", False),
             session_mode=str(q_raw.get("session_mode") or "global").strip().lower(),
-            session_map_file=q_raw.get("session_map_file", "qq_session_map.json"),
+            session_map_file=q_raw.get("session_map_file", "data/qq_session_map.json"),
             session_bindings={
                 str(k): str(v) for k, v in (q_raw.get("session_bindings") or {}).items() if k and v
             },
@@ -432,10 +470,21 @@ class ConfigLoader:
         gw_raw = raw_data.get("gateway", {})
         gw_cfg = GatewayConfig(login_through_adapter=str(gw_raw.get("login_through_adapter", "")))
 
+        # 5. Logging config. An explicit level wins over legacy debug flags.
+        debug = raw_data.get("debug", False) or qq_cfg.debug
+        logging_raw = raw_data.get("logging", {})
+        if not isinstance(logging_raw, dict):
+            raise ValueError("logging must be an object")
+        logging_fields = {field.name for field in dataclasses.fields(LoggingConfig)}
+        if logging_raw.keys() - logging_fields:
+            raise ValueError("logging contains unknown configuration fields")
+        logging_cfg = LoggingConfig(**{"level": "DEBUG" if debug else "INFO", **logging_raw})
+
         return AppConfig(
             muse=muse_cfg,
             qq=qq_cfg,
             onebot=ob_cfg,
             gateway=gw_cfg,
-            debug=raw_data.get("debug", False) or qq_cfg.debug,
+            debug=debug,
+            logging=logging_cfg,
         )

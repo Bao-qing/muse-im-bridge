@@ -22,6 +22,7 @@ from ...config.models import QQConfig
 from ...core.deduplicator import MessageDeduplicator
 from ...core.message import chunk_text
 from ...core.session_map import MODE_GLOBAL, SessionMapper
+from ...core.state_file import ensure_parent
 from ...muse.client.errors import ConnectionLost, HandshakeError, MuseError, RPCError, SubscribeError, LoginRequired, is_runtime_auth_error
 from ...muse.client.push import PushTurnTracker
 from ...muse.client.render import (
@@ -33,9 +34,12 @@ from ...muse.client.render import (
     render_widget_to_text,
     render_presentation_card_to_text,
 )
+from ...observability import get_logger, safe_error, trace_event
 from ...muse.service import MuseService
 from .client import QQClient
 from .route_manager import RouteInfo, RouteManager
+
+logger = get_logger(__name__)
 
 _SANDBOX_MEDIA_RE = re.compile(r"!?\[([^\]]*)\]\(sandbox://([^)]+)\)")
 _WIDGET_RE = re.compile(r"\[\[hatch_widget:[^\]]+\]\]")
@@ -234,6 +238,7 @@ class QQOutboundPusher:
             return
         tmp = f"{state_file}.tmp.{os.getpid()}"
         try:
+            ensure_parent(state_file)
             with open(tmp, "w", encoding="utf-8") as f:
                 json.dump(
                     {
@@ -256,7 +261,7 @@ class QQOutboundPusher:
     async def start(self) -> None:
         self._running = True
         default_type, default_id = self.config.resolve_push_target()
-        print(f"[QQOutbound] Started event-driven outbound dispatcher (Default push target: {default_type}:{default_id})")
+        logger.info('Started event-driven outbound dispatcher (Default push target: %s:%s)', default_type, default_id)
 
         while self._running:
             try:
@@ -266,8 +271,7 @@ class QQOutboundPusher:
             except Exception as e:
                 if not self._running:
                     break
-                if self.config.debug:
-                    print(f"[QQOutbound] Event stream loop error: {e}, reconnecting in 3s...")
+                logger.debug('Event stream loop error: %s, reconnecting in 3s...', safe_error(e))
                 await asyncio.sleep(3.0)
 
     async def stop(self) -> None:
@@ -303,8 +307,7 @@ class QQOutboundPusher:
                     try:
                         it["data"] = client.read_file(wpath)
                     except Exception as e:
-                        if self.config.debug:
-                            print(f"[QQOutbound] Failed reading workspace media {wpath}: {e}")
+                        logger.debug('Failed reading workspace media: %s', safe_error(e))
             ev["_extracted_images"] = imgs
             ev["_extracted_files"] = fls
             ev["_extracted_videos"] = vids
@@ -342,8 +345,7 @@ class QQOutboundPusher:
                 if isinstance(r, dict) and r.get("session_id")
             }
         except Exception as e:
-            if self.config.debug:
-                print(f"[QQOutbound] session list failed ({e}); falling back to watched sessions")
+            logger.debug('session list failed (%s); falling back to watched sessions', safe_error(e))
 
         out: List[str] = []
         for sid in watched:
@@ -393,8 +395,7 @@ class QQOutboundPusher:
             msg = str(e).lower()
             if "status 404" in msg or "not_found" in msg or "session not found" in msg:
                 self._uncreated_sessions.add(session_id)
-            if self.config.debug:
-                print(f"[QQOutbound] baseline fetch for {session_id[:8]} failed ({e}); treating as empty")
+            logger.debug('baseline fetch for %s failed (%s); treating as empty', session_id[:8], safe_error(e))
             hist = []
         for e in hist:
             if e.get("role") == "assistant" and e.get("message_id"):
@@ -415,8 +416,7 @@ class QQOutboundPusher:
                     "【系统提示】获取 Muse 消息时检测到凭据失效（401 Unauthorized）。\n已自动进入登录回落流程，请直接在此私聊发送：\n/login <您的邮箱>\n即可获取验证码重新登录恢复服务 ♪",
                 )
             except Exception as e:
-                if self.config.debug:
-                    print(f"[QQOutbound] Failed to notify admin for login: {e}")
+                logger.debug('Failed to notify admin for login: %s', safe_error(e))
         if self._on_login_required:
             try:
                 self._on_login_required(admin_target)
@@ -445,10 +445,9 @@ class QQOutboundPusher:
             if action == "baseline":
                 self._last_seq = max(self._last_seq, max_seq)
                 self._save_state()
-                if self.config.debug:
-                    print(f"[QQOutbound] Startup baseline {sid[:8]} ({reason}): marked {skipped} messages seen, 0 pushed.")
+                logger.debug('Startup baseline %s (%s): marked %s messages seen, 0 pushed.', sid[:8], reason, skipped)
             else:
-                print(f"[QQOutbound] Startup catch-up {sid[:8]}: recovering up to {kept} recent message(s) (skipped {skipped} older).")
+                logger.info('Startup catch-up %s: recovering up to %s recent message(s) (skipped %s older).', sid[:8], kept, skipped)
 
         if hist:
             await self._scan_and_dispatch(hist, sid)
@@ -507,7 +506,7 @@ class QQOutboundPusher:
             if not await asyncio.to_thread(self.muse_service.token_manager.has_credentials):
                 if not self._login_alerted:
                     self._login_alerted = True
-                    print("[QQOutbound] Muse 尚未登录或凭据失效，暂停出站监听，触发回落登录...")
+                    logger.warning('Muse 尚未登录或凭据失效，暂停出站监听，触发回落登录...')
                     await self._notify_login_required()
                 await asyncio.sleep(5.0)
                 continue
@@ -651,8 +650,7 @@ class QQOutboundPusher:
                             except Exception as ex:
                                 if self._is_auth_error(ex):
                                     raise
-                                if self.config.debug:
-                                    print(f"[QQOutbound] Event-triggered sync failed for {sid[:8]}: {ex}")
+                                logger.debug('Event-triggered sync failed for %s: %s', sid[:8], safe_error(ex))
                         return synced
 
                     synced_batches = await loop.run_in_executor(None, _read_And_sync_events)
@@ -665,13 +663,13 @@ class QQOutboundPusher:
                 if isinstance(e, LoginRequired):
                     if not self._login_alerted:
                         self._login_alerted = True
-                        print("[QQOutbound] Cookie 会话不可用，等待管理员登录。")
+                        logger.warning('Cookie 会话不可用，等待管理员登录。 error=%s', safe_error(e))
                         await self._notify_login_required()
                     await asyncio.sleep(10.0)
                     continue
                 if is_runtime_auth_error(e) and client is not None:
                     await asyncio.to_thread(self.muse_service.token_manager.invalidate_mint, client.token, client.notary_token)
-                print(f"[QQOutbound] 连接暂不可用 ({type(e).__name__}, HTTP {getattr(e, 'status', None) or '-'})，保留 Cookie，3 秒后重连。")
+                logger.warning("连接暂不可用，保留 Cookie，3 秒后重连。 error=%s", safe_error(e))
                 await asyncio.sleep(3.0)
                 continue
             finally:
@@ -695,8 +693,7 @@ class QQOutboundPusher:
                 except Exception as ex:
                     if self._is_auth_error(ex):
                         raise
-                    if self.config.debug:
-                        print(f"[QQOutbound] history fetch failed for {sid[:8]}: {ex}")
+                    logger.debug('history fetch failed for %s: %s', sid[:8], safe_error(ex))
             return results
 
         results = await loop.run_in_executor(None, _tick)
@@ -794,8 +791,7 @@ class QQOutboundPusher:
             if event_name == "message.assistant":
                 status = payload.get("status") or event.get("status")
                 if status != "completed":
-                    if self.config.debug:
-                        print(f"[QQOutbound] Skip {mid}: generation in progress (status={status})")
+                    logger.debug('Skip %s: generation in progress (status=%s)', mid, status)
                     continue
 
             credential = None
@@ -858,8 +854,7 @@ class QQOutboundPusher:
                         reply_msg_id = route.msg_id
 
             if not target_id:
-                if self.config.debug:
-                    print(f"[QQOutbound] No target found for message {mid}, skipping.")
+                logger.debug('No target found for message %s, skipping.', mid)
                 continue
 
             # Mark processing
@@ -882,12 +877,16 @@ class QQOutboundPusher:
                     if seq > self._last_seq:
                         self._last_seq = seq
                     self._save_state()
-                    print(f"[QQOutbound] Dispatched {mid} -> {target_type}:{target_id} [{route_type}] (imgs={len(images)}, files={len(files)}, vids={len(videos)})")
+                    logger.info('Dispatched %s -> %s:%s [%s] (imgs=%s, files=%s, vids=%s)', mid, target_type, target_id, route_type, len(images), len(files), len(videos))
+                    trace_event("qq.outbound", "message.dispatched", session_id=session_id,
+                                message_id=mid, sent_mid=last_user_mid, msg_id=reply_msg_id, target_type=target_type,
+                                target_id=target_id, route_type=route_type,
+                                image_count=len(images), file_count=len(files), video_count=len(videos))
                 else:
                     self.deduplicator.rollback_processing([mid])
             except Exception as e:
                 self.deduplicator.rollback_processing([mid])
-                print(f"[QQOutbound] Dispatch error for {mid}: {e}")
+                logger.error('Dispatch error for %s: %s', mid, safe_error(e))
 
     async def _send_to_qq(
         self,
@@ -921,7 +920,7 @@ class QQOutboundPusher:
 
             if not curr_mid:
                 if active_budget <= 0:
-                    print(f"[QQOutbound] Active budget ({self.config.max_active_chunks}) exhausted; item dropped.")
+                    logger.warning('Active budget (%s) exhausted; item dropped.', self.config.max_active_chunks)
                     return False
                 active_budget -= 1
 
@@ -939,8 +938,7 @@ class QQOutboundPusher:
 
             # Retry as active if passive rejected
             if curr_mid and not (200 <= code < 300):
-                if self.config.debug:
-                    print(f"[QQOutbound] Passive send failed ({code}): {body}, retrying as active...")
+                logger.debug("Passive send failed (status=%s), retrying as active...", code)
                 if active_budget > 0:
                     active_budget -= 1
                     code, body = await loop.run_in_executor(
@@ -958,8 +956,7 @@ class QQOutboundPusher:
                 if target_type == "group" and any(k in str(body) for k in ("40034105", "无权限", "主动消息失败")):
                     admin_type, admin_id = self.config.resolve_push_target()
                     if admin_id and (admin_type != target_type or admin_id != target_id):
-                        if self.config.debug:
-                            print(f"[QQOutbound] Group active send rejected ({code}); falling back to admin {admin_type}:{admin_id}")
+                        logger.debug('Group active send rejected (%s); falling back to admin %s:%s', code, admin_type, admin_id)
                         delivered_type, delivered_id = admin_type, admin_id
                         code, body = await loop.run_in_executor(
                             None,
@@ -972,7 +969,7 @@ class QQOutboundPusher:
                         )
 
             if not (200 <= code < 300):
-                print(f"[QQOutbound] Failed sending item to {target_type}:{target_id} ({code}): {body}")
+                logger.error("Failed sending item to %s:%s (status=%s)", target_type, target_id, code)
                 return False
             if credential is not None:
                 self.muse_service.interactions.remember_credential_message(
@@ -995,12 +992,12 @@ class QQOutboundPusher:
                         self.config.max_image_bytes,
                     )
                 except Exception as e:
-                    print(f"[QQOutbound] Failed to download image {img['url']}: {e}")
+                    logger.error('Failed to download image: %s', safe_error(e))
                     continue
             if not data:
                 continue
             if len(data) > self.config.max_image_bytes:
-                print(f"[QQOutbound] Image exceeds limit ({len(data)} > {self.config.max_image_bytes})")
+                logger.warning('Image exceeds limit (%s > %s)', len(data), self.config.max_image_bytes)
                 continue
 
             try:
@@ -1016,7 +1013,7 @@ class QQOutboundPusher:
                 )
                 await _deliver_item(media_info=file_info)
             except Exception as e:
-                print(f"[QQOutbound] Failed to upload/send image: {e}")
+                logger.error('Failed to upload/send image: %s', safe_error(e))
 
         # 3. Send videos
         for vid in videos:
@@ -1030,12 +1027,12 @@ class QQOutboundPusher:
                         self.config.max_video_bytes,
                     )
                 except Exception as e:
-                    print(f"[QQOutbound] Failed to download video {vid['url']}: {e}")
+                    logger.error('Failed to download video: %s', safe_error(e))
                     continue
             if not data:
                 continue
             if len(data) > self.config.max_video_upload_bytes:
-                print(f"[QQOutbound] Video exceeds upload limit ({len(data)} > {self.config.max_video_upload_bytes})")
+                logger.warning('Video exceeds upload limit (%s > %s)', len(data), self.config.max_video_upload_bytes)
                 continue
 
             try:
@@ -1051,7 +1048,7 @@ class QQOutboundPusher:
                 )
                 await _deliver_item(media_info=file_info)
             except Exception as e:
-                print(f"[QQOutbound] Failed to upload/send video: {e}")
+                logger.error('Failed to upload/send video: %s', safe_error(e))
 
         # 4. Send files
         for fl in files:
@@ -1065,12 +1062,12 @@ class QQOutboundPusher:
                         self.config.max_file_bytes,
                     )
                 except Exception as e:
-                    print(f"[QQOutbound] Failed to download file {fl['url']}: {e}")
+                    logger.error('Failed to download file: %s', safe_error(e))
                     continue
             if not data:
                 continue
             if len(data) > self.config.max_file_bytes:
-                print(f"[QQOutbound] File exceeds limit ({len(data)} > {self.config.max_file_bytes})")
+                logger.warning('File exceeds limit (%s > %s)', len(data), self.config.max_file_bytes)
                 continue
 
             try:
@@ -1086,6 +1083,6 @@ class QQOutboundPusher:
                 )
                 await _deliver_item(media_info=file_info)
             except Exception as e:
-                print(f"[QQOutbound] Failed to upload/send file: {e}")
+                logger.error('Failed to upload/send file: %s', safe_error(e))
 
         return all_delivered

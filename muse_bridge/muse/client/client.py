@@ -108,6 +108,9 @@ class TurnResult:
     user_message_id: str = ""
 
 
+from ...observability import new_id, observed, trace_event
+
+
 class PushSubscription:
     """A live /chat/subscribe stream. read_events() returns parsed event
     dicts (newline-delimited JSON from body_chunks), filtering to this
@@ -142,6 +145,7 @@ class PushSubscription:
             except Exception:
                 continue
             if isinstance(obj, dict):
+                trace_event("muse.push", "event.receive", connection_id=getattr(self._client, "_log_connection_id", ""), stream_id=self.stream_id, payload=obj)
                 events.append(obj)
         return events
 
@@ -169,6 +173,7 @@ class PushSubscription:
             if full is None:
                 continue
             sid, kind, detail = parse_service_frame(unwrap_service_response(full))
+            trace_event("muse.rpc", "frame.receive", stream_id=sid, kind=kind, payload=detail, messages=True)
             if sid != self.stream_id:
                 if hasattr(self._client, "_dispatch_other_stream_frame"):
                     self._client._dispatch_other_stream_frame(sid, kind, detail)
@@ -216,6 +221,7 @@ class MuseClient:
         self._reasm = None
         self._seq = 0
         self._subscriptions = {}  # stream_id -> PushSubscription
+        self._log_connection_id = new_id()
 
     def _register_subscription(self, sub: PushSubscription):
         self._subscriptions[sub.stream_id] = sub
@@ -255,6 +261,7 @@ class MuseClient:
             if full is None:
                 continue
             sid, kind, detail = parse_service_frame(unwrap_service_response(full))
+            trace_event("muse.rpc", "frame.receive", stream_id=sid, kind=kind, payload=detail, messages=True)
             self._dispatch_other_stream_frame(sid, kind, detail)
             for sub in list(self._subscriptions.values()):
                 events.extend(sub.drain_events())
@@ -263,9 +270,12 @@ class MuseClient:
         return events
 
     # -- connection ---------------------------------------------------
+    @observed("muse.connection")
     def connect(self):
         if self._ws is not None:
             return
+        self._log_connection_id = new_id()
+        trace_event("muse.connection", "open", connection_id=self._log_connection_id, host=self.host, vm_id=self.vm_id)
         params = [
             f"vm_id={self.vm_id}",
             f"auth_token={quote(self.token, safe='')}",
@@ -334,6 +344,7 @@ class MuseClient:
             if full is None:
                 continue
             sid, kind, detail = parse_service_frame(unwrap_service_response(full))
+            trace_event("muse.rpc", "frame.receive", stream_id=sid, kind=kind, payload=detail, messages=True)
             if sid != want_seq:
                 self._dispatch_other_stream_frame(sid, kind, detail)
                 continue
@@ -349,6 +360,7 @@ class MuseClient:
                     break
         return status, chunks
 
+    @observed("muse.rpc")
     def request(self, method, path, body=b"", timeout=30,
                 include_content_type=True, service="daemon"):
         """One RPC on a fresh stream. Returns the joined body bytes.
@@ -356,6 +368,7 @@ class MuseClient:
         self._ensure_connected()
         self._seq += 1
         seq = self._seq
+        trace_event("muse.rpc", "stream.open", connection_id=self._log_connection_id, stream_id=seq)
         env = http_request_envelope(seq, method, path, body,
                                     include_content_type=include_content_type,
                                     service=service)
@@ -724,6 +737,7 @@ class MuseClient:
         return self.session_action("unarchive", session_id)
 
     # -- push (subscribe) ---------------------------------------------
+    @observed("muse.subscribe")
     def subscribe(self, session_id=None, timeout=20):
         """Open a /chat/subscribe stream. Returns a PushSubscription once
         the server ACKs (subscribed:true). Raises SubscribeError on a
@@ -736,6 +750,7 @@ class MuseClient:
         self._ensure_connected()
         self._seq += 1
         seq = self._seq
+        trace_event("muse.rpc", "stream.open", connection_id=self._log_connection_id, stream_id=seq)
         payload = {"session_id": session_id} if session_id else {}
         env = http_request_envelope(
             seq, "POST", "/chat/subscribe",
@@ -802,6 +817,7 @@ class MuseClient:
             if full is None:
                 continue
             sid, kind, detail = parse_service_frame(unwrap_service_response(full))
+            trace_event("muse.rpc", "frame.receive", stream_id=sid, kind=kind, payload=detail, messages=True)
             if sid != seq:
                 self._dispatch_other_stream_frame(sid, kind, detail)
                 continue

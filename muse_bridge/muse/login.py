@@ -18,6 +18,8 @@ from typing import Dict, Optional
 
 import httpx
 
+from ..observability import http_request
+
 _BASE_HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -46,10 +48,10 @@ class MuseProtocolLogin:
     def initialize_session(self) -> None:
         """Step 1: Perform SSO redirect cycle to acquire datr and csrf cookies."""
         url = f"https://auth.{self.base_url.split('://')[-1]}/aymh/?origin={self.base_url}"
-        resp = self.client.get(url, headers=_BASE_HEADERS)
+        resp = http_request(self.client, "get",url, headers=_BASE_HEADERS)
         if resp.status_code != 200:
             # Fallback to direct landing GET
-            self.client.get(f"{self.base_url}/", headers=_BASE_HEADERS)
+            http_request(self.client, "get",f"{self.base_url}/", headers=_BASE_HEADERS)
 
     def _api_headers(self) -> Dict[str, str]:
         headers = {
@@ -76,7 +78,7 @@ class MuseProtocolLogin:
         self.initialize_session()
 
         # Call /restart
-        r1 = self.client.post(f"{self.base_url}/api/auth/native/restart", headers=self._api_headers(), json={})
+        r1 = http_request(self.client, "post",f"{self.base_url}/api/auth/native/restart", headers=self._api_headers(), json={})
         if r1.status_code != 201:
             raise RuntimeError(f"初始化认证失败 ({r1.status_code}): {r1.text}")
 
@@ -89,7 +91,7 @@ class MuseProtocolLogin:
                     break
 
         # Call /send-otp
-        r2 = self.client.post(
+        r2 = http_request(self.client, "post",
             f"{self.base_url}/api/auth/native/send-otp",
             headers=self._api_headers(),
             json={"contact_point": email.strip(), "region": region},
@@ -101,7 +103,7 @@ class MuseProtocolLogin:
 
     def confirm_otp(self, otp_code: str) -> dict:
         """Step 3: Submit 6-digit OTP code to verify and acquire session cookies."""
-        r = self.client.post(
+        r = http_request(self.client, "post",
             f"{self.base_url}/api/auth/native/confirm-otp",
             headers=self._api_headers(),
             json={"otp_code": otp_code.strip(), "remember_device": True},
@@ -113,7 +115,7 @@ class MuseProtocolLogin:
 
         # If registration completion is required (new account without profile):
         if data.get("registration_state") == "completion_required":
-            r_comp = self.client.post(
+            r_comp = http_request(self.client, "post",
                 f"{self.base_url}/api/auth/native/register-completion",
                 headers=self._api_headers(),
                 json={

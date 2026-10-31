@@ -19,11 +19,13 @@ import tempfile
 import time
 from typing import Dict, List, Optional, Set, Tuple
 
+from .state_file import ensure_parent
+
 
 class MessageDeduplicator:
     def __init__(
         self,
-        persistence_file: Optional[str] = "qq_delivered.jsonl",
+        persistence_file: Optional[str] = "data/qq_delivered.jsonl",
         in_flight_ttl_s: int = 300,
         processing_ttl_s: int = 300,
         gateway_dedup_s: int = 120,
@@ -93,6 +95,7 @@ class MessageDeduplicator:
         data["ts"] = int(time.time())
         line = json.dumps(data, ensure_ascii=False) + "\n"
         try:
+            ensure_parent(self.persistence_file)
             with open(self.persistence_file, "a", encoding="utf-8") as f:
                 f.write(line)
         except Exception:

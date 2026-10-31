@@ -21,8 +21,11 @@
       "access_requests": {
         "enabled": true,
         "auto_approve": false,
-        "state_file": "qq_access.local.json"
+        "state_file": "data/qq_access.local.json"
       },
+      "session_state_file": "data/qq_session.json",
+      "delivered_file": "data/qq_delivered.jsonl",
+      "session_map_file": "data/qq_session_map.json",
       "session_mode": "global",
       "session_bindings": {},
       "proactive_to_session_owner": true,
@@ -36,7 +39,9 @@
         "enabled": true,
         "target_type": "private",
         "target_id": null,
-        "catch_up_enabled": false
+        "catch_up_enabled": false,
+        "state_file": "data/qq_push_state.json",
+        "delivered_file": "data/qq_delivered.jsonl"
       }
     },
     "onebot": {
@@ -53,6 +58,16 @@
   },
   "gateway": {
     "login_through_adapter": "qq"
+  },
+  "logging": {
+    "level": "INFO",
+    "console": true,
+    "file": "logs/bridge.log",
+    "trace": false,
+    "trace_file": "logs/trace.jsonl",
+    "payload_limit": 65536,
+    "max_bytes": 10485760,
+    "backup_count": 5
   },
   "overrides": {
     "chunk_chars": 1200,

@@ -2,6 +2,7 @@ from .constants import *
 from .models import (
     AppConfig,
     ConfigLoader,
+    LoggingConfig,
     MuseConfig,
     OneBotConfig,
     QQConfig,
@@ -11,6 +12,7 @@ from .models import (
 __all__ = [
     "AppConfig",
     "ConfigLoader",
+    "LoggingConfig",
     "MuseConfig",
     "QQConfig",
     "QQPushConfig",

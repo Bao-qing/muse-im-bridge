@@ -17,8 +17,12 @@ from .client.errors import HandshakeError, TurnCancelled, LoginRequired, is_runt
 from ..config.models import MuseConfig
 from ..core.interactions import InteractionManager
 from ..core.message import Attachment
+from ..observability import get_logger, trace_event
 from .token_manager import MuseTokenManager
 from .interactions import ApprovalBlocked, MuseInteractions
+
+
+logger = get_logger(__name__)
 
 
 class MuseService:
@@ -187,6 +191,9 @@ class MuseService:
                     files=inline_files or None,
                     file_refs=file_refs or None,
                 )
+                logger.debug("Message posted to Muse session_id=%s sent_mid=%s", session_id, sent_mid)
+                trace_event("muse.service", "message.posted", session_id=session_id, sent_mid=sent_mid,
+                            attachment_count=len(atts))
                 return sent_mid
         except Exception as e:
             if is_runtime_auth_error(e) and "client" in locals():
@@ -221,6 +228,9 @@ class MuseService:
                     files=inline_files or None,
                     file_refs=file_refs or None,
                 )
+                logger.debug("Message posted to Muse session_id=%s sent_mid=%s", session_id, sent_mid)
+                trace_event("muse.service", "message.posted", session_id=session_id, sent_mid=sent_mid,
+                            attachment_count=len(atts))
 
                 if on_sent and sent_mid:
                     try:

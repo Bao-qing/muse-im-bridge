@@ -183,8 +183,8 @@ python -m unittest discover tests
         "catch_up_enabled": false,                 // 启动时是否追赶离线期间产生的历史未推送消息 (默认: false，全量标为已读)
         "catch_up_window_s": 21600,                // 追赶允许的最大离线时间窗口 (秒，默认: 21600 = 6小时)
         "catch_up_max_messages": 5,                // 追赶单次补推的最大消息条数 (默认: 5，防止刷屏)
-        "state_file": "qq_push_state.json",        // 推送水位持久化文件路径 (默认: "qq_push_state.json")
-        "delivered_file": "qq_delivered.jsonl"     // 已投递消息去重记录文件路径 (默认: "qq_delivered.jsonl")
+        "state_file": "data/qq_push_state.json",        // 推送水位持久化文件路径 (默认: "data/qq_push_state.json")
+        "delivered_file": "data/qq_delivered.jsonl"     // 已投递消息去重记录文件路径 (默认: "data/qq_delivered.jsonl")
       },
       "ws_guid": "258EAFA5-E914-47DA-95CA-C5AB0DC85B11", // [可选] QQ Gateway 握手 GUID
       "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/155.0.0.0 Safari/537.36", // [可选] 全局统一 HTTP/WS User-Agent
@@ -199,8 +199,8 @@ python -m unittest discover tests
       "gateway_dedup_s": 120,                      // [可选] QQ 网关事件去重窗口秒数 (默认: 120)
       "download_timeout_s": 60,                    // [可选] 附件下载超时时间 (秒，默认: 60)
       "download_proxy": "",                        // [可选] 针对受阻域名的专用代理前缀，例如 "https://proxy.example.com/https/"
-      "session_state_file": "qq_session.json",     // [可选] /switch 与 /new 命令持久化记录文件路径
-      "debug": false                               // [可选] 是否开启极致详尽的调试日志输出 (默认: false)
+      "session_state_file": "data/qq_session.json", // [可选] /switch 与 /new 命令持久化记录文件路径 (默认: "data/qq_session.json")
+      "debug": false                               // [可选] 旧兼容开关，仅在 logging.level 未指定时选用 DEBUG (默认: false)
     },
     "onebot": {
       "enabled": false,                            // [可选] 是否启用 OneBot (NapCat v11) 适配器 (默认: false)
@@ -225,6 +225,39 @@ python -m unittest discover tests
 }
 ```
 
+## 日志与 JSONL 追踪
+
+在配置文件顶层增加 `logging`（完整示例见 `config.example.json`）：
+
+```json
+{
+  "logging": {
+    "level": "INFO",
+    "console": true,
+    "file": "logs/bridge.log",
+    "trace": false,
+    "trace_file": "logs/trace.jsonl",
+    "payload_limit": 65536,
+    "max_bytes": 10485760,
+    "backup_count": 5
+  }
+}
+```
+
+- **等级优先级**：显式 `logging.level` 优先，支持 `TRACE` / `DEBUG` / `INFO` / `WARNING` / `ERROR` / `CRITICAL` / `OFF`（大小写不敏感）。未指定等级时，旧顶层 `debug`、QQ `debug` 或环境变量 `QQ_DEBUG` 开启则使用 `DEBUG`，否则 `INFO`；旧字段保留。显式 `INFO` 或 `OFF` 不会被旧 debug 标志覆盖。
+- **目的地**：`console` 控制 stderr 运行日志，`file` 控制文本运行日志；`file: ""` 或 `null` 禁用文件输出。`trace: true` 单独开启 JSONL 追踪，不会因 `DEBUG` / `TRACE` 等级自动打开；`OFF` 同时关闭运行日志与追踪。开启追踪时 `trace_file` 必须非空且不能与 `file` 指向同一路径；未开启时可设为空或 `null`。相对路径基于进程工作目录。
+- **JSONL 模式**：每行一个 JSON 对象，包含 schema 版本、UTC 时间、单调时钟、运行 ID、顺序号、组件/事件，以及可用的关联 ID、耗时、状态与脱敏 payload。用于串联诊断事件与 HTTP 请求/响应，不改变请求、重试或业务行为，也不主动消费尚未读完的流。运行日志与 JSONL 不混写。
+- **大小与保留**：`payload_limit` 为单事件脱敏后 payload 的 UTF-8 字节限制，默认 65536；超出时记录截断预览、长度与摘要。`0` 表示不限，**不是关闭脱敏**；大消息会增加隐私暴露面、磁盘占用和写入压力，通常不建议长期使用。`max_bytes` 必须为正整数（默认 10 MiB），`backup_count` 为至少 1 的整数（默认 5）；两个文件分别按大小轮转，保留当前文件与最多 5 个备份（`.1` 至 `.5`），不是按天保留，单条大记录可能超过阈值。开关必须为 JSON 布尔值，数字字段不接受字符串、浮点数或布尔值。
+- **隐私与重放限制**：认证请求、Token、Cookie、Authorization、密码、验证码和凭证授权等会被遮蔽，低层交互敏感输入/消息正文也受保护；二进制或无法安全解释的内容仅保留省略标记、长度或摘要。日志不是完整抓包，不能依靠它原样重放认证、凭证、敏感输入或二进制请求。脱敏不能保证识别任意业务字段中的个人信息；即使截断/脱敏后也应限制访问、及时清理，分享前人工检查。不要记录完整配置或真实凭据，也不要提交日志；默认目录及轮转文件已加入 `.gitignore`。
+
+`main.py` 在加载配置前先启用不创建文件的安全默认日志，加载完成后再应用完整配置；加载中的出口 IP 探测行为保持不变。`--check` 的业务输出、CLI 用户提示和交互 `input()` 不受日志开关影响。独立登录工具同样读取日志配置，原有 `--email` / `--output` 行为不变：
+
+```bash
+python tools/login.py --config config.json --output cookies.json
+```
+
+临时诊断可将 `trace` 改为 `true`，排查后关闭并按需删除本地日志；日志目录不可写等日志故障不应阻止认证或消息投递。不要为排查而把真实 Cookie、Token、验证码或密码写进示例配置、日志消息或测试。
+
 ## 白名单申请
 
 新私聊或新群无需先加入白名单即可向机器人发送申请；普通消息仍不会转发。
@@ -240,13 +273,28 @@ python -m unittest discover tests
 "access_requests": {
   "enabled": true,
   "auto_approve": false,
-  "state_file": "qq_access.local.json"
+  "state_file": "data/qq_access.local.json"
 }
 ```
 
 默认人工审批。显式设置 `auto_approve: true` 后，新申请会直接通过并加入有效白名单，包括 `/申请 全员` 的整群开放；这意味着任何能向机器人发送申请的新群都可自行开通。开启前请确认这是期望的访问策略。切换自动模式不会自动批准已有待办。`enabled: false` 停止接收新申请，已有授权和管理员处理待办仍可用。
 
 动态授权与申请记录原子保存到 `state_file`，与配置中的静态白名单合并生效，不改写含密钥的配置文件。删除状态文件会丢失动态授权；修改静态白名单不会撤销已批准的动态授权。文件损坏或不属于当前 QQ 应用时拒绝启动，避免静默重置权限。单实例使用该文件，不支持多个进程同时写入。运行状态文件无需提交。
+
+### 运行状态文件（`data/`）
+
+以下运行状态文件默认写入项目根目录的 `data/`（可各自在配置中改写路径），目录在首次写入时自动创建：
+
+| 文件 | 内容 | 配置项 |
+| :--- | :--- | :--- |
+| `data/qq_access.local.json` | 动态白名单授权与申请记录 | `adapters.qq.access_requests.state_file` |
+| `data/qq_delivered.jsonl` | 已投递消息去重记录（追加写入） | `adapters.qq.delivered_file` / `adapters.qq.push.delivered_file` |
+| `data/qq_push_state.json` | 主动推送水位与已见消息 | `adapters.qq.push.state_file` |
+| `data/qq_routes.json` | 消息 ID -> QQ 目标路由（重启后仍可被动回复） | `RouteManager` 默认值 |
+| `data/qq_session.json` | `global` 模式下的当前 Muse 会话 | `adapters.qq.session_state_file` |
+| `data/qq_session_map.json` | `per_chat` 模式下群/私聊到会话的映射 | `adapters.qq.session_map_file` |
+
+`data/` 已在 `.gitignore` 中忽略。从旧版升级时，将根目录下的同名文件移入 `data/` 即可保留原有状态（不移动则按空状态重新开始）。
 
 重复待办合并；每人新申请间隔至少一分钟，已处理申请重提需等待十分钟，待办七天过期。管理员通知失败时保留待办，可稍后重发申请或由管理员查询；通知和授权结果不等同 QQ 一定送达。
 
@@ -287,12 +335,12 @@ QQ 适配器支持两种会话模式，通过 `adapters.qq.session_mode` 选择�
 
 | 模式 | 行为 |
 | :--- | :--- |
-| `global`（默认） | 所有群聊/私聊共用同一个 Muse 会话（`qq_session.json` / `muse.session_id`），与旧版完全一致 |
+| `global`（默认） | 所有群聊/私聊共用同一个 Muse 会话（`data/qq_session.json` / `muse.session_id`），与旧版完全一致 |
 | `per_chat` | 每个群、每个私聊用户各自独立一个 Muse 会话，互不可见 |
 
 `per_chat` 相关选项：
 
-- `session_map_file`（默认 `qq_session_map.json`）：`群/私聊 -> Muse session_id` 映射，重启后保持。
+- `session_map_file`（默认 `data/qq_session_map.json`）：`群/私聊 -> Muse session_id` 映射，重启后保持。
 - `session_bindings`：预置绑定，键为 `group:<group_openid>` 或 `private:<user_openid>`，值为已有的 Muse `session_id`。
 - `proactive_to_session_owner`（默认 `true`）：提醒等无对应提问的主动消息，推回该会话所属的群/私聊；设为 `false` 则仍推给管理员私聊。
 - `session_hot_window_s` / `session_sweep_s`：出站检测参数（见下）。
