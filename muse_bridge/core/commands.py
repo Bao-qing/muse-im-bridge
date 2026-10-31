@@ -2,12 +2,8 @@
 
 from __future__ import annotations
 
-import json
-import os
 import uuid
 from typing import Any, List, Optional, Tuple
-
-from .state_file import ensure_parent
 
 GATEWAY_COMMANDS = frozenset(["status", "compact", "clear", "usage", "subagents", "stop"])
 LOCAL_COMMANDS = frozenset([
@@ -26,7 +22,8 @@ HELP_TEXT = (
     "/login [邮箱] — 显式登录 Muse（管理员私聊专用）\n"
     "/凭证 [编号] [保存|一次] — 填写凭证，也可回复凭证卡\n"
     "账号和密码可分两行发送，保存后自动继续聊天\n"
-    "/审批 [编号] [选项数字] — 查看或选择 Muse 原生审批选项\n"
+    "/审批 [编号] [选项数字] — 查看或选择 Muse 原生审批选项；多张审批依次排队\n"
+    "/审批 all <选项数字> — 当前审批队列全部使用该选项（也可回复“数字 all”）\n"
     "/cancel — 结束本地输入（不会取消远端审批）\n"
     "/chat — 清除已结束的输入流程（通常无需使用）\n"
     "/delete <序号|id> — 删除会话（主会话不能删）\n"
@@ -106,7 +103,6 @@ class CommandHandler:
         args: str,
         client: Any,
         active_session_id: str,
-        session_state_file: Optional[str] = None,
     ) -> Tuple[str, str]:
         """Execute a local slash command.
 
@@ -119,8 +115,6 @@ class CommandHandler:
 
         if name == "new":
             new_id = str(uuid.uuid4())
-            if session_state_file:
-                cls.save_session_id(session_state_file, new_id)
             return f"已开启新会话：{new_id}", new_id
 
         if name == "current":
@@ -155,8 +149,6 @@ class CommandHandler:
         sid = cls.resolve_session(args.split()[0] if args else "", sessions)
 
         if name == "switch":
-            if session_state_file:
-                cls.save_session_id(session_state_file, sid)
             return f"已切换至会话：{sid}", sid
 
         if name == "delete":
@@ -188,33 +180,3 @@ class CommandHandler:
             return f"会话已重命名为：{new_title}", active_session_id
 
         return HELP_TEXT, active_session_id
-
-    @staticmethod
-    def load_session_id(path: str, default: str = "") -> str:
-        if not path or not os.path.exists(path):
-            return default
-        try:
-            with open(path, "r", encoding="utf-8") as f:
-                data = json.load(f)
-                sid = data.get("session_id")
-                return str(sid).strip() if sid else default
-        except Exception:
-            return default
-
-    @staticmethod
-    def save_session_id(path: str, sid: str) -> None:
-        if not path:
-            return
-        tmp = f"{path}.tmp.{os.getpid()}"
-        try:
-            ensure_parent(path)
-            with open(tmp, "w", encoding="utf-8") as f:
-                json.dump({"session_id": sid}, f, ensure_ascii=False, indent=2)
-                f.write("\n")
-            os.replace(tmp, path)
-        except Exception:
-            if os.path.exists(tmp):
-                try:
-                    os.unlink(tmp)
-                except Exception:
-                    pass

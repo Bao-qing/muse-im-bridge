@@ -49,7 +49,7 @@ class MuseService:
             self.interaction_protocol.fetch_approvals()
         except Exception:
             raise ApprovalBlocked("审批状态暂不可确认，此消息未转发、未缓存；请稍后重新发送。") from None
-        pending = self.interactions.pending_approvals(session_id)
+        pending = self.interaction_protocol.approval_queue(session_id)
         if pending:
             raise ApprovalBlocked(self.format_approval(pending[0]))
 

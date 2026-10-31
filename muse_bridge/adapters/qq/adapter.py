@@ -54,25 +54,17 @@ class QQAdapter(BaseAdapter):
 
         self.deduplicator = deduplicator or MessageDeduplicator(
             persistence_file=self.config.delivered_file,
-            in_flight_ttl_s=self.config.push.in_flight_ttl_s,
-            processing_ttl_s=self.config.push.processing_ttl_s,
+            in_flight_ttl_s=self.config.in_flight_ttl_s,
+            processing_ttl_s=self.config.processing_ttl_s,
             gateway_dedup_s=self.config.gateway_dedup_s,
         )
 
         self.route_manager = RouteManager(ttl_s=600.0)
 
-        self.active_session_id = CommandHandler.load_session_id(
-            self.config.session_state_file,
-            self.config.session_id,
-        )
-
-        # Chat -> Muse session mapping ("global": one shared session, "per_chat": isolated)
+        # Chat -> Muse session mapping: each group / private user has its own session
         self.session_mapper = SessionMapper(
-            mode=self.config.session_mode,
-            global_session_id=self.active_session_id,
             state_file=self.config.session_map_file,
             bindings=self.config.session_bindings,
-            global_state_file=self.config.session_state_file,
         )
 
         self.muse_service.interactions.managed_sessions.update(self.session_mapper.session_ids())
@@ -94,7 +86,6 @@ class QQAdapter(BaseAdapter):
             muse_service=self.muse_service,
             deduplicator=self.deduplicator,
             route_manager=self.route_manager,
-            session_id=self.active_session_id,
             session_mapper=self.session_mapper,
             on_login_required=self.enter_login_mode,
         )
@@ -306,16 +297,15 @@ class QQAdapter(BaseAdapter):
 
             loop = asyncio.get_running_loop()
             client = None
-            # Session this chat is currently bound to (own session in per_chat mode,
-            # the shared global one otherwise).
+            # Session this chat is currently bound to.
             chat_session_id = self.session_mapper.current(target_type, target_id)
-            if self.session_mapper.per_chat and not chat_session_id:
+            if not chat_session_id:
                 chat_session_id = "（尚未创建，发送第一条消息后自动建立）"
             try:
                 if cmd_name not in ("help", "__help__", "__usage_hint__", "new"):
                     client = await asyncio.to_thread(self.muse_service.create_client)
                     await asyncio.to_thread(client.connect)
-                # session_state_file=None: persistence is handled by SessionMapper.bind
+                # Persistence is handled by SessionMapper.bind
                 reply, new_sid = await loop.run_in_executor(
                     None,
                     CommandHandler.execute,
@@ -323,19 +313,14 @@ class QQAdapter(BaseAdapter):
                     cmd_args,
                     client,
                     chat_session_id,
-                    None,
                 )
                 if new_sid != chat_session_id:
                     self.session_mapper.bind(target_type, target_id, new_sid)
-                    if self.session_mapper.per_chat:
-                        if cmd_name == "new":
-                            self.outbound_pusher.track_session(new_sid, fresh=True)
-                        else:
-                            # Bound to an existing session: never replay its old history.
-                            await self.outbound_pusher.ensure_baseline(new_sid)
+                    if cmd_name == "new":
+                        self.outbound_pusher.track_session(new_sid, fresh=True)
                     else:
-                        self.active_session_id = new_sid
-                        self.outbound_pusher.session_id = new_sid
+                        # Bound to an existing session: never replay its old history.
+                        await self.outbound_pusher.ensure_baseline(new_sid)
             except CommandError as e:
                 reply = str(e)
             except ApprovalBlocked as e:
@@ -398,13 +383,12 @@ class QQAdapter(BaseAdapter):
             try:
                 # Resolve which Muse session this chat talks to
                 session_id, created = self.session_mapper.resolve(target_type, target_id)
-                if self.session_mapper.per_chat:
-                    if created:
-                        self.outbound_pusher.track_session(session_id, fresh=True)
-                        logger.info('New isolated Muse session %s for %s:%s', session_id, target_type, target_id)
-                    else:
-                        # Pre-bound / restored session: baseline once so old history is never replayed
-                        await self.outbound_pusher.ensure_baseline(session_id)
+                if created:
+                    self.outbound_pusher.track_session(session_id, fresh=True)
+                    logger.info('New isolated Muse session %s for %s:%s', session_id, target_type, target_id)
+                else:
+                    # Pre-bound / restored session: baseline once so old history is never replayed
+                    await self.outbound_pusher.ensure_baseline(session_id)
 
                 # Post message to Muse in strict chronological order
                 sent_mid = await loop.run_in_executor(
@@ -430,7 +414,7 @@ class QQAdapter(BaseAdapter):
                 if isinstance(e, LoginRequired):
                     logger.warning('Cookie 会话不可用，需要管理员登录。 error=%s', safe_error(e))
                     self.enter_login_mode()
-                    admin_target = self.config.get_default_private_target()
+                    admin_target = self.config.admin_target()
                     if target_type == "private" and is_admin:
                         reply = "【系统提示】发送消息时检测到 Muse 会话凭据已失效，已进入登录回落流程。\n请发送 /login 或 /login <邮箱> 获取验证码。"
                     else:
@@ -449,9 +433,6 @@ class QQAdapter(BaseAdapter):
                 if "status 404" in err_msg or "session not found" in err_msg or "not_found" in err_msg:
                     # Session expired / deleted on Muse: auto-recreate a new session!
                     new_sid = self.session_mapper.new_session(target_type, target_id)
-                    if not self.session_mapper.per_chat:
-                        self.active_session_id = new_sid
-                        self.outbound_pusher.session_id = new_sid
                     logger.warning('Session %s expired/not found on Muse, auto-created new session %s error=%s', session_id[:8], new_sid[:8], safe_error(e))
                     try:
                         sent_mid = await loop.run_in_executor(

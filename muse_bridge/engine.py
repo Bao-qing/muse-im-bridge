@@ -64,7 +64,7 @@ class BridgeEngine:
             if qq_adapter:
                 qq_adapter.enter_login_mode()
             if self.config.gateway.login_through_adapter == "qq":
-                admin_target = self.config.qq.get_default_private_target()
+                admin_target = self.config.qq.admin_target()
                 if admin_target:
                     asyncio.create_task(self._notify_admin_login(admin_target))
         elif cred_ok:

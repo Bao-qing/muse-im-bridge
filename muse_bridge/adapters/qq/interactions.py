@@ -19,6 +19,8 @@ logger = get_logger(__name__)
 # An expired flow intercepts one late message within this window, so a secret
 # typed just after the timeout is not forwarded; later messages are chat.
 LATE_INPUT_GRACE_S = 300
+# "2", "2 all" or "all 2": an option number for the queued approval card.
+APPROVAL_REPLY = re.compile(r"(\d{1,2})(\s*all)?|all\s*(\d{1,2})", re.IGNORECASE)
 
 
 class QQInteractions:
@@ -50,10 +52,31 @@ class QQInteractions:
         # Unbound chats do not implicitly acquire every other session's gate.
         return self.manager.pending_approvals(session_id) if session_id else []
 
-    async def display_approval(self, owner, item, msg_id):
-        fingerprint = item.context.get("fingerprint")
-        await self.reply(owner, self.adapter.muse_service.format_approval(item), msg_id)
-        item.context.setdefault("displayed_to", {})[owner[:2]] = fingerprint
+    @property
+    def protocol(self):
+        return self.adapter.muse_service.interaction_protocol
+
+    def approval_queue(self, session_id):
+        return self.protocol.approval_queue(session_id) if session_id else []
+
+    def approval_targets(self, owner, session_id):
+        """Sessions whose queue a bare numeric reply in this chat may answer."""
+        if self.pending(session_id):
+            return [session_id]
+        if owner[0] != "private":
+            return []
+        # Admin private chat also answers queues whose current card it was shown.
+        return [head.session_id for head in self.protocol.queue_heads()
+                if owner[:2] in head.context.get("displayed_to", {})]
+
+    async def display_approval(self, owner, item, msg_id, *, prefix="", items=None):
+        """Send one message holding the given cards and bind later choices to it."""
+        items = items or [item]
+        snapshots = [self.protocol.display_snapshot(i) for i in items]
+        text = "\n\n".join(self.adapter.muse_service.format_approval(i) for i in items)
+        await self.reply(owner, prefix + text, msg_id)
+        for shown, snapshot in zip(items, snapshots):
+            self.protocol.mark_displayed(shown, owner[:2], snapshot)
 
     async def handle(self, owner, content, msg_id, is_admin, session_id, event=None):
         async with self.manager.owner_lock(owner):
@@ -154,13 +177,26 @@ class QQInteractions:
                         await self.reply(owner, "请回复要填写的凭证卡，或先发送 /凭证 编号。", msg_id)
                     return True
 
-            # Muse refuses chat while this session has a pending approval.
-            pending = self.pending(session_id)
-            if pending:
-                if content.strip().isdigit() and len(pending) == 1:
-                    await self.handle_approval(owner, "/审批", f"{pending[0].id} {content.strip()}", session_id, msg_id, is_admin)
+            # A bare option number answers the card at the head of the queue.
+            reply = APPROVAL_REPLY.fullmatch(content.strip())
+            targets = self.approval_targets(owner, session_id) if reply else []
+            if len(targets) > 1:
+                await self.show_approval(owner, session_id, msg_id, all_sessions=True,
+                                         prefix="多个会话有待审批，请使用 /审批 编号 <数字>。\n\n")
+                return True
+            if targets:
+                target = targets[0]
+                number = reply.group(1) or reply.group(3)
+                if reply.group(2) or reply.group(3):
+                    await self.handle_approval(owner, "/审批", f"all {number}", target, msg_id, is_admin)
                 else:
-                    await self.show_approval(owner, session_id, msg_id)
+                    head = self.approval_queue(target)[0]
+                    await self.handle_approval(owner, "/审批", f"{head.id} {number}", target, msg_id, is_admin)
+                return True
+
+            # Muse refuses chat while this session has a pending approval.
+            if self.pending(session_id):
+                await self.show_approval(owner, session_id, msg_id)
                 return True
             return False
 
@@ -230,13 +266,64 @@ class QQInteractions:
         trace_event("qq.interactions", "login.completed", interaction_id=item.id, state=item.state)
         await self.reply(owner, "【登录成功】Cookie 与运行凭据已更新，后续消息正常转发。", msg_id)
 
-    async def show_approval(self, owner, session_id, msg_id, *, all_sessions=False):
-        pending = self.manager.pending_approvals() if all_sessions else self.pending(session_id)
-        if not pending:
-            await self.reply(owner, "当前没有待处理审批。", msg_id)
+    async def show_approval(self, owner, session_id, msg_id, *, all_sessions=False, prefix=""):
+        """Show only the head of each queue; the rest wait their turn."""
+        heads = self.protocol.queue_heads() if all_sessions else self.approval_queue(session_id)[:1]
+        if not heads:
+            await self.reply(owner, prefix + "当前没有待处理审批。", msg_id)
         else:
-            for item in pending:
-                await self.display_approval(owner, item, msg_id)
+            await self.display_approval(owner, heads[0], msg_id, prefix=prefix, items=heads)
+
+    async def advance_queue(self, owner, session_id, msg_id, text):
+        """Report a decision together with the next queued card, in one message."""
+        queue = self.approval_queue(session_id)
+        if not queue:
+            await self.reply(owner, text + "\n审批已全部完成，可以继续聊天。", msg_id)
+            return
+        head = queue[0]
+        # The background push then skips this chat, which already has the card.
+        await self.display_approval(owner, head, msg_id, prefix=text + "\n\n")
+
+    async def decide_all(self, owner, choice, session_id, msg_id):
+        """Apply the head card's option to every card queued when it was shown."""
+        queue = self.approval_queue(session_id)
+        head = queue[0] if queue else None
+        shown = head.context.get("queue_shown", {}).get(owner[:2]) if head else None
+        if not shown or shown[0][0] != head.id:
+            if head:
+                await self.display_approval(owner, head, msg_id, prefix="请先查看当前审批卡，再批量选择。\n\n")
+            else:
+                await self.reply(owner, "当前没有待处理审批。", msg_id)
+            return
+        options = head.context.get("options", [])
+        index = int(choice) - 1 if choice.isdigit() else -1
+        if not 0 <= index < len(options):
+            await self.display_approval(owner, head, msg_id, prefix="请选择当前审批卡实际提供的选项。\n\n")
+            return
+        wanted = options[index]
+        label = wanted["label"]
+        results = []
+        with self.protocol.deciding(session_id):
+            for remote_key, fingerprint in shown:
+                item = self.manager.items.get(remote_key)
+                if item is None or item.terminal:
+                    continue
+                # Match by meaning, never by position: cards may order options differently.
+                number = choice if item is head else next(
+                    (str(n) for n, o in enumerate(item.context.get("options", []), 1)
+                     if o["decision"] == wanted["decision"] and o.get("scope") == wanted.get("scope")), None)
+                if number is None:
+                    results.append(f"{item.id}：无相同选项，保留待审批")
+                    continue
+                try:
+                    text = await self.adapter.muse_service.submit_approval(
+                        item, number, expected_fingerprint=fingerprint)
+                except Exception as exc:
+                    logger.warning('decide_all unavailable: %s', safe_error(exc))
+                    text = "结果暂未确认"
+                results.append(f"{item.id}：{'已完成' if item.terminal else text.splitlines()[0]}")
+            await self.advance_queue(owner, session_id, msg_id,
+                                     f"【批量审批】「{label}」\n" + "\n".join(results))
 
     async def handle_approval(self, owner, command, args, session_id, msg_id, is_admin):
         if not is_admin:
@@ -246,6 +333,16 @@ class QQInteractions:
             await self.show_approval(owner, session_id, msg_id, all_sessions=owner[0] == "private")
             return
         parts = args.split()
+        if parts[0].lower() == "all":
+            targets = self.approval_targets(owner, session_id)
+            if len(parts) != 2 or len(targets) != 1:
+                text = ("当前没有待处理审批。" if not targets else
+                        "多个会话有待审批，请使用 /审批 编号 <数字> all。" if len(targets) > 1 else
+                        "发送 /审批 all <数字>，对当前队列全部使用该选项。")
+                await self.reply(owner, text, msg_id)
+                return
+            await self.decide_all(owner, parts[1], targets[0], msg_id)
+            return
         item = self.manager.items.get(parts[0].upper())
         if item is None or item.kind != "approval" or item.terminal:
             await self.reply(owner, "该审批不存在或已结束；消息未转发。", msg_id)
@@ -264,15 +361,21 @@ class QQInteractions:
         if choice is None or not fingerprint:
             await self.display_approval(owner, item, msg_id)
             return
-        try:
-            text = await self.adapter.muse_service.submit_approval(item, choice, expected_fingerprint=fingerprint)
-        except Exception as exc:
-            logger.warning('handle_approval unavailable: %s', safe_error(exc))
-            text = "审批结果暂未确认，未放行、未补发任何消息，请重新查看审批。"
-        await self.reply(owner, text, msg_id)
-        if not item.terminal:
-            # Re-display authoritative state; never reinterpret an old numeric choice.
-            await self.display_approval(owner, item, msg_id)
+        if len(parts) == 3 and parts[2].lower() == "all" and item is next(iter(self.approval_queue(item.session_id)), None):
+            await self.decide_all(owner, choice, item.session_id, msg_id)
+            return
+        with self.protocol.deciding(item.session_id):
+            try:
+                text = await self.adapter.muse_service.submit_approval(item, choice, expected_fingerprint=fingerprint)
+            except Exception as exc:
+                logger.warning('handle_approval unavailable: %s', safe_error(exc))
+                text = "审批结果暂未确认，未放行、未补发任何消息，请重新查看审批。"
+            if item.terminal:
+                await self.advance_queue(owner, item.session_id, msg_id, text)
+            else:
+                # Re-display authoritative state; never reinterpret an old numeric choice.
+                # The result's first line is the reason; the card itself follows once.
+                await self.display_approval(owner, item, msg_id, prefix=text.splitlines()[0] + "\n\n")
 
     def credential_candidates(self, owner, session_id):
         return [item for item in list(self.manager.items.values())

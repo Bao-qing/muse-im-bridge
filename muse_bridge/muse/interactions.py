@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import hashlib
 import json
 import os
@@ -64,7 +65,13 @@ class MuseInteractions:
         self.manager = service.interactions
         self._decision_locks = {}
         self._refresh_lock = asyncio.Lock()
+        self._notify_lock = asyncio.Lock()
         self._fetch_lock = threading.RLock()
+        # Per-session approval rounds: ids in display order, kept until the
+        # session's queue empties so positions read 1/2, 2/2 across decisions.
+        self._queue_lock = threading.Lock()
+        self._rounds = {}
+        self._deciding = {}
         self._capture_lock = threading.RLock()
         self._receipt_path = os.fspath(service.config.cookies_file) + ".captures.local.json"
         self._capture_receipts = set()
@@ -392,11 +399,85 @@ class MuseInteractions:
         async with self._refresh_lock:
             return await asyncio.to_thread(self.fetch_approvals)
 
+    @staticmethod
+    def _requested_at(item):
+        a = item.context.get("approval") or {}
+        for source in (a, a.get("runtime_request_trace") or {}):
+            value = source.get("requested_at_ms") if isinstance(source, dict) else None
+            if type(value) is int:
+                return value
+        return float("inf")
+
+    def approval_queue(self, session_id):
+        """Pending approvals of one session in stable display order; the head is shown."""
+        pending = sorted(self.manager.pending_approvals(session_id), key=self._requested_at)
+        with self._queue_lock:
+            if not pending:
+                self._rounds.pop(session_id, None)
+                return []
+            order = self._rounds.setdefault(session_id, [])
+            order.extend(i.id for i in pending if i.id not in order)
+            rank = {key: n for n, key in enumerate(order)}
+            return sorted(pending, key=lambda i: rank[i.id])
+
+    def queue_heads(self):
+        sessions = list(dict.fromkeys(i.session_id for i in self.manager.pending_approvals()))
+        with self._queue_lock:
+            for sid in [s for s in self._rounds if s not in sessions]:
+                del self._rounds[sid]
+        return [queue[0] for queue in map(self.approval_queue, sessions) if queue]
+
+    def queue_position(self, item):
+        """(position, round size, still pending) for the card header and hints."""
+        queue = self.approval_queue(item.session_id)
+        with self._queue_lock:
+            order = self._rounds.get(item.session_id, [])
+            if item.id not in order:
+                return 1, 1, len(queue)
+            return order.index(item.id) + 1, len(order), len(queue)
+
+    def display_snapshot(self, item):
+        """Taken before sending: what the user will see, to bind later choices."""
+        return (item.context.get("fingerprint"),
+                [(i.id, i.context.get("fingerprint")) for i in self.approval_queue(item.session_id)])
+
+    def mark_displayed(self, item, target, snapshot):
+        fingerprint, queue = snapshot
+        item.context.setdefault("displayed_to", {})[target] = fingerprint
+        item.context.setdefault("queue_shown", {})[target] = queue
+
+    @contextlib.contextmanager
+    def deciding(self, session_id):
+        """Hold back background pushes while a chat decides and advances this queue."""
+        with self._queue_lock:
+            self._deciding[session_id] = self._deciding.get(session_id, 0) + 1
+        try:
+            yield
+        finally:
+            with self._queue_lock:
+                left = self._deciding.get(session_id, 1) - 1
+                if left:
+                    self._deciding[session_id] = left
+                else:
+                    self._deciding.pop(session_id, None)
+
+    async def announce(self, item, notify):
+        """Push a queue head once; concurrent callers never send it twice."""
+        async with self._notify_lock:
+            if item.terminal or item.context.get("notified"):
+                return False
+            delivered = await notify(item, self.format_approval(item))
+            if delivered:
+                item.context["notified"] = True
+            return delivered
+
     def format_approval(self, item):
         a = item.context.get("approval") or {}
         d = a.get("display") or {}
-        lines = [f"【审批 {item.id}】{d.get('summary_title') or a.get('approval_phrase') or '待审批操作'}",
-                 f"Muse 会话：{item.session_id}", d.get("purpose_summary") or a.get("short_explanation") or ""]
+        position, total, waiting = self.queue_position(item)
+        lines = [f"【审批 {item.id}】{position}/{total}",
+                 d.get("summary_title") or a.get("approval_phrase") or "待审批操作",
+                 d.get("purpose_summary") or a.get("short_explanation") or ""]
         document = d.get("request_preview_document") or {}
         for block in document.get("blocks", []):
             if block.get("type") == "fields":
@@ -410,7 +491,10 @@ class MuseInteractions:
         lines.extend(f"选项 {n}｜{o['label']}" for n, o in enumerate(options, 1))
         if not options:
             lines.append("服务端未提供可验证的原生选项，请在 Muse 网页处理；")
-        lines.append(f"可直接回复数字审批，也可使用 /审批 {item.id} <数字> \n完成审批以继续聊天")
+        lines.append(f"可直接回复数字审批，也可使用 /审批 {item.id} <数字> ")
+        if waiting > 1:
+            lines.append(f"回复「<数字> all」或 /审批 all <数字>，对排队中的 {waiting} 项全部使用该选项")
+        lines.append("完成审批以继续聊天")
         return "\n".join(line for line in lines if line)
 
     async def submit_approval(self, item, choice, *, expected_fingerprint=None, automatic=False):
@@ -488,10 +572,10 @@ class MuseInteractions:
                             if policy.notify and item.terminal:
                                 await notify(item, text)
                             continue
-                    if not item.context.get("notified"):
-                        delivered = await notify(item, self.format_approval(item))
-                        if delivered:
-                            item.context["notified"] = True
+                # One card per session at a time; the next is pushed once the head ends.
+                for head in self.queue_heads():
+                    if head.session_id not in self._deciding:
+                        await self.announce(head, notify)
             except asyncio.CancelledError:
                 raise
             except Exception as e:

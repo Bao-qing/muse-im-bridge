@@ -74,12 +74,12 @@ def main(argv=None) -> int:
         print(f"Reply Mode:     {config.muse.reply_mode}")
         print("--- Adapters ---")
         if config.qq.enabled:
-            target_type, target_id = config.qq.resolve_push_target()
             wl_priv = len(config.qq.whitelist.get("private") or []) if isinstance(config.qq.whitelist.get("private"), list) else 0
             wl_grp = len([k for k in config.qq.whitelist if k != "private"])
             print(f"QQ Adapter:     ENABLED (AppID: {config.qq.app_id})")
             print(f"  Whitelist:    {wl_priv} private user(s), {wl_grp} group(s)")
-            print(f"  Push Subsys:  {'ENABLED' if config.qq.push.enabled else 'DISABLED'} -> {target_type}:{target_id or '(none)'}")
+            print(f"  Admin:        {'set' if config.qq.admin_target() else '(none: unbound pushes are dropped)'}")
+            print(f"  Catch-up:     {'ENABLED' if config.qq.catch_up_enabled else 'DISABLED'}")
         else:
             print("QQ Adapter:     DISABLED")
 
