@@ -719,16 +719,29 @@ class QQOutboundPusher:
             target = self._proactive_target(item.session_id)
             if target[1]:
                 targets.append(target)
-        targets.extend(("private", admin) for admin in self.config.admin_id)
+        admins = [("private", admin) for admin in self.config.admin_id if admin]
+        if self.config.approvals_in_place and item.kind == "approval":
+            # In-place push replaces the admin copy; admins are only the
+            # fallback when no chat of the session could show the card.
+            return (await self._deliver_interaction(item, text, targets)
+                    or await self._deliver_interaction(item, text, admins))
+        return await self._deliver_interaction(item, text, targets + admins)
+
+    async def _deliver_interaction(self, item, text, targets):
+        protocol = self.muse_service.interaction_protocol
         delivered = False
         for target_type, target_id in dict.fromkeys(targets):
             if not target_id:
                 continue
+            if (item.kind == "approval" and item.context.get("displayed_to", {}).get((target_type, target_id))
+                    == item.context.get("fingerprint")):
+                delivered = True  # This chat already shows the current card.
+                continue
             route = self.route_manager.get_latest_for_target(target_type, target_id, max_age_s=280.0)
-            fingerprint = item.context.get("fingerprint")
+            snapshot = protocol.display_snapshot(item) if item.kind == "approval" else None
             ok = await self._send_to_qq(target_type, target_id, text, [], [], [], route=route)
-            if ok and item.kind == "approval":
-                item.context.setdefault("displayed_to", {})[(target_type, target_id)] = fingerprint
+            if ok and snapshot is not None:
+                protocol.mark_displayed(item, (target_type, target_id), snapshot)
             delivered = bool(ok) or delivered
         return delivered
 

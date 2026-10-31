@@ -112,6 +112,7 @@ class QQConfig:
     admin_id: List[str] = dataclasses.field(default_factory=list)
     admin_only: bool = constants.DEFAULT_ADMIN_ONLY
     credentials_in_place: bool = False
+    approvals_in_place: bool = False
     access_requests: AccessRequestsConfig = dataclasses.field(default_factory=AccessRequestsConfig)
     session_id: str = ""
     whitelist: Dict[str, Union[List[str], str]] = dataclasses.field(default_factory=dict)
@@ -165,6 +166,8 @@ class QQConfig:
     def __post_init__(self):
         if type(self.credentials_in_place) is not bool:
             raise ValueError("adapters.qq.credentials_in_place must be a boolean")
+        if type(self.approvals_in_place) is not bool:
+            raise ValueError("adapters.qq.approvals_in_place must be a boolean")
 
     def is_admin(self, user_openid: str) -> bool:
         """Whether the user openid belongs to an administrator."""
@@ -419,6 +422,7 @@ class ConfigLoader:
             admin_id=admin_ids,
             admin_only=bool(_get_val(q_raw, "admin_only", constants.DEFAULT_ADMIN_ONLY)),
             credentials_in_place=q_raw.get("credentials_in_place", False),
+            approvals_in_place=q_raw.get("approvals_in_place", False),
             session_id=str(q_raw.get("session_id") or muse_cfg.session_id or ""),
             whitelist=q_raw.get("whitelist") or {},
             push=push_cfg,
