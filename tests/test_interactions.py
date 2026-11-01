@@ -96,7 +96,7 @@ class TestQQInteractions(unittest.IsolatedAsyncioTestCase):
 
         client.connect.side_effect = lambda: connection_threads.append(threading.get_ident())
         with patch.object(self.service, "create_client", side_effect=create_client):
-            with patch("muse_bridge.adapters.qq.adapter.CommandHandler.execute", return_value=("done", "s1")):
+            with patch("muse_bridge.gateway.chat.CommandHandler.execute", return_value=("done", "s1")):
                 await self.send("/sessions")
         self.assertEqual(len(connection_threads), 2)
         self.assertNotIn(event_thread, connection_threads)
