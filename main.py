@@ -86,7 +86,14 @@ def main(argv=None) -> int:
             print("QQ Adapter:     DISABLED")
 
         if config.onebot.enabled:
-            print(f"OneBot Adapter: ENABLED ({config.onebot.base_url}, Target Group: {config.onebot.target_group_id})")
+            ob = config.onebot
+            wl_priv = len(ob.whitelist.get("private") or []) if isinstance(ob.whitelist.get("private"), list) else 0
+            wl_grp = len([k for k in ob.whitelist if k != "private"])
+            print(f"OneBot Adapter: ENABLED ({ob.base_url})")
+            print(f"  Whitelist:    {wl_priv} private user(s), {wl_grp} group(s); group trigger: {ob.group_trigger}")
+            admin = ob.admin_target()
+            fallback = "unbound -> admin" if ob.unbound_push_to_admin else "unbound dropped"
+            print(f"  Admin:        {admin or '(none)'} ({fallback})")
         else:
             print("OneBot Adapter: DISABLED")
 

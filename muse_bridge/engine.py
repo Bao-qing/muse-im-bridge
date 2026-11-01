@@ -9,6 +9,7 @@ from .adapters.base import BaseAdapter
 from .adapters.onebot import OneBotAdapter
 from .adapters.qq import QQAdapter
 from .config.models import AppConfig
+from .gateway.chat import ChatGateway
 from .muse.service import MuseService
 from .muse.token_manager import MuseTokenManager
 from .observability import get_logger, safe_error
@@ -58,15 +59,16 @@ class BridgeEngine:
             cred_ok = False
             login_required = False
             logger.warning("启动验证暂不可用，保留 Cookie，后台重试。 error=%s", safe_error(exc))
-        qq_adapter = next((a for a in self.adapters if isinstance(a, QQAdapter)), None)
         if login_required:
             logger.warning("启动验证：Muse 会话凭据未就绪或已失效，进入登录回落流程。")
-            if qq_adapter:
-                qq_adapter.enter_login_mode()
-            if self.config.gateway.login_through_adapter == "qq":
-                admin_target = self.config.qq.admin_target()
+            for adapter in self.adapters:
+                if isinstance(adapter, ChatGateway):
+                    adapter.enter_login_mode()
+            login_adapter = self._login_adapter()
+            if login_adapter:
+                admin_target = login_adapter.config.admin_target()
                 if admin_target:
-                    asyncio.create_task(self._notify_admin_login(admin_target))
+                    asyncio.create_task(self._notify_admin_login(login_adapter, admin_target))
         elif cred_ok:
             logger.info('启动验证：Muse 会话凭据有效，认证通过。')
 
@@ -86,28 +88,33 @@ class BridgeEngine:
             pass
 
     async def _notify_interaction(self, item, text):
+        """Push a card through the adapters whose chats own its session.
+
+        A session no chat owns (e.g. the configured main session) goes to every
+        adapter, which then falls back to its own admin.
+        """
+        chats = [a for a in self.adapters if isinstance(a, ChatGateway) and a.is_enabled]
+        owners = [a for a in chats if a.owns_session(item.session_id)]
         delivered = False
-        for adapter in self.adapters:
-            if isinstance(adapter, QQAdapter) and adapter.is_enabled:
-                delivered = await adapter.notify_interaction(item, text) or delivered
+        for adapter in owners or chats:
+            delivered = await adapter.notify_interaction(item, text) or delivered
         return delivered
 
-    async def _notify_admin_login(self, admin_target: str) -> None:
-        await asyncio.sleep(4)  # Wait for QQ gateway to connect
-        qq_adapter = next((a for a in self.adapters if isinstance(a, QQAdapter)), None)
-        if qq_adapter:
-            try:
-                loop = asyncio.get_running_loop()
-                await loop.run_in_executor(
-                    None,
-                    qq_adapter.client.send_message,
-                    "private",
-                    admin_target,
-                    "【系统提示】Muse 会话凭据未就绪或已失效，已进入登录回落流程。\n您可直接在此私聊发送：\n/login <您的邮箱>\n即可获取验证码完成在线认证 ♪",
-                )
-                qq_adapter.enter_login_mode(admin_target)
-            except Exception as e:
-                logger.debug('Failed to notify admin for login: %s', safe_error(e))
+    def _login_adapter(self):
+        """Adapter whose admin is asked to log in (``gateway.login_through_adapter``)."""
+        name = self.config.gateway.login_through_adapter
+        return next((a for a in self.adapters if isinstance(a, ChatGateway) and a.name == name), None)
+
+    async def _notify_admin_login(self, adapter, admin_target: str) -> None:
+        await asyncio.sleep(4)  # Wait for the chat gateway to connect
+        try:
+            await adapter.send_notice(
+                admin_target,
+                "【系统提示】Muse 会话凭据未就绪或已失效，已进入登录回落流程。\n您可直接在此私聊发送：\n/login <您的邮箱>\n即可获取验证码完成在线认证 ♪",
+            )
+            adapter.enter_login_mode(admin_target)
+        except Exception as e:
+            logger.debug('Failed to notify admin for login: %s', safe_error(e))
 
     async def stop(self) -> None:
         self._running = False

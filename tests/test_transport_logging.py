@@ -397,10 +397,10 @@ class GatewayLoggingTests(unittest.IsolatedAsyncioTestCase):
             await asyncio.sleep(0)
             callback.assert_awaited_once_with(message)
             self.assertEqual(connect.call_count, 2)
-            expected = "wss://onebot.test/ws?sig=private-signature/&access_token=private-ob-token"
+            expected = "wss://onebot.test/ws?sig=private-signature&access_token=private-ob-token"
             self.assertEqual([c.args for c in connect.call_args_list], [(expected,), (expected,)])
             self.assertEqual(ws.recv.await_count, 2)
-            self.assertEqual(sleep.await_args_list[0].args, (5.0,))
+            self.assertEqual(sleep.await_args_list[0].args, (1.0,))
             logs = json.dumps(cap.events) + str(cap.runtime)
             for secret in ("private-chat", "private-otp-123456", "private-quote", "private-unknown",
                            "private-ob-token", "private-signature", "private-websocket-error", "private-connect-error"):

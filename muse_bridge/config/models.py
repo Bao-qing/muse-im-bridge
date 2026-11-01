@@ -11,7 +11,7 @@ import ipaddress
 import json
 import os
 import urllib.request
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, ClassVar, Dict, List, Optional, Union
 
 from . import constants
 
@@ -86,11 +86,36 @@ class AccessRequestsConfig:
             raise ValueError("adapters.qq.access_requests.state_file must be a nonempty path")
 
 
+def _normalize_whitelist(raw: Any) -> Dict[str, Union[List[str], str]]:
+    """Whitelist as ``{"private": [user...], "<group id>": "*" | [user...]}``.
+
+    Ids become strings (OneBot ids are numbers in JSON). The legacy OneBot
+    form ``{"groups": [gid...]}`` opens each listed group to all members.
+    """
+    if not isinstance(raw, dict):
+        return {}
+    out: Dict[str, Union[List[str], str]] = {}
+    for key, value in raw.items():
+        if key == "groups" and isinstance(value, list):
+            for gid in value:
+                if gid is not None and str(gid).strip():
+                    out[str(gid).strip()] = "*"
+            continue
+        if value == "*":
+            out[str(key)] = "*"
+        elif isinstance(value, list):
+            out[str(key)] = [str(v) for v in value if v is not None and str(v).strip()]
+    return out
+
+
 @dataclasses.dataclass
-class QQConfig:
+class ChatConfig:
+    """Settings shared by every chat platform behind the gateway layer."""
+
+    # Validation messages name the config section, e.g. ``adapters.qq``.
+    section: ClassVar[str] = "adapters.chat"
+
     enabled: bool = True
-    app_id: str = ""
-    app_secret: str = ""
     admin_id: List[str] = dataclasses.field(default_factory=list)
     admin_only: bool = constants.DEFAULT_ADMIN_ONLY
     # Send messages of a session with no bound chat to the first admin.
@@ -100,8 +125,6 @@ class QQConfig:
     access_requests: AccessRequestsConfig = dataclasses.field(default_factory=AccessRequestsConfig)
     whitelist: Dict[str, Union[List[str], str]] = dataclasses.field(default_factory=dict)
     delivered_file: str = "data/qq_delivered.jsonl"
-    proxy_url: Optional[str] = None
-    download_proxy: str = ""
     debug: bool = False
 
     # Each group / private user gets its own Muse session.
@@ -116,6 +139,7 @@ class QQConfig:
 
     # Outbound push: watermark file, startup catch-up and delivery timing.
     push_state_file: str = "data/qq_push_state.json"
+    routes_file: str = "data/qq_routes.json"
     catch_up_enabled: bool = constants.DEFAULT_CATCH_UP_ENABLED
     catch_up_window_s: int = constants.DEFAULT_CATCH_UP_WINDOW_S
     catch_up_max_messages: int = constants.DEFAULT_CATCH_UP_MAX_MESSAGES
@@ -123,10 +147,9 @@ class QQConfig:
     in_flight_ttl_s: int = constants.DEFAULT_IN_FLIGHT_TTL_S
     processing_ttl_s: int = constants.DEFAULT_PROCESSING_TTL_S
 
-    # Chunking & budget
+    # Chunking
     chunk_chars: int = constants.DEFAULT_CHUNK_CHARS
     max_chunks: int = constants.DEFAULT_MAX_CHUNKS
-    max_active_chunks: int = constants.DEFAULT_MAX_ACTIVE_CHUNKS
 
     # Media limits
     max_image_bytes: int = constants.DEFAULT_MAX_IMAGE_BYTES
@@ -135,45 +158,73 @@ class QQConfig:
     max_video_upload_bytes: int = constants.DEFAULT_MAX_VIDEO_UPLOAD_BYTES
     file_ref_threshold_bytes: int = constants.DEFAULT_FILE_REF_THRESHOLD_BYTES
 
+    # Timeouts
+    gateway_dedup_s: int = constants.DEFAULT_GATEWAY_DEDUP_S
+    download_timeout_s: int = constants.DEFAULT_DOWNLOAD_TIMEOUT_S
+
+    def __post_init__(self):
+        for name in ("credentials_in_place", "approvals_in_place", "unbound_push_to_admin"):
+            if type(getattr(self, name)) is not bool:
+                raise ValueError(f"{self.section}.{name} must be a boolean")
+
+    def is_admin(self, user_id: str) -> bool:
+        """Whether the user id belongs to an administrator."""
+        return bool(user_id and user_id in self.admin_id)
+
+    def admin_target(self) -> Optional[str]:
+        """First administrator id: private fallback for messages with no chat."""
+        return next((a for a in self.admin_id if a and a != "*"), None)
+
+
+@dataclasses.dataclass
+class QQConfig(ChatConfig):
+    section: ClassVar[str] = "adapters.qq"
+
+    app_id: str = ""
+    app_secret: str = ""
+    proxy_url: Optional[str] = None
+    download_proxy: str = ""
+    # Active (non-reply) messages per outbound item; QQ limits active sends.
+    max_active_chunks: int = constants.DEFAULT_MAX_ACTIVE_CHUNKS
+
     # Protocol & Headers
     ws_guid: str = constants.DEFAULT_WS_GUID
     user_agent: str = constants.DEFAULT_USER_AGENT
 
-    # Timeouts
-    gateway_dedup_s: int = constants.DEFAULT_GATEWAY_DEDUP_S
-    download_timeout_s: int = constants.DEFAULT_DOWNLOAD_TIMEOUT_S
     push_timeout_s: int = constants.DEFAULT_PUSH_TIMEOUT_S
     push_grace_s: int = constants.DEFAULT_PUSH_GRACE_S
     poll_timeout_s: int = constants.DEFAULT_POLL_TIMEOUT_S
     poll_interval_s: int = constants.DEFAULT_POLL_INTERVAL_S
     poll_quiet_polls: int = constants.DEFAULT_POLL_QUIET_POLLS
 
-    def __post_init__(self):
-        if type(self.credentials_in_place) is not bool:
-            raise ValueError("adapters.qq.credentials_in_place must be a boolean")
-        if type(self.approvals_in_place) is not bool:
-            raise ValueError("adapters.qq.approvals_in_place must be a boolean")
-        if type(self.unbound_push_to_admin) is not bool:
-            raise ValueError("adapters.qq.unbound_push_to_admin must be a boolean")
 
-    def is_admin(self, user_openid: str) -> bool:
-        """Whether the user openid belongs to an administrator."""
-        return bool(user_openid and user_openid in self.admin_id)
-
-    def admin_target(self) -> Optional[str]:
-        """First administrator openid: private fallback for messages with no chat."""
-        return next((a for a in self.admin_id if a and a != "*"), None)
+def _onebot_access_requests() -> AccessRequestsConfig:
+    return AccessRequestsConfig(state_file="data/onebot_access.local.json")
 
 
 @dataclasses.dataclass
-class OneBotConfig:
+class OneBotConfig(ChatConfig):
+    section: ClassVar[str] = "adapters.onebot"
+
     enabled: bool = False
+    access_requests: AccessRequestsConfig = dataclasses.field(default_factory=_onebot_access_requests)
+    delivered_file: str = "data/onebot_delivered.jsonl"
+    session_map_file: str = "data/onebot_session_map.json"
+    push_state_file: str = "data/onebot_push_state.json"
+    routes_file: str = "data/onebot_routes.json"
+
     base_url: str = ""
     access_token: str = ""
     ws_url: str = ""
-    target_group_id: Optional[int] = None
-    session_id: str = ""
-    whitelist: Dict[str, Any] = dataclasses.field(default_factory=dict)
+    # Which group messages reach Muse: "all", "at" (@bot or a / command), "prefix" (/ only).
+    group_trigger: str = constants.DEFAULT_ONEBOT_GROUP_TRIGGER
+
+    def __post_init__(self):
+        super().__post_init__()
+        self.whitelist = _normalize_whitelist(self.whitelist)
+        self.admin_id = [str(a) for a in self.admin_id if a is not None and str(a).strip()]
+        if self.group_trigger not in {"all", "at", "prefix"}:
+            raise ValueError("adapters.onebot.group_trigger must be all, at, or prefix")
 
 
 @dataclasses.dataclass
@@ -304,67 +355,68 @@ class ConfigLoader:
             if detected:
                 muse_cfg.client_ip = detected
 
-        # 2. QQ config (check adapters.qq or qq_official / qq)
+        # 2. Chat platforms (adapters.qq / adapters.onebot) share one field set.
         adapters_raw = raw_data.get("adapters", {})
+
+        def _chat_fields(raw: dict, cls) -> Dict[str, Any]:
+            defaults = {f.name: (f.default if f.default is not dataclasses.MISSING else f.default_factory())
+                        for f in dataclasses.fields(cls)}
+            admin_raw = raw.get("admin_id") or []
+            if isinstance(admin_raw, list):
+                admin_ids = [str(a) for a in admin_raw if a]
+            elif isinstance(admin_raw, (str, int)) and admin_raw:
+                admin_ids = [str(admin_raw)]
+            else:
+                admin_ids = []
+            access_raw = raw.get("access_requests", {})
+            if not isinstance(access_raw, dict):
+                raise ValueError(f"{cls.section}.access_requests must be an object")
+            access_cfg = AccessRequestsConfig(
+                enabled=access_raw.get("enabled", True),
+                auto_approve=access_raw.get("auto_approve", False),
+                state_file=access_raw.get("state_file", defaults["access_requests"].state_file),
+            )
+
+            def _int(key: str) -> int:
+                return int(_get_val(raw, key, defaults[key]))
+
+            return dict(
+                access_requests=access_cfg,
+                enabled=raw.get("enabled", defaults["enabled"]),
+                admin_id=admin_ids,
+                admin_only=bool(_get_val(raw, "admin_only", constants.DEFAULT_ADMIN_ONLY)),
+                unbound_push_to_admin=_get_val(raw, "unbound_push_to_admin",
+                                               constants.DEFAULT_UNBOUND_PUSH_TO_ADMIN),
+                credentials_in_place=raw.get("credentials_in_place", False),
+                approvals_in_place=_get_val(raw, "approvals_in_place",
+                                            constants.DEFAULT_APPROVALS_IN_PLACE),
+                whitelist=raw.get("whitelist") or {},
+                delivered_file=raw.get("delivered_file", defaults["delivered_file"]),
+                session_map_file=raw.get("session_map_file", defaults["session_map_file"]),
+                session_bindings={
+                    str(k): str(v) for k, v in (raw.get("session_bindings") or {}).items() if k and v
+                },
+                session_hot_window_s=int(raw.get("session_hot_window_s", 45)),
+                session_sweep_s=int(raw.get("session_sweep_s", 60)),
+                push_state_file=raw.get("push_state_file", defaults["push_state_file"]),
+                routes_file=raw.get("routes_file", defaults["routes_file"]),
+                catch_up_enabled=bool(_get_val(raw, "catch_up_enabled", constants.DEFAULT_CATCH_UP_ENABLED)),
+                **{key: _int(key) for key in (
+                    "catch_up_window_s", "catch_up_max_messages", "recheck_sleep_s", "in_flight_ttl_s",
+                    "processing_ttl_s", "chunk_chars", "max_chunks", "max_image_bytes", "max_file_bytes",
+                    "max_video_bytes", "max_video_upload_bytes", "file_ref_threshold_bytes",
+                    "gateway_dedup_s", "download_timeout_s")},
+            )
+
         q_raw = adapters_raw.get("qq") or raw_data.get("qq_official") or raw_data.get("qq") or {}
-
-        admin_raw = q_raw.get("admin_id") or []
-        if isinstance(admin_raw, list):
-            admin_ids = [str(a) for a in admin_raw if a]
-        elif isinstance(admin_raw, str) and admin_raw:
-            admin_ids = [admin_raw]
-        else:
-            admin_ids = []
-
-        access_raw = q_raw.get("access_requests", {})
-        if not isinstance(access_raw, dict):
-            raise ValueError("adapters.qq.access_requests must be an object")
-        access_cfg = AccessRequestsConfig(
-            enabled=access_raw.get("enabled", True),
-            auto_approve=access_raw.get("auto_approve", False),
-            state_file=access_raw.get("state_file", "data/qq_access.local.json"),
-        )
-
         qq_cfg = QQConfig(
-            access_requests=access_cfg,
-            enabled=q_raw.get("enabled", True),
+            **_chat_fields(q_raw, QQConfig),
             app_id=str(q_raw.get("app_id") or os.environ.get("QQ_APP_ID") or ""),
             app_secret=str(q_raw.get("app_secret") or os.environ.get("QQ_APP_SECRET") or ""),
-            admin_id=admin_ids,
-            admin_only=bool(_get_val(q_raw, "admin_only", constants.DEFAULT_ADMIN_ONLY)),
-            unbound_push_to_admin=_get_val(q_raw, "unbound_push_to_admin",
-                                           constants.DEFAULT_UNBOUND_PUSH_TO_ADMIN),
-            credentials_in_place=q_raw.get("credentials_in_place", False),
-            approvals_in_place=_get_val(q_raw, "approvals_in_place",
-                                        constants.DEFAULT_APPROVALS_IN_PLACE),
-            whitelist=q_raw.get("whitelist") or {},
-            delivered_file=q_raw.get("delivered_file", "data/qq_delivered.jsonl"),
             proxy_url=q_raw.get("proxy_url") or muse_cfg.proxy_url,
             download_proxy=q_raw.get("download_proxy") or "",
             debug=q_raw.get("debug", False) or _env_bool("QQ_DEBUG", False),
-            session_map_file=q_raw.get("session_map_file", "data/qq_session_map.json"),
-            session_bindings={
-                str(k): str(v) for k, v in (q_raw.get("session_bindings") or {}).items() if k and v
-            },
-            session_hot_window_s=int(q_raw.get("session_hot_window_s", 45)),
-            session_sweep_s=int(q_raw.get("session_sweep_s", 60)),
-            push_state_file=q_raw.get("push_state_file", "data/qq_push_state.json"),
-            catch_up_enabled=bool(_get_val(q_raw, "catch_up_enabled", constants.DEFAULT_CATCH_UP_ENABLED)),
-            catch_up_window_s=int(_get_val(q_raw, "catch_up_window_s", constants.DEFAULT_CATCH_UP_WINDOW_S)),
-            catch_up_max_messages=int(_get_val(q_raw, "catch_up_max_messages", constants.DEFAULT_CATCH_UP_MAX_MESSAGES)),
-            recheck_sleep_s=int(_get_val(q_raw, "recheck_sleep_s", constants.DEFAULT_RECHECK_SLEEP_S)),
-            in_flight_ttl_s=int(_get_val(q_raw, "in_flight_ttl_s", constants.DEFAULT_IN_FLIGHT_TTL_S)),
-            processing_ttl_s=int(_get_val(q_raw, "processing_ttl_s", constants.DEFAULT_PROCESSING_TTL_S)),
-            chunk_chars=int(_get_val(q_raw, "chunk_chars", constants.DEFAULT_CHUNK_CHARS)),
-            max_chunks=int(_get_val(q_raw, "max_chunks", constants.DEFAULT_MAX_CHUNKS)),
             max_active_chunks=int(_get_val(q_raw, "max_active_chunks", constants.DEFAULT_MAX_ACTIVE_CHUNKS)),
-            max_image_bytes=int(_get_val(q_raw, "max_image_bytes", constants.DEFAULT_MAX_IMAGE_BYTES)),
-            max_file_bytes=int(_get_val(q_raw, "max_file_bytes", constants.DEFAULT_MAX_FILE_BYTES)),
-            max_video_bytes=int(_get_val(q_raw, "max_video_bytes", constants.DEFAULT_MAX_VIDEO_BYTES)),
-            max_video_upload_bytes=int(_get_val(q_raw, "max_video_upload_bytes", constants.DEFAULT_MAX_VIDEO_UPLOAD_BYTES)),
-            file_ref_threshold_bytes=int(_get_val(q_raw, "file_ref_threshold_bytes", constants.DEFAULT_FILE_REF_THRESHOLD_BYTES)),
-            gateway_dedup_s=int(_get_val(q_raw, "gateway_dedup_s", constants.DEFAULT_GATEWAY_DEDUP_S)),
-            download_timeout_s=int(_get_val(q_raw, "download_timeout_s", constants.DEFAULT_DOWNLOAD_TIMEOUT_S)),
             push_timeout_s=int(_get_val(q_raw, "push_timeout_s", constants.DEFAULT_PUSH_TIMEOUT_S)),
             push_grace_s=int(_get_val(q_raw, "push_grace_s", constants.DEFAULT_PUSH_GRACE_S)),
             poll_timeout_s=int(_get_val(q_raw, "poll_timeout_s", constants.DEFAULT_POLL_TIMEOUT_S)),
@@ -374,16 +426,15 @@ class ConfigLoader:
             user_agent=str(_get_val(q_raw, "user_agent", constants.DEFAULT_USER_AGENT)),
         )
 
-        # 3. OneBot config
+        # 3. OneBot config. The token may come from the environment instead of the file.
         ob_raw = adapters_raw.get("onebot") or raw_data.get("onebot") or {}
         ob_cfg = OneBotConfig(
-            enabled=ob_raw.get("enabled", False),
-            base_url=ob_raw.get("base_url", ""),
-            access_token=ob_raw.get("access_token", ""),
-            ws_url=ob_raw.get("ws_url", ""),
-            target_group_id=ob_raw.get("target_group_id"),
-            session_id=str(ob_raw.get("session_id") or muse_cfg.session_id or ""),
-            whitelist=ob_raw.get("whitelist") or {},
+            **_chat_fields(ob_raw, OneBotConfig),
+            debug=bool(ob_raw.get("debug", False)),
+            base_url=str(ob_raw.get("base_url") or os.environ.get("ONEBOT_BASE_URL") or ""),
+            access_token=str(ob_raw.get("access_token") or os.environ.get("ONEBOT_ACCESS_TOKEN") or ""),
+            ws_url=str(ob_raw.get("ws_url") or os.environ.get("ONEBOT_WS_URL") or ""),
+            group_trigger=ob_raw.get("group_trigger", constants.DEFAULT_ONEBOT_GROUP_TRIGGER),
         )
 
         # 4. Gateway config
