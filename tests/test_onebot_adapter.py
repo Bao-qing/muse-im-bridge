@@ -297,6 +297,27 @@ class TestOneBotInbound(unittest.IsolatedAsyncioTestCase):
             await adapter.handle_event(event)
             self.assertIn("[file下载失败：NapCat 未提供可下载地址]", muse.post_message.call_args.args[1])
 
+    async def test_admin_fills_group_credential_card_in_place_by_default(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            adapter, muse = _make_adapter(tmp)
+            adapter.session_mapper.bind("group", "G1", "s1")
+            item = muse.interactions.add("credential", session_id="s1", ttl=0,
+                                         context={"page_url": "https://example.test/login", "capture": "sign_in"})
+            muse.interactions.remember_credential_message("group", "G1", {"id": "555"}, item)
+
+            def quoted(uid, mid):
+                event = _group("G1", uid, "account\npassword", mid)
+                event["message"].insert(0, {"type": "reply", "data": {"id": "555"}})
+                return event
+
+            await adapter.handle_event(quoted(5, 1))
+            muse.capture_credential.assert_not_called()
+            self.assertEqual(_sent_texts(adapter)[-1], "仅管理员可以填写凭证。")
+            await adapter.handle_event(quoted("A1", 2))
+            muse.capture_credential.assert_called_once_with(item, "password")
+            self.assertEqual(_sent_texts(adapter)[-1], "【凭证已保存】")
+            muse.post_message.assert_not_called()
+
     async def test_quoted_credential_prompt_is_found_by_reply_segment(self):
         with tempfile.TemporaryDirectory() as tmp:
             adapter, muse = _make_adapter(tmp)
