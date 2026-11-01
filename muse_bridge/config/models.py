@@ -96,7 +96,7 @@ class QQConfig:
     # Send messages of a session with no bound chat to the first admin.
     unbound_push_to_admin: bool = constants.DEFAULT_UNBOUND_PUSH_TO_ADMIN
     credentials_in_place: bool = False
-    approvals_in_place: bool = False
+    approvals_in_place: bool = constants.DEFAULT_APPROVALS_IN_PLACE
     access_requests: AccessRequestsConfig = dataclasses.field(default_factory=AccessRequestsConfig)
     whitelist: Dict[str, Union[List[str], str]] = dataclasses.field(default_factory=dict)
     delivered_file: str = "data/qq_delivered.jsonl"
@@ -335,7 +335,8 @@ class ConfigLoader:
             unbound_push_to_admin=_get_val(q_raw, "unbound_push_to_admin",
                                            constants.DEFAULT_UNBOUND_PUSH_TO_ADMIN),
             credentials_in_place=q_raw.get("credentials_in_place", False),
-            approvals_in_place=q_raw.get("approvals_in_place", False),
+            approvals_in_place=_get_val(q_raw, "approvals_in_place",
+                                        constants.DEFAULT_APPROVALS_IN_PLACE),
             whitelist=q_raw.get("whitelist") or {},
             delivered_file=q_raw.get("delivered_file", "data/qq_delivered.jsonl"),
             proxy_url=q_raw.get("proxy_url") or muse_cfg.proxy_url,
