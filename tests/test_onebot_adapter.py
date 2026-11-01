@@ -355,3 +355,45 @@ class TestOneBotOutbound(unittest.IsolatedAsyncioTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestEngineRouting(unittest.IsolatedAsyncioTestCase):
+    def _engine(self, qq_owns, onebot_owns, login_through="onebot"):
+        from muse_bridge.engine import BridgeEngine
+        from muse_bridge.adapters.qq.adapter import QQAdapter
+        engine = BridgeEngine.__new__(BridgeEngine)
+        engine.config = mock.MagicMock()
+        engine.config.gateway.login_through_adapter = login_through
+        qq = mock.MagicMock(spec=QQAdapter)
+        ob = mock.MagicMock(spec=OneBotAdapter)
+        for adapter, name, owns in ((qq, "qq", qq_owns), (ob, "onebot", onebot_owns)):
+            adapter.name = name
+            adapter.is_enabled = True
+            adapter.owns_session.return_value = owns
+            adapter.notify_interaction = mock.AsyncMock(return_value=True)
+            adapter.send_notice = mock.AsyncMock()
+        engine.adapters = [qq, ob]
+        return engine, qq, ob
+
+    async def test_card_goes_only_to_the_adapter_owning_the_session(self):
+        engine, qq, ob = self._engine(qq_owns=False, onebot_owns=True)
+        item = mock.Mock(session_id="S")
+        self.assertTrue(await engine._notify_interaction(item, "card"))
+        ob.notify_interaction.assert_awaited_once_with(item, "card")
+        qq.notify_interaction.assert_not_awaited()
+
+    async def test_unowned_session_goes_to_every_adapter(self):
+        engine, qq, ob = self._engine(qq_owns=False, onebot_owns=False)
+        await engine._notify_interaction(mock.Mock(session_id="MAIN"), "card")
+        qq.notify_interaction.assert_awaited_once()
+        ob.notify_interaction.assert_awaited_once()
+
+    async def test_login_notice_uses_the_configured_adapter(self):
+        engine, qq, ob = self._engine(False, False, login_through="onebot")
+        self.assertIs(engine._login_adapter(), ob)
+        with mock.patch("muse_bridge.engine.asyncio.sleep", new=mock.AsyncMock()):
+            await engine._notify_admin_login(ob, "A1")
+        ob.send_notice.assert_awaited_once()
+        self.assertEqual(ob.send_notice.await_args.args[0], "A1")
+        ob.enter_login_mode.assert_called_once_with("A1")
+        qq.send_notice.assert_not_awaited()
