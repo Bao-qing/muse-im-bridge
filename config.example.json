@@ -42,10 +42,27 @@
       "base_url": "https://onebot.example.com",
       "access_token": "YOUR_ONEBOT_TOKEN",
       "ws_url": "wss://onebot.example.com",
-      "target_group_id": null,
+      "admin_id": [
+        "YOUR_ADMIN_QQ"
+      ],
+      "admin_only": true,
+      "unbound_push_to_admin": true,
+      "approvals_in_place": true,
+      "group_trigger": "all",
+      "access_requests": {
+        "enabled": true,
+        "auto_approve": false,
+        "state_file": "data/onebot_access.local.json"
+      },
+      "delivered_file": "data/onebot_delivered.jsonl",
+      "session_map_file": "data/onebot_session_map.json",
+      "push_state_file": "data/onebot_push_state.json",
+      "routes_file": "data/onebot_routes.json",
       "whitelist": {
-        "private": [],
-        "groups": []
+        "private": [
+          "YOUR_ADMIN_QQ"
+        ],
+        "YOUR_GROUP_ID": "*"
       }
     }
   },

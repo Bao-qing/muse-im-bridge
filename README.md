@@ -22,18 +22,25 @@ muse_bridge/
 │   │   ├── client/           # 底层 Noise_XX 加密协议与 WebSocket 传输客户端
 │   │   ├── token_manager.py  # 自动凭证推导与静默续期（cookies -> vm_id -> mint）
 │   │   └── service.py        # 会话交互、附件处理、工作区文件读写、主动事件流订阅
-│   ├── adapters/             # 适配器体系
+│   ├── gateway/              # 与平台无关的 Gateway 层（对接 Muse）
+│   │   ├── chat.py           # ChatGateway：会话映射、斜杠命令、登录/凭证/审批输入、入站流水线
+│   │   ├── outbound.py       # OutboundDispatcher：订阅 Muse 事件、路由、审批卡投递（平台只实现 _deliver）
+│   │   ├── interactions.py   # 登录、凭证、审批数字回复的输入路由
+│   │   ├── access.py         # 白名单申请与本地审批
+│   │   └── routes.py         # Muse 消息 ID -> 聊天目的地
+│   ├── adapters/             # 平台适配器（只负责解析事件与调用平台 API）
 │   │   ├── base.py           # BaseAdapter 抽象基类
 │   │   ├── qq/               # QQ 官方机器人适配器
-│   │   │   ├── adapter.py    # QQAdapter 总控（协调网关与主动推送子组件）
+│   │   │   ├── adapter.py    # QQAdapter：解析 QQ 事件、被动/主动回复
 │   │   │   ├── client.py     # QQ OpenAPI 客户端（鉴权、发消息、上传富媒体）
-│   │   │   ├── gateway.py    # QQ WebSocket 网关（心跳与事件分发）
-│   │   │   ├── outbound.py   # QQOutboundPusher（出站推送：发回会话绑定的聊天，未绑定时发管理员）
+│   │   │   ├── gateway.py    # QQ WebSocket 事件源（心跳与事件分发）
+│   │   │   ├── outbound.py   # QQOutboundPusher：被动回复、主动配额、富媒体上传
 │   │   │   └── ws_transport.py # 兼容 QQ 101 Connection:close 的底层 WS 客户端
 │   │   └── onebot/           # OneBot v11 (NapCat) 适配器
-│   │       ├── adapter.py    # OneBotAdapter 总控
-│   │       ├── client.py     # NapCat HTTP API 客户端（标准 Array 消息段结构）
-│   │       └── gateway.py    # NapCat WebSocket 实时事件监听
+│   │       ├── adapter.py    # OneBotAdapter：消息段解析、群触发策略、自身/重复过滤
+│   │       ├── client.py     # NapCat HTTP API 客户端（Array 消息段、retcode 校验）
+│   │       ├── gateway.py    # NapCat 正向 WebSocket 事件源（退避重连）
+│   │       └── outbound.py   # OneBotOutboundPusher：文本分段、base64 图片/视频、文件上传
 │   └── engine.py             # BridgeEngine 协调调度引擎
 ├── tools/
 │   └── export_cookies.js     # 网页端 Cookie 一键导出辅助工具
@@ -104,7 +111,11 @@ cp config.example.json config.json
       "base_url": "https://onebot.example.com",
       "access_token": "YOUR_ONEBOT_TOKEN",
       "ws_url": "wss://onebot.example.com",
-      "target_group_id": null
+      "admin_id": ["YOUR_ADMIN_QQ"],
+      "whitelist": {
+        "private": ["YOUR_ADMIN_QQ"],
+        "YOUR_GROUP_ID": "*"
+      }
     }
   }
 }
@@ -141,7 +152,7 @@ python -m unittest discover tests
   "muse": {
     "cookies_file": "cookies.json",                 // [可选] 网页 cookies 路径，用于自动提取 vm_id 和静默续期 token (默认: "cookies.json")
     "mint_file": ".mint.json",                     // [可选] 缓存的 mint token 路径 (默认: ".mint.json")
-    "session_id": "YOUR_MUSE_SESSION_ID",          // [可选] OneBot 默认使用的 Muse 会话 UUID；QQ 按聊天自动建会话，不使用此项
+    "session_id": "YOUR_MUSE_SESSION_ID",          // [可选] 主会话 UUID，仅用于其审批卡推送给管理员；QQ 与 OneBot 都按聊天自动建会话，不使用此项
     "vm_id": "",                                   // [可选] 虚拟机 ID，留空则自动从 cookies 或 mint token 解析
     "host": "hatch.metaaivm.com",                  // [可选] Muse 网关域名 (默认: "hatch.metaaivm.com")
     "client_ip": "",                               // [可选] 出口公网 IP，留空则启动时自动探测
@@ -201,12 +212,17 @@ python -m unittest discover tests
       "base_url": "https://onebot.example.com",    // [必填-若启用] OneBot HTTP API 地址
       "access_token": "YOUR_ONEBOT_TOKEN",         // [必填-若启用] OneBot API Bearer Token
       "ws_url": "wss://onebot.example.com",        // [必填-若启用] OneBot 正向 WebSocket 事件流地址
-      "target_group_id": null,                     // [可选] 默认交互/推送的 QQ 群号
-      "session_id": "",                            // [可选] 独立绑定的 Muse 会话 ID，留空复用 muse.session_id
-      "whitelist": {                               // [可选] OneBot 交互白名单
-        "private": [],                             // 允许私聊的用户 QQ 号列表
-        "groups": []                               // 允许群聊的群号列表 ("*" 表示全员开放)
+                                                   // access_token / base_url / ws_url 也可用环境变量
+                                                   // ONEBOT_ACCESS_TOKEN / ONEBOT_BASE_URL / ONEBOT_WS_URL 提供；ws_url 留空时由 base_url 推出
+      "admin_id": ["YOUR_ADMIN_QQ"],               // [可选] 管理员 QQ 号（审批、凭证、/login、管理指令）
+      "group_trigger": "all",                      // [可选] 群消息触发：all 全部 / at 需 @机器人或 / 指令 / prefix 仅 / 指令 (默认: all)
+      "whitelist": {                               // [必填-若启用] 与 QQ 同格式；为空时拒绝所有聊天
+        "private": ["YOUR_ADMIN_QQ"],              // 允许私聊的 QQ 号
+        "YOUR_GROUP_ID": "*"                       // 群号: "*" 全员开放，或成员 QQ 号列表；旧写法 "groups": [群号] 仍兼容
       }
+      // 其余字段与 adapters.qq 相同：admin_only、approvals_in_place、credentials_in_place、
+      // unbound_push_to_admin、access_requests、session_bindings、catch_up_*、chunk_chars、max_*_bytes 等；
+      // 状态文件默认 data/onebot_*.json，与 QQ 分开
     }
   },
   "gateway": {                                     // [可选] 跨通道与网关协同配置
@@ -284,8 +300,9 @@ python tools/login.py --config config.json --output cookies.json
 | `data/qq_access.local.json` | 动态白名单授权与申请记录 | `adapters.qq.access_requests.state_file` |
 | `data/qq_delivered.jsonl` | 已投递消息去重记录（追加写入） | `adapters.qq.delivered_file` |
 | `data/qq_push_state.json` | 主动推送水位与已见消息 | `adapters.qq.push_state_file` |
-| `data/qq_routes.json` | 消息 ID -> QQ 目标路由（重启后仍可被动回复） | `RouteManager` 默认值 |
+| `data/qq_routes.json` | 消息 ID -> QQ 目标路由（重启后仍可被动回复） | `adapters.qq.routes_file` |
 | `data/qq_session_map.json` | 群/私聊到 Muse 会话的映射 | `adapters.qq.session_map_file` |
+| `data/onebot_*.json(l)` | OneBot 的同类文件（access、delivered、push_state、routes、session_map） | `adapters.onebot.*_file` |
 
 `data/` 已在 `.gitignore` 中忽略。从旧版升级时，将根目录下的同名文件移入 `data/` 即可保留原有状态（不移动则按空状态重新开始）。
 
@@ -327,7 +344,7 @@ QQ 私聊不等同网页安全输入：密码和验证码仍经过 QQ 链路。�
 
 ## 会话隔离
 
-QQ 适配器中每个群、每个私聊用户各自绑定一个 Muse 会话，互不可见。需要多个聊天共用同一会话时，在各聊天中 `/switch` 到同一个会话 ID，或用 `session_bindings` 预置。
+QQ 与 OneBot 适配器中每个群、每个私聊用户各自绑定一个 Muse 会话，互不可见（两个平台的映射文件分开，互不串号）。需要多个聊天共用同一会话时，在各聊天中 `/switch` 到同一个会话 ID，或用 `session_bindings` 预置。
 
 相关选项：
 
@@ -348,3 +365,17 @@ QQ 适配器中每个群、每个私聊用户各自绑定一个 Muse 会话，�
 - 首次收到某个群/私聊的消息时自动新建会话（新 UUID）；`/new`、`/switch` 只改变发指令的这个群/私聊。
 - 出站不会轮询所有会话历史：每轮只调用一次 `/api/session/list`，按 `updated_at_ms` 变化判断哪个会话有新活动（等价于网页端的 `sessions.updated` 事件），只拉取有变化或刚发过消息的会话历史。
 - 运行中切换到已有会话时，会先把该会话旧消息标记为已读，不会回放历史。
+
+## OneBot (NapCat) 适配器
+
+OneBot 与 QQ 走同一个 Gateway 层（`muse_bridge/gateway/`），会话隔离、斜杠命令、`admin_only`、白名单申请、登录/凭证/审批、主动推送的行为与 QQ 一致；适配器只负责把 NapCat 事件转成统一消息、调用 NapCat API 发出。
+
+- **连接**：HTTP API（`base_url`）发消息，正向 WebSocket（`ws_url`，留空则由 `base_url` 推出）收事件。WS 断开后按 1s、2s、4s…最长 30s 退避重连。证书不校验（兼容自签证书）。请求带自定义 User-Agent，Cloudflare 会拒绝 Python 默认 UA（错误 1010）。
+- **消息格式**：按 Array 消息段解析 `text`、`at`、`reply`、`image`、`video`、`file`、`record`；`message_format: string`（CQ 码）只取文本、@ 与引用。
+- **过滤**：丢弃机器人自己发的消息（`self_id`）与 `message_sent` 事件；按 `message_id` 去重。
+- **群触发**：`group_trigger` 为 `all`（默认，群内所有消息）、`at`（需 @机器人，或以 `/` 开头的指令）、`prefix`（只处理 `/` 指令）。私聊不受影响。
+- **回复与推送**：OneBot 没有被动回复窗口，回复和主动推送都直接发送，投递顺序同上（提问所在聊天 → 会话绑定的聊天 → 管理员 → 丢弃）。长文本按 `chunk_chars` / `max_chunks` 分段；图片、视频以 `base64://` 消息段发送，文件走 `upload_group_file` / `upload_private_file`。群发送被 NapCat 拒绝（`retcode != 0`，如被禁言、被移出群）时，加「【群消息提醒】」前缀改发第一个管理员私聊；网络超时不会改发，避免重复。
+- **收图与文件**：图片段自带可下载的 QQ CDN 地址（含 rkey），直接下载。文件段只有 `file_id`，依次尝试 `get_file`（base64 或 http 地址）与 `get_group_file_url`；NapCat 只给出它本机路径时无法读取，Muse 收到的消息会附「[file下载失败：NapCat 未提供可下载地址]」。
+- **凭证引用**：回复（引用）凭证提示消息即可选中该凭证，等同 QQ 的引用回复。
+- **白名单**：与 QQ 同格式，QQ 号、群号写成字符串或数字均可；为空时拒绝所有聊天（旧版 OneBot 原型为空即放行，已改）。旧写法 `"groups": [群号]` 等价于这些群 `"*"`。
+- **审批卡与登录**：审批卡只推送到拥有该会话的适配器；没有任何聊天绑定的会话（如 `muse.session_id`）才推送到所有适配器的管理员。`gateway.login_through_adapter` 设为 `"onebot"` 时，凭据失效的登录提醒发给 OneBot 管理员。
