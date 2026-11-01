@@ -54,6 +54,10 @@ DEFAULT_CATCH_UP_MAX_MESSAGES = 5
 
 # Administrator Permission Defaults
 DEFAULT_ADMIN_ONLY = True
+# Push messages of a session that no chat is bound to to the first admin's DM.
+DEFAULT_UNBOUND_PUSH_TO_ADMIN = True
+# Push approval cards only to the chat the session belongs to (no admin copy).
+DEFAULT_APPROVALS_IN_PLACE = True
 
 # WebSocket & HTTP Client Protocol Defaults
 DEFAULT_WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"

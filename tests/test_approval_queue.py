@@ -205,8 +205,9 @@ class QueueCase(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([c.args[:2] for c in pusher._send_to_qq.await_args_list],
                          [("group", "G"), ("private", "ADMIN")])
 
-    async def test_default_push_still_copies_admin(self):
+    async def test_copies_admin_when_in_place_disabled(self):
         self.bind_group_only()
+        self.adapter.config.approvals_in_place = False
         queue = self.load(row("remote-a", 1000))
         pusher = self.adapter.outbound_pusher
         pusher._send_to_qq = AsyncMock(return_value=True)
@@ -224,12 +225,12 @@ class QueueCase(unittest.IsolatedAsyncioTestCase):
         pusher._send_to_qq.assert_not_awaited()
 
     def test_approvals_in_place_config(self):
-        self.assertFalse(QQConfig().approvals_in_place)
+        self.assertTrue(QQConfig().approvals_in_place)
         with self.assertRaises(ValueError):
             QQConfig(approvals_in_place="yes")
         path = Path(self.tmp.name) / "config.json"
-        path.write_text('{"muse": {}, "adapters": {"qq": {"approvals_in_place": true}}}', encoding="utf-8")
-        self.assertTrue(ConfigLoader.load(str(path)).qq.approvals_in_place)
+        path.write_text('{"muse": {}, "adapters": {"qq": {"approvals_in_place": false}}}', encoding="utf-8")
+        self.assertFalse(ConfigLoader.load(str(path)).qq.approvals_in_place)
 
 
 if __name__ == "__main__":

@@ -93,8 +93,10 @@ class QQConfig:
     app_secret: str = ""
     admin_id: List[str] = dataclasses.field(default_factory=list)
     admin_only: bool = constants.DEFAULT_ADMIN_ONLY
+    # Send messages of a session with no bound chat to the first admin.
+    unbound_push_to_admin: bool = constants.DEFAULT_UNBOUND_PUSH_TO_ADMIN
     credentials_in_place: bool = False
-    approvals_in_place: bool = False
+    approvals_in_place: bool = constants.DEFAULT_APPROVALS_IN_PLACE
     access_requests: AccessRequestsConfig = dataclasses.field(default_factory=AccessRequestsConfig)
     whitelist: Dict[str, Union[List[str], str]] = dataclasses.field(default_factory=dict)
     delivered_file: str = "data/qq_delivered.jsonl"
@@ -151,6 +153,8 @@ class QQConfig:
             raise ValueError("adapters.qq.credentials_in_place must be a boolean")
         if type(self.approvals_in_place) is not bool:
             raise ValueError("adapters.qq.approvals_in_place must be a boolean")
+        if type(self.unbound_push_to_admin) is not bool:
+            raise ValueError("adapters.qq.unbound_push_to_admin must be a boolean")
 
     def is_admin(self, user_openid: str) -> bool:
         """Whether the user openid belongs to an administrator."""
@@ -328,8 +332,11 @@ class ConfigLoader:
             app_secret=str(q_raw.get("app_secret") or os.environ.get("QQ_APP_SECRET") or ""),
             admin_id=admin_ids,
             admin_only=bool(_get_val(q_raw, "admin_only", constants.DEFAULT_ADMIN_ONLY)),
+            unbound_push_to_admin=_get_val(q_raw, "unbound_push_to_admin",
+                                           constants.DEFAULT_UNBOUND_PUSH_TO_ADMIN),
             credentials_in_place=q_raw.get("credentials_in_place", False),
-            approvals_in_place=q_raw.get("approvals_in_place", False),
+            approvals_in_place=_get_val(q_raw, "approvals_in_place",
+                                        constants.DEFAULT_APPROVALS_IN_PLACE),
             whitelist=q_raw.get("whitelist") or {},
             delivered_file=q_raw.get("delivered_file", "data/qq_delivered.jsonl"),
             proxy_url=q_raw.get("proxy_url") or muse_cfg.proxy_url,
