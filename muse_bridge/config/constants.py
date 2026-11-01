@@ -59,6 +59,9 @@ DEFAULT_UNBOUND_PUSH_TO_ADMIN = True
 # Push approval cards only to the chat the session belongs to (no admin copy).
 DEFAULT_APPROVALS_IN_PLACE = True
 
+# OneBot group messages reaching Muse: "all", "at" (@bot or / command), "prefix".
+DEFAULT_ONEBOT_GROUP_TRIGGER = "all"
+
 # WebSocket & HTTP Client Protocol Defaults
 DEFAULT_WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 DEFAULT_USER_AGENT = (

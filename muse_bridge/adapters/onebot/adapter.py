@@ -33,7 +33,7 @@ class OneBotAdapter(BaseAdapter):
             access_token=self.config.access_token,
             on_message=self.handle_message,
         )
-        self.active_session_id = self.config.session_id
+        self.active_session_id = muse_service.config.session_id
         if self.active_session_id:
             self.muse_service.interactions.managed_sessions.add(self.active_session_id)
 
