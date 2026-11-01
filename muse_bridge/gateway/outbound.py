@@ -247,8 +247,8 @@ class OutboundDispatcher:
 
     async def start(self) -> None:
         self._running = True
-        logger.info('Started event-driven outbound dispatcher (unbound sessions fall back to admin: %s)',
-                    "yes" if self.config.admin_target() else "no")
+        logger.info('Started %s outbound dispatcher (unbound sessions fall back to admin: %s)', self.platform,
+                    "yes" if self.config.unbound_push_to_admin and self.config.admin_target() else "no")
 
         while self._running:
             try:
