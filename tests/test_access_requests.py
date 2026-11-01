@@ -150,7 +150,7 @@ class TestAccessRequests(unittest.IsolatedAsyncioTestCase):
 
     async def test_failed_save_never_publishes_automatic_grant(self):
         self.config.access_requests.auto_approve = True
-        with patch("muse_bridge.adapters.qq.access.os.replace", side_effect=OSError("disk")):
+        with patch("muse_bridge.gateway.access.os.replace", side_effect=OSError("disk")):
             await self.send("/申请")
         self.assertFalse(self.allowed())
         self.assertFalse(Path(self.config.access_requests.state_file).exists())
@@ -160,7 +160,7 @@ class TestAccessRequests(unittest.IsolatedAsyncioTestCase):
     async def test_failed_approval_save_keeps_pending_and_no_access(self):
         await self.send("/申请")
         row = self.pending()[0]
-        with patch("muse_bridge.adapters.qq.access.os.replace", side_effect=OSError("disk")):
+        with patch("muse_bridge.gateway.access.os.replace", side_effect=OSError("disk")):
             await self.send(f"/申请审批 {row['id']} 同意", user="ADMIN", group=None)
         self.assertFalse(self.allowed())
         self.assertEqual(self.adapter.access_requests.store.get(row["id"])["status"], "pending")
@@ -249,7 +249,7 @@ class TestAccessRequests(unittest.IsolatedAsyncioTestCase):
         with patch.object(store, "MAX_PENDING", 1):
             with self.assertRaises(ValueError):
                 store.apply("group", "G", "OTHER", "self", now=1100)
-        with patch("muse_bridge.adapters.qq.access.time.time", return_value=1000 + store.PENDING_TTL):
+        with patch("muse_bridge.gateway.access.time.time", return_value=1000 + store.PENDING_TTL):
             self.assertEqual(store.pending(), [])
         self.assertEqual(store.get(row["id"])["status"], "expired")
         for args in (("private", "OTHER", "NEW", "self"), ("private", "NEW", "NEW", "all"),
@@ -275,7 +275,7 @@ class TestAccessRequests(unittest.IsolatedAsyncioTestCase):
         row = self.pending()[0]
         self.assertEqual(row["notified"], ["ADMIN"])
         self.adapter.client.send_message.side_effect = None
-        with patch("muse_bridge.adapters.qq.access.time.time", return_value=row["notice_at"] + 61):
+        with patch("muse_bridge.gateway.access.time.time", return_value=row["notice_at"] + 61):
             await self.send("/申请")
         calls = self.adapter.client.send_message.call_args_list
         self.assertEqual(sum(c.args[:2] == ("private", "ADMIN") for c in calls), 1)
@@ -303,7 +303,7 @@ class TestAccessRequests(unittest.IsolatedAsyncioTestCase):
     def test_processed_request_cooldown_survives_restart(self):
         store = self.adapter.access_requests.store
         row, _ = store.apply("group", "G", "NEW", "self", now=1000)
-        with patch("muse_bridge.adapters.qq.access.time.time", return_value=1100):
+        with patch("muse_bridge.gateway.access.time.time", return_value=1100):
             store.decide(row["id"], False, "ADMIN")
         restored = AccessRequestStore(store.path, "APP")
         with self.assertRaises(ValueError):

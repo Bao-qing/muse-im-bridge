@@ -1,0 +1,366 @@
+"""Platform-neutral chat gateway between Muse and one chat platform.
+
+The gateway owns everything that does not depend on the platform:
+per-chat Muse sessions, deduplication, whitelist applications, slash
+commands, login / credential / approval flows, and the outbound dispatcher.
+A platform adapter (QQ, OneBot, ...) subclasses it and only translates:
+raw platform events -> ``InboundMessage`` -> ``handle_inbound``, and the
+send / download hooks below -> platform API calls.
+
+Inbound flow (identical for every platform):
+access command -> whitelist -> interaction input (OTP, passwords, approval
+numbers) -> login gate -> local slash commands -> per-chat session ->
+``post_message`` (returns at once) -> route registration. The reply comes
+back through the outbound dispatcher, never through this call.
+"""
+
+from __future__ import annotations
+
+import asyncio
+from typing import Dict, List, Optional, Tuple
+
+from ..adapters.base import BaseAdapter
+from ..config.models import ChatConfig
+from ..core.commands import CommandError, CommandHandler
+from ..core.deduplicator import MessageDeduplicator
+from ..core.message import Attachment, InboundMessage
+from ..core.session_map import SessionMapper
+from ..muse.client.errors import (ConnectionLost, CredentialRefreshError, HandshakeError,
+                                  LoginRequired, is_runtime_auth_error)
+from ..muse.interactions import ApprovalBlocked
+from ..muse.service import MuseService
+from ..observability import get_logger, safe_error, trace_event
+from .access import ChatAccessRequests
+from .interactions import ChatInteractions
+from .outbound import OutboundDispatcher
+from .routes import RouteManager
+
+logger = get_logger(__name__)
+
+# Commands that change which session a chat uses, or the account itself.
+ADMIN_COMMANDS = frozenset({"login", "switch", "delete", "rename", "archive", "unarchive", "new"})
+
+
+class ChatGateway(BaseAdapter):
+    """Base of every chat adapter; see the module docstring for the split."""
+
+    def __init__(
+        self,
+        config: ChatConfig,
+        muse_service: MuseService,
+        deduplicator: Optional[MessageDeduplicator] = None,
+    ):
+        self.config = config
+        self.muse_service = muse_service
+        self.deduplicator = deduplicator or MessageDeduplicator(
+            persistence_file=self.config.delivered_file,
+            in_flight_ttl_s=self.config.in_flight_ttl_s,
+            processing_ttl_s=self.config.processing_ttl_s,
+            gateway_dedup_s=self.config.gateway_dedup_s,
+        )
+        self.route_manager = RouteManager(state_file=self.config.routes_file, ttl_s=600.0)
+
+        # Chat -> Muse session mapping: each group / private user has its own session
+        self.session_mapper = SessionMapper(
+            state_file=self.config.session_map_file,
+            bindings=self.config.session_bindings,
+        )
+        self.muse_service.interactions.managed_sessions.update(self.session_mapper.session_ids())
+
+        # Sole exit to the chat for both replies & proactive pushes
+        self.outbound_pusher = self.create_outbound()
+
+        self._in_login_fallback: bool = False
+        self.interaction_router = ChatInteractions(self)
+        self.access_requests = ChatAccessRequests(self)
+        self._chat_send_locks: Dict[Tuple[str, str], asyncio.Lock] = {}
+        self._running = False
+
+    # ------------------------------------------------------------------
+    # Platform hooks
+    # ------------------------------------------------------------------
+    def create_outbound(self) -> OutboundDispatcher:
+        raise NotImplementedError
+
+    def access_identity(self) -> str:
+        """Bot identity stored with whitelist grants (refuses a foreign state file)."""
+        raise NotImplementedError
+
+    async def send_reply(self, target_type: str, target_id: str, text: str,
+                         msg_id: Optional[str] = None) -> dict:
+        """Reply in a chat; raises when it was not delivered.
+
+        Returns the sent message body; credential prompts remember it so a
+        later quote of that message selects the credential.
+        """
+        raise NotImplementedError
+
+    async def send_command_output(self, target_type: str, target_id: str, text: str,
+                                  msg_id: Optional[str] = None) -> None:
+        """Deliver the output of a local slash command (best effort)."""
+        try:
+            await self.send_reply(target_type, target_id, text, msg_id)
+        except Exception as e:
+            logger.warning('Command reply to %s:%s failed: %s', target_type, target_id, safe_error(e))
+
+    async def send_notice(self, target_id: str, text: str) -> None:
+        """Send a system notice to a private chat (admin login alerts)."""
+        await self.send_reply("private", target_id, text)
+
+    async def download_attachment(self, att: Attachment, max_bytes: int) -> bytes:
+        raise NotImplementedError
+
+    @staticmethod
+    def message_references(event) -> List[Tuple[str, str]]:
+        """``[(kind, value)]`` of messages the raw event quotes (credential replies)."""
+        return []
+
+    # ------------------------------------------------------------------
+    # Engine-facing API
+    # ------------------------------------------------------------------
+    @property
+    def is_enabled(self) -> bool:
+        return bool(self.config.enabled)
+
+    async def notify_interaction(self, item, text):
+        return await self.outbound_pusher.notify_interaction(item, text)
+
+    def owns_session(self, session_id: str) -> bool:
+        """Whether a chat of this adapter is bound to ``session_id``."""
+        return bool(session_id and self.session_mapper.owners(session_id))
+
+    def enter_login_mode(self, admin_target: Optional[str] = None) -> None:
+        self._in_login_fallback = True
+
+    def exit_login_mode(self) -> None:
+        self._in_login_fallback = False
+        if self.outbound_pusher:
+            self.outbound_pusher.reset_login_alert()
+
+    async def _notify_admin_login(self, admin_target: str) -> None:
+        try:
+            await self.send_notice(
+                admin_target,
+                "【系统告警】向 Muse 发送消息时检测到凭据失效（401 Unauthorized）。\n已自动进入登录回落流程，请直接在此私聊发送：\n/login <您的邮箱>\n即可获取验证码重新登录恢复服务 ♪",
+            )
+        except Exception as e:
+            logger.debug('Failed to notify admin for login: %s', safe_error(e))
+
+    # ------------------------------------------------------------------
+    # Inbound pipeline
+    # ------------------------------------------------------------------
+    async def handle_inbound(self, msg: InboundMessage) -> None:
+        """Process one parsed chat message (ids already validated, mentions stripped)."""
+        kind = msg.source.chat_type
+        target = msg.source.target_id
+        user = msg.source.sender_id
+        event = msg.source.raw_event or {}
+        msg_id = msg.id or None
+        content = msg.text
+        attachments = msg.attachments
+
+        if self.access_requests.is_command(content):
+            owner = (kind, target, user)
+            async with self.muse_service.interactions.owner_lock(owner):
+                current = self.muse_service.interactions.current(owner)
+                if (current and not current.terminal) or self.interaction_router.message_references(event):
+                    await self.send_reply(kind, target, "请先结束当前填写，再单独发送申请命令。", msg_id)
+                    return
+                await self.access_requests.handle(kind, target, user, content, msg_id)
+            return
+        if not self.access_requests.allows(kind, target, user):
+            logger.debug('Ignored %s message: sender not in whitelist', kind)
+            return
+
+        if not content and not attachments and not self.interaction_router.message_references(event):
+            return
+
+        target_type, target_id = kind, target
+        is_admin = self.config.is_admin(user)
+        owner = (target_type, target_id, user)
+        session_id = self.session_mapper.current(target_type, target_id) or ""
+
+        # Consume sensitive input before any raw message logging.
+        if await self.interaction_router.handle(owner, content, msg_id, is_admin, session_id, event=event):
+            logger.info('Local interaction from %s:%s: [redacted]', target_type, target_id)
+            return
+
+        available = await asyncio.to_thread(self.muse_service.token_manager.has_credentials)
+        if available and self._in_login_fallback:
+            self.exit_login_mode()
+        needs_login = not available
+        if needs_login and not content.startswith("/"):
+            text = "Muse 认证不可用，请管理员私聊发送 /login 或 /login <邮箱>。"
+            await self.send_reply(target_type, target_id, text, msg_id)
+            return
+
+        logger.info("Inbound platform=%s target_type=%s target_id=%s msg_id=%s attachments=%s",
+                    self.name, target_type, target_id, msg_id, len(attachments))
+
+        # 1. Local Slash Commands
+        parsed = CommandHandler.parse_command(content)
+        if parsed is not None:
+            await self._run_command(parsed, target_type, target_id, msg_id, is_admin)
+            return
+
+        trace_event(f"{self.name}.adapter", "message.received", payload={"content": content},
+                    session_id=session_id, target_type=target_type, target_id=target_id,
+                    msg_id=msg_id, attachment_count=len(attachments))
+
+        # 2. Sequential Inbound Ingestion (Serialized per chat so slow files are never overtaken by later text!)
+        chat_lock = self._chat_send_locks.setdefault((target_type, target_id), asyncio.Lock())
+        async with chat_lock:
+            await self._forward(target_type, target_id, content, attachments, msg_id, is_admin)
+
+    async def _run_command(self, parsed, target_type, target_id, msg_id, is_admin) -> None:
+        cmd_name, cmd_args = parsed
+
+        # Check admin-only permission switch
+        if self.config.admin_only and cmd_name in ADMIN_COMMANDS and not is_admin:
+            await self.send_reply(
+                target_type,
+                target_id,
+                "权限不足：管理指令仅限管理员在私聊中执行（如需在群聊中使用，可在配置中设置 admin_only: false）。",
+                msg_id,
+            )
+            return
+
+        loop = asyncio.get_running_loop()
+        client = None
+        # Session this chat is currently bound to.
+        chat_session_id = self.session_mapper.current(target_type, target_id)
+        if not chat_session_id:
+            chat_session_id = "（尚未创建，发送第一条消息后自动建立）"
+        try:
+            if cmd_name not in ("help", "__help__", "__usage_hint__", "new"):
+                client = await asyncio.to_thread(self.muse_service.create_client)
+                await asyncio.to_thread(client.connect)
+            # Persistence is handled by SessionMapper.bind
+            reply, new_sid = await loop.run_in_executor(
+                None,
+                CommandHandler.execute,
+                cmd_name,
+                cmd_args,
+                client,
+                chat_session_id,
+            )
+            if new_sid != chat_session_id:
+                self.session_mapper.bind(target_type, target_id, new_sid)
+                if cmd_name == "new":
+                    self.outbound_pusher.track_session(new_sid, fresh=True)
+                else:
+                    # Bound to an existing session: never replay its old history.
+                    await self.outbound_pusher.ensure_baseline(new_sid)
+        except CommandError as e:
+            reply = str(e)
+        except ApprovalBlocked as e:
+            await self.send_reply(target_type, target_id, str(e), msg_id)
+            return
+        except Exception as e:
+            if isinstance(e, LoginRequired):
+                self.enter_login_mode()
+                reply = "Muse Cookie 会话已失效，请管理员私聊 /login。"
+            else:
+                if is_runtime_auth_error(e) and client is not None:
+                    await asyncio.to_thread(self.muse_service.token_manager.invalidate_mint, client.token, client.notary_token)
+                reply = "命令结果未确认，请稍后核对；不会自动重复执行。"
+        finally:
+            if client:
+                try:
+                    client.close()
+                except Exception:
+                    pass
+
+        # Reply command output directly
+        await self.send_command_output(target_type, target_id, reply, msg_id)
+
+    async def _forward(self, target_type, target_id, content, attachments, msg_id, is_admin) -> None:
+        loop = asyncio.get_running_loop()
+
+        # Download attachments if any
+        for att in attachments:
+            if (att.url or att.file_info) and not att.data:
+                max_cap = (
+                    self.config.max_video_bytes if att.type == "video"
+                    else self.config.max_file_bytes if att.type == "file"
+                    else self.config.max_image_bytes
+                )
+                try:
+                    att.data = await self.download_attachment(att, max_cap)
+                except Exception as e:
+                    content += f"\n[{att.type}下载失败：{e}]"
+
+        try:
+            # Resolve which Muse session this chat talks to
+            session_id, created = self.session_mapper.resolve(target_type, target_id)
+            if created:
+                self.outbound_pusher.track_session(session_id, fresh=True)
+                logger.info('New isolated Muse session %s for %s:%s', session_id, target_type, target_id)
+            else:
+                # Pre-bound / restored session: baseline once so old history is never replayed
+                await self.outbound_pusher.ensure_baseline(session_id)
+
+            # Post message to Muse in strict chronological order
+            sent_mid = await loop.run_in_executor(
+                None,
+                self.muse_service.post_message,
+                session_id,
+                content,
+                attachments,
+                self.config.file_ref_threshold_bytes,
+            )
+            self.outbound_pusher.track_session(session_id)
+
+            # Register route for outbound pusher
+            self.route_manager.register(sent_mid, target_type, target_id, msg_id)
+            logger.debug('Message delivered to Muse (mid=%s), route registered for %s:%s', sent_mid, target_type, target_id)
+            trace_event(f"{self.name}.adapter", "route.registered", session_id=session_id, sent_mid=sent_mid,
+                        target_type=target_type, target_id=target_id, msg_id=msg_id)
+        except ApprovalBlocked as e:
+            await self.send_reply(target_type, target_id, str(e), msg_id)
+            return
+        except Exception as e:
+            err_msg = str(e).lower()
+            if isinstance(e, LoginRequired):
+                logger.warning('Cookie 会话不可用，需要管理员登录。 error=%s', safe_error(e))
+                self.enter_login_mode()
+                admin_target = self.config.admin_target()
+                if target_type == "private" and is_admin:
+                    reply = "【系统提示】发送消息时检测到 Muse 会话凭据已失效，已进入登录回落流程。\n请发送 /login 或 /login <邮箱> 获取验证码。"
+                else:
+                    reply = "【系统提示】Muse 会话凭据已失效，服务已暂停并进入登录维护状态，已通知管理员重新登录。"
+                    if admin_target and (target_type != "private" or target_id != admin_target):
+                        loop.call_soon(
+                            asyncio.create_task,
+                            self._notify_admin_login(admin_target),
+                        )
+                await self.send_reply(target_type, target_id, reply, msg_id)
+                return
+            if isinstance(e, (CredentialRefreshError, HandshakeError, ConnectionLost)) or is_runtime_auth_error(e):
+                await self.send_reply(target_type, target_id,
+                    "连接暂不可用，消息结果未确认；未自动重发，请稍后核对。", msg_id)
+                return
+            if "status 404" in err_msg or "session not found" in err_msg or "not_found" in err_msg:
+                # Session expired / deleted on Muse: auto-recreate a new session!
+                new_sid = self.session_mapper.new_session(target_type, target_id)
+                logger.warning('Session %s expired/not found on Muse, auto-created new session %s error=%s', session_id[:8], new_sid[:8], safe_error(e))
+                try:
+                    sent_mid = await loop.run_in_executor(
+                        None,
+                        self.muse_service.post_message,
+                        new_sid,
+                        content,
+                        attachments,
+                        self.config.file_ref_threshold_bytes,
+                    )
+                    self.outbound_pusher.track_session(new_sid, fresh=True)
+                    self.route_manager.register(sent_mid, target_type, target_id, msg_id)
+                    trace_event(f"{self.name}.adapter", "route.registered", session_id=new_sid, sent_mid=sent_mid,
+                                target_type=target_type, target_id=target_id, msg_id=msg_id)
+                    return
+                except Exception as retry_err:
+                    logger.error('Failed to post message to new session: %s', safe_error(retry_err))
+                    await self.send_reply(target_type, target_id, f"会话重建后发送出错：{retry_err}", msg_id)
+                    return
+            logger.error('Failed to post message to Muse: %s', safe_error(e))
+            await self.send_reply(target_type, target_id, f"转接出错了：{e}", msg_id)
