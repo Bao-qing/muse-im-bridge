@@ -216,6 +216,7 @@ class QQClient:
         media_file_info: Optional[str] = None,
         msg_id: Optional[str] = None,
         msg_seq: Optional[int] = None,
+        message_reference: Optional[dict] = None,
     ) -> Tuple[int, dict]:
         """Send a message to C2C or Group."""
         if target_type == "private":
@@ -227,6 +228,8 @@ class QQClient:
         if media_file_info:
             payload["msg_type"] = 7
             payload["media"] = {"file_info": media_file_info}
+            if content:
+                payload["content"] = content
         elif markdown_content is not None:
             payload["msg_type"] = 2
             payload["markdown"] = {"content": markdown_content}
@@ -238,6 +241,8 @@ class QQClient:
             if msg_seq is not None:
                 payload["msg_seq"] = msg_seq
 
+        if message_reference is not None:
+            payload["message_reference"] = message_reference
         return self.post_with_retry(url, payload)
 
     def upload_media(

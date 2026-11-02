@@ -45,6 +45,7 @@ class QQOutboundPusher(OutboundDispatcher):
         videos: List[dict],
         route: Optional[RouteInfo] = None,
         credential=None,
+        delivery=None,
     ) -> bool:
         loop = asyncio.get_running_loop()
         chunks = chunk_text(text, self.config.chunk_chars, self.config.max_chunks) if text else []
@@ -63,6 +64,22 @@ class QQOutboundPusher(OutboundDispatcher):
         async def _deliver_item(content=None, md=None, media_info=None) -> bool:
             nonlocal active_budget
             curr_mid, curr_seq = _get_passive_meta()
+
+            async def send(t, i, body, markdown, media, passive_id=None, sequence=None):
+                reference = self.quote_for(delivery, t, i)
+                ref_id = next((v for k, v in reference.references if k == "ref"), None) if reference else None
+                if not ref_id and reference:
+                    ref_id = next((v for k, v in reference.references if k == "id"), None)
+                options = {}
+                if ref_id:
+                    options["message_reference"] = {"message_id": ref_id, "ignore_get_message_error": False}
+                elif delivery and delivery.reply_to_id:
+                    prefix = self.quote_text(delivery, t, i)
+                    body = prefix + (body or "")
+                    if markdown is not None:
+                        markdown = prefix + markdown
+                return await asyncio.to_thread(
+                    self.client.send_message, t, i, body, markdown, media, passive_id, sequence, **options)
             delivered_type, delivered_id = target_type, target_id
 
             if not curr_mid:
@@ -71,53 +88,33 @@ class QQOutboundPusher(OutboundDispatcher):
                     return False
                 active_budget -= 1
 
-            code, body = await loop.run_in_executor(
-                None,
-                self.client.send_message,
-                target_type,
-                target_id,
-                content,
-                md,
-                media_info,
-                curr_mid,
-                curr_seq,
-            )
+            code, body = await send(target_type, target_id, content, md, media_info, curr_mid, curr_seq)
 
             # Retry as active if passive rejected
             if curr_mid and not (200 <= code < 300):
                 logger.debug("Passive send failed (status=%s), retrying as active...", code)
                 if active_budget > 0:
                     active_budget -= 1
-                    code, body = await loop.run_in_executor(
-                        None,
-                        self.client.send_message,
-                        target_type,
-                        target_id,
-                        content,
-                        md,
-                        media_info,
-                    )
+                    code, body = await send(target_type, target_id, content, md, media_info)
 
             if not (200 <= code < 300):
-                # If active send to group fails with permission error (40034105), fall back to admin private
-                if target_type == "group" and any(k in str(body) for k in ("40034105", "无权限", "主动消息失败")):
+                # A known native quote must not turn into a private text fallback.
+                if (target_type == "group"
+                        and self.quote_for(delivery, target_type, target_id) is None
+                        and any(k in str(body) for k in ("40034105", "无权限", "主动消息失败"))):
                     admin_type, admin_id = "private", self.config.admin_target()
                     if admin_id:
                         logger.debug('Group active send rejected (%s); falling back to admin %s:%s', code, admin_type, admin_id)
                         delivered_type, delivered_id = admin_type, admin_id
-                        code, body = await loop.run_in_executor(
-                            None,
-                            self.client.send_message,
-                            admin_type,
-                            admin_id,
-                            f"【群消息提醒】\n{content}" if content else content,
-                            f"【群消息提醒】\n{md}" if md else md,
-                            media_info,
-                        )
+                        code, body = await send(
+                            admin_type, admin_id,
+                            "【群消息提醒】" + chr(10) + content if content else content,
+                            "【群消息提醒】" + chr(10) + md if md else md, media_info)
 
             if not (200 <= code < 300):
                 logger.error("Failed sending item to %s:%s (status=%s)", target_type, target_id, code)
                 return False
+            self.remember_delivery(delivery, delivered_type, delivered_id, body)
             if credential is not None:
                 self.muse_service.interactions.remember_credential_message(
                     delivered_type, delivered_id, body, credential)

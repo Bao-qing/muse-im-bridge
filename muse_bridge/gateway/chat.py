@@ -210,7 +210,8 @@ class ChatGateway(BaseAdapter):
         # 2. Sequential Inbound Ingestion (Serialized per chat so slow files are never overtaken by later text!)
         chat_lock = self._chat_send_locks.setdefault((target_type, target_id), asyncio.Lock())
         async with chat_lock:
-            await self._forward(target_type, target_id, content, attachments, msg_id, is_admin)
+            references = msg.references or self.interaction_router.message_references(event)
+            await self._forward(target_type, target_id, content, attachments, msg_id, is_admin, references, event)
 
     async def _run_command(self, parsed, target_type, target_id, msg_id, is_admin) -> None:
         cmd_name, cmd_args = parsed
@@ -274,8 +275,16 @@ class ChatGateway(BaseAdapter):
         # Reply command output directly
         await self.send_command_output(target_type, target_id, reply, msg_id)
 
-    async def _forward(self, target_type, target_id, content, attachments, msg_id, is_admin) -> None:
+    async def _forward(self, target_type, target_id, content, attachments, msg_id, is_admin, references=(), event=None) -> None:
         loop = asyncio.get_running_loop()
+        quote = {}
+
+        own_references = [("id", msg_id)] if msg_id else []
+        scene = (event or {}).get("message_scene") or {}
+        entries = scene.get("ext") if isinstance(scene, dict) else None
+        for entry in entries if isinstance(entries, list) else []:
+            if isinstance(entry, str) and entry.startswith("msg_idx="):
+                own_references.append(("ref", entry.partition("=")[2]))
 
         # Download attachments if any
         for att in attachments:
@@ -300,15 +309,24 @@ class ChatGateway(BaseAdapter):
                 # Pre-bound / restored session: baseline once so old history is never replayed
                 await self.outbound_pusher.ensure_baseline(session_id)
 
+            reference = self.outbound_pusher.reference_store.resolve_channel(
+                session_id, target_type, target_id, references)
+            quote = {}
+            if reference:
+                if reference.reply_target:
+                    quote["reply_to_target"] = reference.reply_target
+                else:
+                    quote["in_reply_to"] = reference.muse_id
+            elif references:
+                content = "【引用消息未关联到当前会话】" + chr(10) + content
+
             # Post message to Muse in strict chronological order
-            sent_mid = await loop.run_in_executor(
-                None,
-                self.muse_service.post_message,
-                session_id,
-                content,
-                attachments,
-                self.config.file_ref_threshold_bytes,
-            )
+            sent_mid = await asyncio.to_thread(
+                self.muse_service.post_message, session_id, content, attachments,
+                self.config.file_ref_threshold_bytes, **quote)
+            if sent_mid and msg_id:
+                self.outbound_pusher.reference_store.remember(
+                    session_id, target_type, target_id, sent_mid, own_references, content)
             self.outbound_pusher.track_session(session_id)
 
             # Register route for outbound pusher
@@ -340,6 +358,11 @@ class ChatGateway(BaseAdapter):
                 await self.send_reply(target_type, target_id,
                     "连接暂不可用，消息结果未确认；未自动重发，请稍后核对。", msg_id)
                 return
+            if quote and ("status 404" in err_msg or "not_found" in err_msg):
+                # A missing quote target is not evidence that the chat session died.
+                await self.send_reply(target_type, target_id,
+                    "引用原消息无法读取，未自动重发；请取消引用后重试。", msg_id)
+                return
             if "status 404" in err_msg or "session not found" in err_msg or "not_found" in err_msg:
                 # Session expired / deleted on Muse: auto-recreate a new session!
                 new_sid = self.session_mapper.new_session(target_type, target_id)
@@ -353,6 +376,9 @@ class ChatGateway(BaseAdapter):
                         attachments,
                         self.config.file_ref_threshold_bytes,
                     )
+                    if sent_mid and msg_id:
+                        self.outbound_pusher.reference_store.remember(
+                            new_sid, target_type, target_id, sent_mid, own_references, content)
                     self.outbound_pusher.track_session(new_sid, fresh=True)
                     self.route_manager.register(sent_mid, target_type, target_id, msg_id)
                     trace_event(f"{self.name}.adapter", "route.registered", session_id=new_sid, sent_mid=sent_mid,

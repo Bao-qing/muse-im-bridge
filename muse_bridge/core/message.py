@@ -45,6 +45,7 @@ class InboundMessage:
     text: str = ""
     attachments: List[Attachment] = dataclasses.field(default_factory=list)
     timestamp: float = 0.0
+    references: List[tuple[str, str]] = dataclasses.field(default_factory=list)
 
 
 @dataclasses.dataclass
@@ -53,6 +54,15 @@ class OutboundMessage:
     attachments: List[Attachment] = dataclasses.field(default_factory=list)
     reply_to_id: Optional[str] = None
     msg_seq: int = 1
+
+
+@dataclasses.dataclass(frozen=True)
+class DeliveryReference:
+    session_id: str
+    muse_id: str
+    excerpt: str = ""
+    reply_to_id: Optional[str] = None
+    reply_target: Optional[dict] = None
 
 
 def _fence_open(line: str) -> Optional[dict]:

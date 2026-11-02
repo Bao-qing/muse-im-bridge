@@ -184,6 +184,7 @@ def _make_adapter(tmp, **extra):
     muse.post_message = mock.Mock(side_effect=lambda sid, text, atts, thr: f"mid-{sid}-{text}")
     adapter = OneBotAdapter(config=cfg, muse_service=muse)
     adapter.self_id = SELF
+    adapter.outbound_pusher.bind_reference_account(SELF)
     adapter.route_manager = RouteManager(state_file=None)
     adapter.outbound_pusher.route_manager = adapter.route_manager
     adapter.client = mock.Mock()
