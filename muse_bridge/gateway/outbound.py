@@ -993,9 +993,11 @@ class OutboundDispatcher:
         removals = [e for e in old if e not in emojis]
         parts = []
         if additions:
-            parts.append("【Muse 反应】" + " ".join(additions))
+            # parts.append("【Muse 反应】" + " ".join(additions))
+            parts.append(" ".join(additions))
         if removals:
-            parts.append("【Muse 取消反应】" + " ".join(removals))
+            # parts.append("【Muse 取消反应】" + " ".join(removals))
+            parts.append(" ".join(removals))
         text = chr(10).join(parts)
         try:
             success = await self._deliver(
