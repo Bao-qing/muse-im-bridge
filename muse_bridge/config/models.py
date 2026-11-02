@@ -120,7 +120,7 @@ class ChatConfig:
     admin_only: bool = constants.DEFAULT_ADMIN_ONLY
     # Send messages of a session with no bound chat to the first admin.
     unbound_push_to_admin: bool = constants.DEFAULT_UNBOUND_PUSH_TO_ADMIN
-    credentials_in_place: bool = False
+    credentials_in_place: bool = constants.DEFAULT_CREDENTIALS_IN_PLACE
     approvals_in_place: bool = constants.DEFAULT_APPROVALS_IN_PLACE
     access_requests: AccessRequestsConfig = dataclasses.field(default_factory=AccessRequestsConfig)
     whitelist: Dict[str, Union[List[str], str]] = dataclasses.field(default_factory=dict)
@@ -387,7 +387,8 @@ class ConfigLoader:
                 admin_only=bool(_get_val(raw, "admin_only", constants.DEFAULT_ADMIN_ONLY)),
                 unbound_push_to_admin=_get_val(raw, "unbound_push_to_admin",
                                                constants.DEFAULT_UNBOUND_PUSH_TO_ADMIN),
-                credentials_in_place=raw.get("credentials_in_place", False),
+                credentials_in_place=_get_val(raw, "credentials_in_place",
+                                              constants.DEFAULT_CREDENTIALS_IN_PLACE),
                 approvals_in_place=_get_val(raw, "approvals_in_place",
                                             constants.DEFAULT_APPROVALS_IN_PLACE),
                 whitelist=raw.get("whitelist") or {},

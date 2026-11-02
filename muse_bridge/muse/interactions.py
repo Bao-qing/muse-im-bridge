@@ -18,6 +18,29 @@ from ..observability import get_logger, safe_error, trace_event
 logger = get_logger(__name__)
 
 
+# Single-value captures use explicit protected fields, never names guessed from
+# a card title. Legacy create_password cards use the password field.
+SECRET_CAPTURE_FIELDS = {
+    "create_password": "password", "password": "password", "secret": "secret",
+    "api_key": "api_key", "private_key": "private_key",
+    "ssh_private_key": "private_key", "otp_seed": "otp_seed",
+    "totp_secret": "totp_secret",
+}
+
+
+def credential_input_kind(context):
+    capture = context.get("capture", "sign_in")
+    if capture == "verification_code":
+        return "code"
+    if capture in SECRET_CAPTURE_FIELDS or context.get("secret_field"):
+        return "secret"
+    return "sign_in"
+
+
+def credential_secret_label(context):
+    return context.get("password_label") or "密钥或凭证内容"
+
+
 DECISIONS = {"allow_once", "allow_session", "allow_always", "deny_always", "deny"}
 DURABLE_SCOPES = {"destination", "destination_domain", "entity", "connector_all_actions", "recipient"}
 LABELS = {
@@ -92,7 +115,9 @@ class MuseInteractions:
         if not isinstance(vm_id, str) or not vm_id:
             vm_id = self.service.config.vm_id
         identity = [self.service.config.host, vm_id, session_id, remote_id,
-                    context["page_url"], context["capture_authorization"]]
+                    context["page_url"], context.get("capture_authorization")]
+        if context.get("secret_field") and context.get("capture") != "sign_in":
+            identity.extend([context.get("capture"), context["secret_field"]])
         return hashlib.sha256(json.dumps(identity, ensure_ascii=False).encode()).hexdigest()
 
     def _record_capture(self, key):
@@ -149,7 +174,10 @@ class MuseInteractions:
             return None
         if existing and version < existing.context.get("state_version", 0):
             return existing
-        if (state.get("data") or {}).get("credential_capture_completed") is True:
+        state_data = state.get("data") or {}
+        if not isinstance(state_data, dict):
+            return None
+        if state_data.get("credential_capture_completed") is True:
             if existing:
                 existing.context["state_version"] = version
                 self.manager.finish(existing)
@@ -158,36 +186,57 @@ class MuseInteractions:
             # Never resurrect a completed/cancelled capture from a replayed card.
             existing.context["state_version"] = version
             return existing
-        parsed = urlparse(fields.get("url") or "")
-        if (parsed.scheme != "https" or parsed.hostname != "agent.meta.ai"
-                or parsed.path.rstrip("/") != "/connect/browser-credentials"
-                or parsed.username or parsed.password):
+        url = fields.get("url")
+        if not isinstance(url, str):
             return None
-        params = parse_qs(parsed.fragment)
+        try:
+            parsed = urlparse(url)
+            if (parsed.scheme != "https" or parsed.hostname not in {"agent.meta.ai", "muse.ai"}
+                    or parsed.path.rstrip("/") != "/connect/browser-credentials"
+                    or parsed.username or parsed.password or parsed.query
+                    or parsed.port not in (None, 443)):
+                return None
+        except ValueError:
+            return None
+        params = parse_qs(parsed.fragment, keep_blank_values=True)
         keys = ("page_url", "capture_authorization", "username_label", "password_label", "verification_code_label", "capture")
+        if any(len(values) != 1 for values in params.values()):
+            return None
         context = {}
         for key in keys:
             values = params.get(key, [])
-            if len(values) > 1:
-                return None
-            value = values[0] if values else ("sign_in" if key == "capture" else None)
+            # Capture often exists only in the structured card, not its URL.
+            value = values[0] if values else (fields.get(key, "sign_in") if key == "capture" else None)
             if key in fields and fields[key] != value:
                 return None
+            if value is not None and (not isinstance(value, str) or not value.strip()):
+                return None
             context[key] = value
-        page = urlparse(context.get("page_url") or "")
-        if page.scheme not in {"http", "https"} or not page.hostname or page.username or page.password:
+        try:
+            page = urlparse(context.get("page_url") or "")
+            if page.scheme not in {"http", "https"} or not page.hostname or page.username or page.password:
+                return None
+        except ValueError:
             return None
-        if not context["capture_authorization"]:
+        capture = context["capture"]
+        if capture not in {"sign_in", "verification_code", *SECRET_CAPTURE_FIELDS}:
             return None
-        capture = context.get("capture") or "sign_in"
-        if capture not in {"sign_in", "verification_code"}:
+        secret_field = SECRET_CAPTURE_FIELDS.get(capture)
+        if capture == "sign_in" and not context["username_label"] and context["password_label"]:
+            secret_field = "password"
+        # Authorized login/code cards keep the existing fail-closed requirement.
+        # Legacy single-secret cards may omit authorization; the authenticated
+        # authd capture API accepts them with the explicit session context.
+        if not context["capture_authorization"] and capture != "create_password":
+            return None
+        if secret_field and (context["username_label"] or context["verification_code_label"]):
             return None
         providers = fields.get("auth_providers") or []
         if not isinstance(providers, list) or any(p not in {"google", "apple", "amazon", "1password"} for p in providers):
             return None
-        if providers and capture != "sign_in":
+        if providers and (capture != "sign_in" or secret_field):
             return None
-        context.update(capture=capture, auth_providers=providers,
+        context.update(capture=capture, auth_providers=providers, secret_field=secret_field,
                        grant_request_type=fields.get("grant_request_type"),
                        idempotency_key=str(uuid.uuid4()), state_version=version,
                        lifetime="on_read" if capture == "verification_code" else "persist")
@@ -206,14 +255,22 @@ class MuseInteractions:
         if c.get("auth_providers") or c.get("grant_request_type"):
             raise ValueError("Provider capture must be completed in the web client")
         page = urlparse(c["page_url"])
-        verification = c.get("capture") == "verification_code"
-        fields = ([{"name": "verification_code", "value": secret, "protected": True}] if verification else
-                  [{"name": "username", "value": c["username"], "protected": True},
-                   {"name": "password", "value": secret, "protected": True}])
+        kind = credential_input_kind(c)
+        verification = kind == "code"
+        if kind == "secret":
+            field_name = c.get("secret_field") or SECRET_CAPTURE_FIELDS[c["capture"]]
+            fields = [{"name": field_name, "value": secret, "protected": True}]
+        elif verification:
+            fields = [{"name": "verification_code", "value": secret, "protected": True}]
+        else:
+            fields = [{"name": "username", "value": c["username"], "protected": True},
+                      {"name": "password", "value": secret, "protected": True}]
         body = {"page_url": page._replace(path=page.path or "/").geturl(),
                 "idempotency_key": c["idempotency_key"], "label": None, "fields": fields,
                 "lifetime": "on_read" if verification else c["lifetime"],
-                "session_id": item.session_id, "capture_authorization": c["capture_authorization"]}
+                "session_id": item.session_id}
+        if c.get("capture_authorization"):
+            body["capture_authorization"] = c["capture_authorization"]
         digest = hashlib.sha256((c["idempotency_key"] + json.dumps(body, sort_keys=True)).encode()).hexdigest()
         previous_digest = c.get("submitted_digest")
         if previous_digest is not None and previous_digest != digest:
