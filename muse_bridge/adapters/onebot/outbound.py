@@ -56,6 +56,7 @@ class OneBotOutboundPusher(OutboundDispatcher):
         videos: List[dict],
         route: Optional[RouteInfo] = None,
         credential=None,
+        delivery=None,
     ) -> bool:
         admin_id = self.config.admin_target()
 
@@ -64,10 +65,20 @@ class OneBotOutboundPusher(OutboundDispatcher):
             try:
                 return target_type, target_id, await asyncio.to_thread(op, target_type, target_id)
             except OneBotAPIError as e:
-                if target_type != "group" or not admin_id:
+                if (target_type != "group" or not admin_id
+                        or self.quote_for(delivery, target_type, target_id) is not None):
                     raise
                 logger.debug('Group send refused (%s); falling back to admin %s', safe_error(e), admin_id)
                 return "private", admin_id, await asyncio.to_thread(fallback_op or op, "private", admin_id)
+
+        def segments(t, i, segment):
+            reference = self.quote_for(delivery, t, i)
+            ref_id = next((value for kind, value in reference.references if kind == "id"), None) if reference else None
+            if ref_id:
+                return [{"type": "reply", "data": {"id": ref_id}}, segment]
+            if delivery and delivery.reply_to_id:
+                return [text_segment(self.quote_text(delivery, t, i)), segment]
+            return [segment]
 
         all_delivered = True
 
@@ -75,13 +86,14 @@ class OneBotOutboundPusher(OutboundDispatcher):
         for chunk in chunk_text(text, self.config.chunk_chars, self.config.max_chunks) if text else []:
             try:
                 sent_type, sent_id, body = await _send(
-                    lambda t, i, c=chunk: self.client.send_msg(t, i, [text_segment(c)]),
-                    lambda t, i, c=chunk: self.client.send_msg(t, i, [text_segment(GROUP_FALLBACK_PREFIX + c)]),
+                    lambda t, i, c=chunk: self.client.send_msg(t, i, segments(t, i, text_segment(c))),
+                    lambda t, i, c=chunk: self.client.send_msg(t, i, segments(t, i, text_segment(GROUP_FALLBACK_PREFIX + c))),
                 )
             except Exception as e:
                 logger.error("Failed sending item to %s:%s: %s", target_type, target_id, safe_error(e))
                 all_delivered = False
                 continue
+            self.remember_delivery(delivery, sent_type, sent_id, body)
             if credential is not None:
                 # Quoting this message later selects the credential (reply segment id).
                 self.muse_service.interactions.remember_credential_message(
@@ -95,7 +107,9 @@ class OneBotOutboundPusher(OutboundDispatcher):
                 if data is None:
                     continue
                 try:
-                    await _send(lambda t, i, d=data, k=kind: self.client.send_msg(t, i, [media_segment(k, d)]))
+                    sent_type, sent_id, body = await _send(
+                        lambda t, i, d=data, k=kind: self.client.send_msg(t, i, segments(t, i, media_segment(k, d))))
+                    self.remember_delivery(delivery, sent_type, sent_id, body)
                 except Exception as e:
                     logger.error('Failed to send %s: %s', kind, safe_error(e))
 
@@ -106,8 +120,17 @@ class OneBotOutboundPusher(OutboundDispatcher):
                 continue
             name = item.get("filename") or "file.dat"
             try:
-                await _send(lambda t, i, d=data, n=name: self.client.upload_file(t, i, d, n))
+                sent_type, sent_id, _ = await _send(
+                    lambda t, i, d=data, n=name: self.client.upload_file(t, i, d, n))
+                # OneBot upload_*_file has no chat message ID. A companion gives
+                # the file a native quote context and a replyable reference.
+                if delivery:
+                    body = await asyncio.to_thread(
+                        self.client.send_msg, sent_type, sent_id,
+                        segments(sent_type, sent_id, text_segment("【文件】" + name)))
+                    self.remember_delivery(delivery, sent_type, sent_id, body)
             except Exception as e:
+                all_delivered = False
                 logger.error('Failed to upload file: %s', safe_error(e))
 
         return all_delivered

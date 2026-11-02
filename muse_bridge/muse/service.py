@@ -174,6 +174,8 @@ class MuseService:
         text: str,
         attachments: Optional[List[Attachment]] = None,
         threshold_bytes: int = 2 * 1024 * 1024,
+        in_reply_to: Optional[str] = None,
+        reply_to_target: Optional[dict] = None,
     ) -> str:
         """Post a user message to Muse and return the message_id immediately without waiting."""
         try:
@@ -190,6 +192,8 @@ class MuseService:
                     images=inline_images or None,
                     files=inline_files or None,
                     file_refs=file_refs or None,
+                    **({"in_reply_to": in_reply_to} if in_reply_to else {}),
+                    **({"reply_to_target": reply_to_target} if reply_to_target else {}),
                 )
                 logger.debug("Message posted to Muse session_id=%s sent_mid=%s", session_id, sent_mid)
                 trace_event("muse.service", "message.posted", session_id=session_id, sent_mid=sent_mid,
@@ -209,6 +213,8 @@ class MuseService:
         should_cancel: Optional[Callable[[], bool]] = None,
         threshold_bytes: int = 2 * 1024 * 1024,
         on_sent: Optional[Callable[[str], None]] = None,
+        in_reply_to: Optional[str] = None,
+        reply_to_target: Optional[dict] = None,
     ) -> TurnResult:
         """Send a turn to Muse, wait for reply, and mark seen."""
         try:
@@ -227,6 +233,8 @@ class MuseService:
                     images=inline_images or None,
                     files=inline_files or None,
                     file_refs=file_refs or None,
+                    **({"in_reply_to": in_reply_to} if in_reply_to else {}),
+                    **({"reply_to_target": reply_to_target} if reply_to_target else {}),
                 )
                 logger.debug("Message posted to Muse session_id=%s sent_mid=%s", session_id, sent_mid)
                 trace_event("muse.service", "message.posted", session_id=session_id, sent_mid=sent_mid,

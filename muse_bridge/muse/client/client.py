@@ -400,7 +400,7 @@ class MuseClient:
 
     # -- chat RPCs ----------------------------------------------------
     def send_message(self, session_id, text, images=None, files=None,
-                     file_refs=None):
+                     file_refs=None, in_reply_to=None, reply_to_target=None):
         """POST /chat/stream. Returns the user message_id (or None if the
         message event carried none; wait_turn can still match by text).
 
@@ -434,6 +434,11 @@ class MuseClient:
             "timezone": self.timezone,
             "metadata": {"thread_is_dictation_used": False},
         }
+        # Verified against the web client's chat.stream request builder.
+        if in_reply_to:
+            payload["in_reply_to"] = in_reply_to
+        if reply_to_target:
+            payload["reply_to_target"] = reply_to_target
         if images or files or file_refs:
             items = []
             for img in images or []:
