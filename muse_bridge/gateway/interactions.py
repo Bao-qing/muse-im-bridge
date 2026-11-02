@@ -11,6 +11,7 @@ import time
 
 from ..muse.client.errors import LoginRequired
 from ..muse.login import MuseProtocolLogin
+from ..muse.interactions import credential_input_kind, credential_secret_label
 from ..observability import get_logger, safe_error, trace_event
 
 
@@ -69,11 +70,25 @@ class ChatInteractions:
         for shown, snapshot in zip(items, snapshots):
             self.protocol.mark_displayed(shown, owner[:2], snapshot)
 
+    def is_credential_input(self, owner, content, event):
+        """Keep secret whitespace and route replies past ordinary group triggers."""
+        current = self.manager.current(owner)
+        if current and current.kind == "credential":
+            return True
+        references = self.message_references(event)
+        if self.manager.referenced_credential(owner[0], owner[1], references) is not None:
+            return True
+        session_id = self.adapter.session_mapper.current(owner[0], owner[1]) or ""
+        return bool(self.credential_candidates(owner, session_id)) and (
+            bool(references) or len(content.splitlines()) >= 2)
+
     async def handle(self, owner, content, msg_id, is_admin, session_id, event=None):
         async with self.manager.owner_lock(owner):
             parts = content.split(None, 1)
             command = parts[0].lower() if parts else ""
-            args = parts[1].strip() if len(parts) > 1 else ""
+            args = parts[1] if len(parts) > 1 else ""
+            if command not in {"/凭证", "/credential", "/密码", "/password", "/验证码", "/code"}:
+                args = args.strip()
             current = self.manager.current(owner)
             references = self.message_references(event or {})
             referenced = self.manager.referenced_credential(owner[0], owner[1], references)
@@ -158,8 +173,8 @@ class ChatInteractions:
                         await self.credential_input(current, owner, content, msg_id, is_admin)
                 return True
 
-            # A pending credential card is an open flow: a two-line answer fills it.
-            if len(content.splitlines()) == 2:
+            # A pending credential card is an open flow: multiline input stays local.
+            if len(content.splitlines()) >= 2:
                 candidates = self.credential_candidates(owner, session_id)
                 if candidates:
                     if len(candidates) == 1:
@@ -398,10 +413,10 @@ class ChatInteractions:
         except ValueError:
             await self.reply(owner, "此凭证正在由其他人填写。", msg_id)
             return
-        if item.state not in {"wait_username", "wait_password", "wait_code"}:
-            verification = item.context.get("capture") == "verification_code"
-            item.context["lifetime"] = "on_read" if verification else (lifetime or "persist")
-            item.state = "wait_code" if verification else "wait_username"
+        if item.state not in {"wait_username", "wait_password", "wait_code", "wait_secret"}:
+            kind = credential_input_kind(item.context)
+            item.context["lifetime"] = "on_read" if kind == "code" else (lifetime or "persist")
+            item.state = {"code": "wait_code", "secret": "wait_secret", "sign_in": "wait_username"}[kind]
             item.expires_at = time.time() + 300
         elif lifetime is not None and lifetime != item.context.get("lifetime"):
             await self.reply(owner, "请先 /cancel，再更改保存方式。", msg_id)
@@ -409,8 +424,7 @@ class ChatInteractions:
         if content:
             await self.credential_input(item, owner, content, msg_id, is_admin)
         else:
-            prompt = "请输入验证码。" if item.state == "wait_code" else ("请输入密码。" if item.state == "wait_password" else "请发送账号和密码，每项一行；也可以先发账号。")
-            await self.reply(owner, prompt, msg_id, item=item)
+            await self.reply(owner, self.credential_prompt(item), msg_id, item=item)
 
     async def handle_credential(self, owner, command, args, current, session_id, msg_id, is_admin):
         if not self.can_fill_credential(owner, is_admin):
@@ -419,9 +433,9 @@ class ChatInteractions:
         if command in {"/密码", "/password", "/验证码", "/code"}:
             parts = args.split(None, 1)
             item = self.manager.items.get(parts[0].upper()) if parts else None
-            expected = "wait_code" if command in {"/验证码", "/code"} else "wait_password"
+            expected = {"wait_code"} if command in {"/验证码", "/code"} else {"wait_password", "wait_secret"}
             if (not item or item.kind != "credential" or item.terminal or item.owner != owner
-                    or item.state != expected or current is not item
+                    or item.state not in expected or current is not item
                     or (owner[0] != "private" and item.session_id != session_id)):
                 await self.reply(owner, "请先选择要填写的凭证。", msg_id)
                 return
@@ -447,14 +461,16 @@ class ChatInteractions:
             self.manager.finish(item, "cancelled")
             await self.reply(owner, "无权继续填写此凭证。", msg_id)
             return
-        lines = content.replace("\r\n", "\n").split("\n")
-        if item.state == "wait_username" or (item.state == "wait_password" and len(lines) == 2):
+        content = content.replace("\r\n", "\n")
+        if item.state == "wait_secret":
+            await self._capture(item, owner, content, msg_id)
+            return
+        lines = content.split("\n")
+        if item.state == "wait_username" or (item.state == "wait_password" and
+                len(lines) == 2):
             if (item.context.get("submitted_digest") is not None
                     and lines[0].strip() != item.context.get("username")):
                 await self.reply(owner, "请用相同内容重试，或 /cancel 取消。", msg_id, item=item)
-                return
-            if len(lines) > 2:
-                await self.reply(owner, "请分两行发送：第一行账号，第二行密码。", msg_id, item=item)
                 return
             username = lines[0].strip()
             if not username:
@@ -462,21 +478,31 @@ class ChatInteractions:
                 return
             item.context["username"] = username
             item.state = "wait_password"
-            if len(lines) == 2 and lines[1]:
-                await self._capture(item, owner, lines[1], msg_id)
+            if len(lines) >= 2 and any(lines[1:]):
+                await self._capture(item, owner, "\n".join(lines[1:]), msg_id)
             else:
                 await self.reply(owner, "请输入密码。", msg_id, item=item)
         elif item.state in {"wait_password", "wait_code"}:
-            if len(lines) != 1:
-                await self.reply(owner, "请只发送密码。" if item.state == "wait_password" else "请只发送验证码。", msg_id, item=item)
+            if item.state == "wait_code" and len(lines) != 1:
+                await self.reply(owner, "请只发送验证码。", msg_id, item=item)
                 return
             await self._capture(item, owner, content, msg_id)
         else:
             await self.reply(owner, "正在保存，请稍候。", msg_id)
 
+    @staticmethod
+    def credential_prompt(item):
+        if item.state == "wait_code":
+            return "请输入验证码。"
+        if item.state == "wait_secret":
+            return f"请发送{credential_secret_label(item.context)}；支持整段多行内容，无需填写账号。"
+        if item.state == "wait_password":
+            return "请输入密码。"
+        return "请发送账号和密码，每项一行；也可以先发账号。"
+
     async def _capture(self, item, owner, secret, msg_id):
-        if not secret:
-            await self.reply(owner, "请输入验证码。" if item.state == "wait_code" else "请输入密码。", msg_id, item=item)
+        if not secret or not secret.strip():
+            await self.reply(owner, self.credential_prompt(item), msg_id, item=item)
             return
         if item.expires_at and time.time() >= item.expires_at:
             self.manager.finish(item, "expired")

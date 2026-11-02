@@ -36,6 +36,7 @@ from ..muse.client.render import (
 )
 from ..observability import get_logger, safe_error, trace_event
 from ..muse.service import MuseService
+from ..muse.interactions import credential_input_kind, credential_secret_label
 from .routes import RouteInfo, RouteManager
 
 logger = get_logger(__name__)
@@ -800,10 +801,12 @@ class OutboundDispatcher:
                         hint = "请在 Muse 网页完成此登录。"
                     elif not self.config.credentials_in_place:
                         hint = "请管理员私聊填写。"
-                    elif credential.context.get("capture") == "verification_code":
+                    elif credential_input_kind(credential.context) == "code":
                         hint = "管理员可引用此消息，发送验证码。"
+                    elif credential_input_kind(credential.context) == "secret":
+                        hint = f"管理员可引用此消息，发送{credential_secret_label(credential.context)}（支持整段多行内容，无需填写账号）。"
                     else:
-                        hint = "管理员可引用此消息，分两行发送账号和密码。"
+                        hint = "管理员可引用此消息，第一行发送账号，后续内容发送密码或密钥（支持多行）。"
                     clean_text = chr(10).join((
                         f"【凭证 {credential.id}】{credential.context['page_url']}",
                         hint, f"也可发送 \n/凭证 {credential.id} [保存/一次] [凭证]"))
