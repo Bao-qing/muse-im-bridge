@@ -58,6 +58,8 @@ DEFAULT_ADMIN_ONLY = True
 DEFAULT_UNBOUND_PUSH_TO_ADMIN = True
 # Push approval cards only to the chat the session belongs to (no admin copy).
 DEFAULT_APPROVALS_IN_PLACE = True
+# Let admins fill credential cards in the group that shows them (input visible to members).
+DEFAULT_CREDENTIALS_IN_PLACE = True
 
 # OneBot group messages reaching Muse: "all", "at" (@bot or / command), "prefix".
 DEFAULT_ONEBOT_GROUP_TRIGGER = "all"

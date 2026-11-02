@@ -108,13 +108,14 @@ class TestCredentialReplies(unittest.IsolatedAsyncioTestCase):
             await self.quoted("password", ref="PROMPT==")
         capture.assert_called_once_with(card, "password")
 
-    async def test_group_setting_default_denies_but_explicit_true_allows(self):
+    async def test_group_setting_default_allows_but_explicit_false_denies(self):
         card = self.card()
+        self.adapter.config.credentials_in_place = False
         with patch.object(self.service, "capture_credential", return_value="saved") as capture:
             await self.group(f"/凭证 {card.id}\naccount\npassword")
             capture.assert_not_called()
             self.assertEqual(self.text(), "请私聊填写此凭证。")
-            self.adapter.config.credentials_in_place = True
+            self.adapter.config.credentials_in_place = QQConfig().credentials_in_place
             await self.group(f"/凭证 {card.id}\naccount\npassword")
             capture.assert_called_once_with(card, "password")
         self.service.post_message.assert_not_called()
@@ -303,11 +304,13 @@ class TestCredentialReplies(unittest.IsolatedAsyncioTestCase):
         self.service.post_message.assert_not_called()
 
     def test_config_requires_real_boolean(self):
-        self.assertFalse(QQConfig().credentials_in_place)
+        self.assertTrue(QQConfig().credentials_in_place)
         for value in ("false", 0, None):
             with self.assertRaises(ValueError):
                 QQConfig(credentials_in_place=value)
         path = Path(self.tmp.name) / "config.json"
         path.write_text(json.dumps({"muse": {"client_ip": "127.0.0.1"},
-            "adapters": {"qq": {"credentials_in_place": True}}}), encoding="utf-8")
-        self.assertTrue(ConfigLoader.load(str(path)).qq.credentials_in_place)
+            "adapters": {"qq": {}, "onebot": {"credentials_in_place": False}}}), encoding="utf-8")
+        loaded = ConfigLoader.load(str(path))
+        self.assertTrue(loaded.qq.credentials_in_place)
+        self.assertFalse(loaded.onebot.credentials_in_place)

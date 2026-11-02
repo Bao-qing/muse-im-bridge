@@ -227,7 +227,9 @@ class QQAdapter(ChatGateway):
         raw_content = d.get("content") or ""
         if not isinstance(raw_content, str):
             return
-        content = re.sub(r"<@!?\w+>", "", raw_content).strip()
+        content = re.sub(r"<@!?\w+>", "", raw_content)
+        if not self.interaction_router.is_credential_input((kind, target, user), content, d):
+            content = content.strip()
         await self.handle_inbound(InboundMessage(
             id=msg_id or "",
             source=MessageSource(platform="qq", chat_type=kind, target_id=target,
