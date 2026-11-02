@@ -268,9 +268,9 @@ class ChatInteractions:
     async def advance_queue(self, owner, session_id, msg_id, text):
         """Report a decision together with the next queued card, in one message."""
         queue = self.approval_queue(session_id)
-        if not queue:
-            await self.reply(owner, text + "\n审批已全部完成，可以继续聊天。", msg_id)
-            return
+        # if not queue:
+        #     await self.reply(owner, text + "\n审批已全部完成，可以继续聊天。", msg_id)
+        #     return
         head = queue[0]
         # The background push then skips this chat, which already has the card.
         await self.display_approval(owner, head, msg_id, prefix=text + "\n\n")

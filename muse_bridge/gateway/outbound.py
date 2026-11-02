@@ -806,7 +806,7 @@ class OutboundDispatcher:
                         hint = "管理员可引用此消息，分两行发送账号和密码。"
                     clean_text = chr(10).join((
                         f"【凭证 {credential.id}】{credential.context['page_url']}",
-                        hint, f"也可发送 /凭证 {credential.id}；"))
+                        hint, f"也可发送 \n/凭证 {credential.id} [保存/一次] [凭证]"))
                 elif credential:
                     clean_text = "凭证卡已结束。"
                 else:
