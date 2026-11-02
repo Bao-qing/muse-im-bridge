@@ -45,7 +45,7 @@ def _default_ws_url(base_url: str) -> str:
     return base_url
 
 
-def parse_segments(message, self_id: Optional[str]) -> Tuple[str, bool, List[Attachment], List[Tuple[str, str]]]:
+def parse_segments(message, self_id: Optional[str], *, strip_text: bool = True) -> Tuple[str, bool, List[Attachment], List[Tuple[str, str]]]:
     """``(text, mentions_bot, attachments, references)`` from an event's ``message``.
 
     ``message`` is the Array form; a CQ-code string (``message_format: string``)
@@ -55,7 +55,8 @@ def parse_segments(message, self_id: Optional[str]) -> Tuple[str, bool, List[Att
         mentioned = bool(self_id) and any(qq == self_id for qq in _CQ_AT_RE.findall(message))
         references = [("id", rid) for rid in _CQ_REPLY_RE.findall(message)]
         text = _CQ_AT_RE.sub(lambda m: "" if m.group(1) == self_id else f"@{m.group(1)}", message)
-        return _CQ_RE.sub("", text).strip(), mentioned, [], references
+        text = _CQ_RE.sub("", text)
+        return text.strip() if strip_text else text, mentioned, [], references
 
     parts: List[str] = []
     mentioned = False
@@ -90,7 +91,8 @@ def parse_segments(message, self_id: Optional[str]) -> Tuple[str, bool, List[Att
                 url=url,
                 file_info=str(data.get("file_id") or "") or None,
             ))
-    return "".join(parts).strip(), mentioned, attachments, references
+    text = "".join(parts)
+    return text.strip() if strip_text else text, mentioned, attachments, references
 
 
 class OneBotAdapter(ChatGateway):
@@ -216,8 +218,11 @@ class OneBotAdapter(ChatGateway):
         if not valid_id(user) or not valid_id(target):
             return
 
-        text, mentioned, attachments, _ = parse_segments(event.get("message"), self_id)
-        if not self.triggers(kind, text, mentioned):
+        text, mentioned, attachments, _ = parse_segments(event.get("message"), self_id, strip_text=False)
+        credential_input = self.interaction_router.is_credential_input((kind, target, user), text, event)
+        if not credential_input:
+            text = text.strip()
+        if not credential_input and not self.triggers(kind, text, mentioned):
             return
         for att in attachments:
             if att.file_info and kind == "group":

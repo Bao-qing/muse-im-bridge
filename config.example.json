@@ -18,7 +18,7 @@
       ],
       "admin_only": true,
       "unbound_push_to_admin": true,
-      "credentials_in_place": false,
+      "credentials_in_place": true,
       "approvals_in_place": true,
       "access_requests": {
         "enabled": true,
