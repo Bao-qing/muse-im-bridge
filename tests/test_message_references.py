@@ -196,7 +196,7 @@ class ReactionCase(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(a.client.send_msg.call_count, 1)
             await p._scan_and_dispatch([self.update(11, ['❤️'])], 's')
             self.assertEqual(a.client.send_msg.call_count, 2)
-            self.assertIn('取消反应', str(a.client.send_msg.call_args))
+            self.assertEqual(a.client.send_msg.call_args.args[2][1]['data']['text'], chr(10).join(['❤️', '👍']))
             await p._scan_and_dispatch([self.update(12, [])], 's')
             self.assertEqual(p.reference_store.reaction_state('s', 'old'), (12, []))
 
@@ -238,6 +238,84 @@ class ReactionCase(unittest.IsolatedAsyncioTestCase):
             a.client.send_msg.side_effect = None
             await p._scan_and_dispatch([self.update()], 's')
             self.assertEqual(p.reference_store.reaction_state('s', 'old'), (10, ['👍']))
+
+
+class QQReactionTextCase(unittest.IsolatedAsyncioTestCase):
+    def make_pusher(self, tmp, kind='private'):
+        from muse_bridge.adapters.qq.client import QQClient
+        config = QQConfig(app_id='bot', app_secret='unused', admin_id=['admin'],
+                          routes_file=tmp+'/r', push_state_file=tmp+'/p')
+        client = QQClient('bot', 'unused')
+        client.post_with_retry = mock.Mock(return_value=(200, {'id': 'out'}))
+        mapper = SessionMapper(bindings={kind+':target': 's'})
+        pusher = QQOutboundPusher(config, client, mock.Mock(), MessageDeduplicator(persistence_file=None),
+                                  RouteManager(state_file=None), mapper)
+        pusher.reference_store.remember('s', kind, 'target', 'old', [('ref', 'REFIDX_old')])
+        return pusher, client
+
+    async def test_reaction_uses_text_with_native_quote_and_deduplicates(self):
+        for kind in ('private', 'group'):
+            with self.subTest(kind=kind), tempfile.TemporaryDirectory() as tmp:
+                p, client = self.make_pusher(tmp, kind)
+                await p._scan_and_dispatch([ReactionCase.update()], 's')
+                client.post_with_retry.assert_called_once()
+                payload = client.post_with_retry.call_args.args[1]
+                self.assertEqual(payload['content'], '👍')
+                self.assertEqual(payload.get('msg_type', 0), 0)
+                self.assertNotIn('markdown', payload)
+                self.assertEqual(payload['message_reference'],
+                                 {'message_id': 'REFIDX_old', 'ignore_get_message_error': False})
+                await p._scan_and_dispatch([ReactionCase.update()], 's')
+                client.post_with_retry.assert_called_once()
+                await p._scan_and_dispatch([ReactionCase.update(11, [])], 's')
+                payload = client.post_with_retry.call_args.args[1]
+                self.assertEqual(payload['content'], '👍')
+                self.assertNotIn('markdown', payload)
+                self.assertEqual(payload['message_reference']['message_id'], 'REFIDX_old')
+                self.assertEqual(p.reference_store.reaction_state('s', 'old'), (11, []))
+
+    async def test_plain_text_is_kept_during_passive_active_retry(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            p, client = self.make_pusher(tmp)
+            client.post_with_retry.side_effect = [(400, {'message': 'expired'}), (200, {'id': 'out'})]
+            route = p.route_manager.register('user', 'private', 'target', 'passive-id')
+            result = await p._deliver('private', 'target', '👍', [], [], [], route=route,
+                                      delivery=DeliveryReference('s', 'old', reply_to_id='old', plain_text=True))
+            self.assertTrue(result)
+            self.assertEqual(client.post_with_retry.call_count, 2)
+            first, second = [call.args[1] for call in client.post_with_retry.call_args_list]
+            for payload in (first, second):
+                self.assertEqual(payload['content'], '👍')
+                self.assertNotIn('markdown', payload)
+                self.assertEqual(payload['message_reference']['message_id'], 'REFIDX_old')
+            self.assertEqual(first['msg_id'], 'passive-id')
+            self.assertNotIn('msg_id', second)
+
+    async def test_missing_original_reaction_fallback_remains_plain_text(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            p, client = self.make_pusher(tmp)
+            event = ReactionCase.update()
+            event['payload']['message_id'] = 'missing'
+            await p._scan_and_dispatch([event], 's')
+            payload = client.post_with_retry.call_args.args[1]
+            self.assertIn('原消息在此聊天不可用', payload['content'])
+            self.assertTrue(payload['content'].endswith('👍'))
+            self.assertNotIn('markdown', payload)
+            self.assertNotIn('message_reference', payload)
+
+    async def test_ordinary_replies_keep_markdown_with_or_without_quote(self):
+        for quoted in (False, True):
+            with self.subTest(quoted=quoted), tempfile.TemporaryDirectory() as tmp:
+                p, client = self.make_pusher(tmp)
+                event = assistant(reply='old' if quoted else None)
+                await p._scan_and_dispatch([event], 's')
+                client.post_with_retry.assert_called_once()
+                payload = client.post_with_retry.call_args.args[1]
+                self.assertEqual(payload['msg_type'], 2)
+                self.assertEqual(payload['markdown'], {'content': 'fictional answer'})
+                self.assertNotIn('content', payload)
+                self.assertEqual('message_reference' in payload, quoted)
+
 
 class QQInboundCase(unittest.IsolatedAsyncioTestCase):
     async def test_qq_self_index_and_quote_are_kept_separate(self):

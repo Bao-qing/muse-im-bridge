@@ -120,9 +120,10 @@ class QQOutboundPusher(OutboundDispatcher):
                     delivered_type, delivered_id, body, credential)
             return True
 
-        # 1. Send text chunks
+        # Reaction notifications use text; ordinary replies retain Markdown.
+        plain_text = delivery is not None and delivery.plain_text
         for chunk in chunks:
-            all_delivered = await _deliver_item(content=chunk, md=chunk) and all_delivered
+            all_delivered = await _deliver_item(content=chunk, md=None if plain_text else chunk) and all_delivered
 
         # 2. Send images
         for img in images:

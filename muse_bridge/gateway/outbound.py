@@ -1002,7 +1002,7 @@ class OutboundDispatcher:
         try:
             success = await self._deliver(
                 target_type, target_id, text, [], [], [],
-                delivery=DeliveryReference(session_id, mid, "", mid))
+                delivery=DeliveryReference(session_id, mid, "", mid, plain_text=True))
             if success:
                 self.reference_store.set_reaction_state(session_id, mid, max(seq, prev_seq), emojis)
         except Exception as exc:

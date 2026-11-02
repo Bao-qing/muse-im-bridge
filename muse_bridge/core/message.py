@@ -63,6 +63,7 @@ class DeliveryReference:
     excerpt: str = ""
     reply_to_id: Optional[str] = None
     reply_target: Optional[dict] = None
+    plain_text: bool = False
 
 
 def _fence_open(line: str) -> Optional[dict]:
