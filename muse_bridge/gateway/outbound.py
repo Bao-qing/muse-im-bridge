@@ -20,7 +20,8 @@ from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
 from ..config.models import ChatConfig
 from ..core.deduplicator import MessageDeduplicator
-from ..core.message import chunk_text
+from ..core.message import DeliveryReference, chunk_text
+from ..core.references import MessageReferenceStore
 from ..core.session_map import SessionMapper
 from ..core.state_file import ensure_parent
 from ..muse.client.errors import ConnectionLost, HandshakeError, MuseError, RPCError, SubscribeError, LoginRequired, is_runtime_auth_error
@@ -174,6 +175,13 @@ class OutboundDispatcher:
         self.route_manager = route_manager
         self._on_login_required = on_login_required
         self.session_mapper = session_mapper or SessionMapper()
+        identity = getattr(config, "app_id", None) or getattr(config, "base_url", "")
+        self._reference_state_file = str(config.routes_file) + ".references.local.json" if config.routes_file else None
+        self._reference_identity = f"{self.platform}:{identity}"
+        self.reference_store = MessageReferenceStore(
+            state_file=None if self.platform == "onebot" else self._reference_state_file,
+            identity=self._reference_identity)
+        self._reference_account = None
 
         self._running = False
         self._login_alerted: bool = False
@@ -383,6 +391,7 @@ class OutboundDispatcher:
             logger.debug('baseline fetch for %s failed (%s); treating as empty', session_id[:8], safe_error(e))
             hist = []
         for e in hist:
+            await self._dispatch_reaction(e, session_id, baseline=True)
             if e.get("role") == "assistant" and e.get("message_id"):
                 self._seen_ids.add(e["message_id"])
         self._gated.add(session_id)
@@ -424,6 +433,8 @@ class OutboundDispatcher:
             )
             self._seen_ids = seen_ids
             if action == "baseline":
+                for event in hist:
+                    await self._dispatch_reaction(event, sid, baseline=True)
                 self._last_seq = max(self._last_seq, max_seq)
                 self._save_state()
                 logger.debug('Startup baseline %s (%s): marked %s messages seen, 0 pushed.', sid[:8], reason, skipped)
@@ -465,6 +476,9 @@ class OutboundDispatcher:
             status = payload.get("status") or ev.get("status")
             if status in ("interrupted", "cancelled"):
                 return sid, None
+            return sid, "sync"
+
+        if name == "reactions.updated":
             return sid, "sync"
 
         if name == "delta.presentation":
@@ -607,11 +621,14 @@ class OutboundDispatcher:
 
                         default_sid = next(iter(subscribed_sids)) if len(subscribed_sids) == 1 else None
                         dirty_sids: Set[str] = set()
+                        reaction_events: Dict[str, List[dict]] = {}
 
                         for ev in events:
                             sid, kind = self._classify_push_event(ev, default_sid=default_sid)
                             if not sid:
                                 continue
+                            if (ev.get("event") or ev.get("event_name")) == "reactions.updated":
+                                reaction_events.setdefault(sid, []).append(ev)
                             tracker = trackers.setdefault(sid, PushTurnTracker(sid))
                             if tracker.feed(ev):
                                 dirty_sids.add(sid)
@@ -627,11 +644,13 @@ class OutboundDispatcher:
                         synced: List[Tuple[str, List[dict]]] = []
                         for sid in dirty_sids:
                             try:
-                                synced.append((sid, self._fetch_session(client, sid)))
+                                synced.append((sid, self._fetch_session(client, sid) + reaction_events.get(sid, [])))
                             except Exception as ex:
                                 if self._is_auth_error(ex):
                                     raise
                                 logger.debug('Event-triggered sync failed for %s: %s', sid[:8], safe_error(ex))
+                                if reaction_events.get(sid):
+                                    synced.append((sid, reaction_events[sid]))
                         return synced
 
                     synced_batches = await loop.run_in_executor(None, _read_And_sync_events)
@@ -735,6 +754,14 @@ class OutboundDispatcher:
             if event.get("event_name") == "delta.presentation" and session_id:
                 self.muse_service.interaction_protocol.register_credential(event, session_id)
         ordered = sorted(hist, key=lambda e: e.get("seq") or 0)
+        live_reaction_ids = {
+            (event.get("payload") or {}).get("message_id") for event in ordered
+            if (event.get("event") or event.get("event_name")) == "reactions.updated"
+        }
+        for event in ordered:
+            if event.get("message_id") in live_reaction_ids and "reaction_emoji" in event:
+                continue
+            await self._dispatch_reaction(event, session_id)
         last_user_mid: Optional[str] = None
 
         for event in ordered:
@@ -872,6 +899,12 @@ class OutboundDispatcher:
                     videos=videos,
                     route=route,
                     **({"credential": credential} if credential else {}),
+                    delivery=DeliveryReference(
+                        session_id or "", mid, clean_text[:240],
+                        event.get("reply_to_message_id") or payload.get("reply_to_message_id")
+                        or self._reply_target_id(payload.get("reply_to_target")),
+                        {"type": "presentation", "presentation_event_id": payload.get("presentation_id") or mid}
+                        if event_name == "delta.presentation" else None),
                 )
                 if success:
                     self.deduplicator.mark_delivered([mid])
@@ -893,6 +926,120 @@ class OutboundDispatcher:
     # ------------------------------------------------------------------
     # Platform hooks
     # ------------------------------------------------------------------
+    @staticmethod
+    def _reply_target_id(target):
+        if not isinstance(target, dict):
+            return None
+        if target.get("type") == "message":
+            return target.get("message_id")
+        if target.get("type") == "presentation":
+            return target.get("presentation_event_id")
+        return None
+
+    @staticmethod
+    def _reaction_snapshot(event):
+        name = event.get("event") or event.get("event_name")
+        payload = event.get("payload") or {}
+        if not isinstance(payload, dict):
+            return None
+        if name == "reactions.updated":
+            mid, emojis = payload.get("message_id"), payload.get("reactions")
+            seq = event.get("seq") or payload.get("seq") or 0
+            if not isinstance(emojis, list):
+                return None
+        elif name in ("message.user", "message.assistant", "delta.presentation") and "reaction_emoji" in event:
+            mid = event.get("message_id")
+            emoji = event.get("reaction_emoji")
+            if emoji is not None and not isinstance(emoji, str):
+                return None
+            emojis = [emoji] if emoji else []
+            # History seq is the original message sequence, NOT reaction revision.
+            # Keep it separate from live update ordering.
+            seq = 0
+        else:
+            return None
+        if not isinstance(mid, str) or not mid or type(seq) is not int:
+            return None
+        emojis = [e.get("emoji") if isinstance(e, dict) else e for e in emojis]
+        emojis = list(dict.fromkeys(e for e in emojis if isinstance(e, str) and 0 < len(e) <= 64))[:64]
+        return mid, seq, emojis
+
+    async def _dispatch_reaction(self, event, session_id, baseline=False):
+        snapshot = self._reaction_snapshot(event)
+        if not session_id or snapshot is None:
+            return
+        mid, seq, emojis = snapshot
+        previous = self.reference_store.reaction_state(session_id, mid)
+        if baseline:
+            if previous is None:
+                self.reference_store.set_reaction_state(session_id, mid, seq, emojis)
+            return
+        if previous:
+            prev_seq, old = previous
+            if seq and prev_seq and seq <= prev_seq:
+                return
+            # History is fetched after push batches and is authoritative even
+            # when a newer reaction was missed during a transport disconnect.
+        else:
+            prev_seq, old = 0, []
+        if old == emojis:
+            if seq > prev_seq:
+                self.reference_store.set_reaction_state(session_id, mid, seq, emojis)
+            return
+        target_type, target_id = self._proactive_target(session_id)
+        if not target_id:
+            return
+        additions = [e for e in emojis if e not in old]
+        removals = [e for e in old if e not in emojis]
+        parts = []
+        if additions:
+            parts.append("【Muse 反应】" + " ".join(additions))
+        if removals:
+            parts.append("【Muse 取消反应】" + " ".join(removals))
+        text = chr(10).join(parts)
+        try:
+            success = await self._deliver(
+                target_type, target_id, text, [], [], [],
+                delivery=DeliveryReference(session_id, mid, "", mid))
+            if success:
+                self.reference_store.set_reaction_state(session_id, mid, max(seq, prev_seq), emojis)
+        except Exception as exc:
+            logger.warning("Reaction delivery failed: %s", safe_error(exc))
+
+    def bind_reference_account(self, account_id):
+        """Never reuse another logged-in OneBot account's opaque IDs."""
+        if self.platform != "onebot" or not account_id or self._reference_account == str(account_id):
+            return
+        self._reference_account = str(account_id)
+        self.reference_store = MessageReferenceStore(
+            self._reference_state_file, self._reference_identity + ":" + self._reference_account)
+
+    def quote_for(self, delivery, target_type, target_id):
+        if not delivery or not delivery.reply_to_id:
+            return None
+        return self.reference_store.resolve_muse(
+            delivery.session_id, target_type, target_id, delivery.reply_to_id)
+
+    def quote_text(self, delivery, target_type, target_id):
+        if not delivery or not delivery.reply_to_id:
+            return ""
+        reference = self.quote_for(delivery, target_type, target_id)
+        excerpt = reference.excerpt if reference else "原消息在此聊天不可用"
+        return "【引用】" + (excerpt or "[非文本消息]").replace(chr(10), chr(10) + "> ") + chr(10)
+
+    def remember_delivery(self, delivery, target_type, target_id, body):
+        if not delivery or not delivery.session_id or not isinstance(body, dict):
+            return
+        info = body.get("ext_info") or {}
+        refs = [("id", body.get("id") or body.get("message_id"))]
+        if isinstance(info, dict):
+            refs.append(("ref", info.get("ref_idx")))
+        refs = [(kind, str(value)) for kind, value in refs if value is not None and str(value)]
+        if refs:
+            self.reference_store.remember(
+                delivery.session_id, target_type, target_id, delivery.muse_id,
+                refs, delivery.excerpt, delivery.reply_target)
+
     async def _deliver(
         self,
         target_type: str,
@@ -903,6 +1050,7 @@ class OutboundDispatcher:
         videos: List[dict],
         route: Optional[RouteInfo] = None,
         credential=None,
+        delivery=None,
     ) -> bool:
         """Send one outbound item; True when its text reached the chat.
 

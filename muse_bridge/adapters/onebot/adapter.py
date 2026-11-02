@@ -145,6 +145,7 @@ class OneBotAdapter(ChatGateway):
             info = await asyncio.to_thread(self.client.get_login_info)
             if info.get("user_id"):
                 self.self_id = str(info["user_id"])
+                self.outbound_pusher.bind_reference_account(self.self_id)
                 logger.info('OneBot account %s (%s)', self.self_id, info.get("nickname") or "")
         except Exception as e:
             # Events carry self_id too; the WS lifecycle event fills it in.
@@ -210,7 +211,10 @@ class OneBotAdapter(ChatGateway):
             logger.debug('Duplicate OneBot message ignored: %s', msg_id)
             return
 
-        self_id = self.self_id or self.gateway.self_id or (str(event["self_id"]) if event.get("self_id") else None)
+        self_id = str(event["self_id"]) if event.get("self_id") else self.self_id or self.gateway.self_id
+        if self_id:
+            self.self_id = self_id
+            self.outbound_pusher.bind_reference_account(self_id)
         user = str(event.get("user_id") or "")
         if self_id and user == self_id:
             return
@@ -218,11 +222,13 @@ class OneBotAdapter(ChatGateway):
         if not valid_id(user) or not valid_id(target):
             return
 
-        text, mentioned, attachments, _ = parse_segments(event.get("message"), self_id, strip_text=False)
+        text, mentioned, attachments, references = parse_segments(event.get("message"), self_id, strip_text=False)
         credential_input = self.interaction_router.is_credential_input((kind, target, user), text, event)
         if not credential_input:
             text = text.strip()
-        if not credential_input and not self.triggers(kind, text, mentioned):
+        session_id = self.session_mapper.current(kind, target) or ""
+        known_quote = self.outbound_pusher.reference_store.resolve_channel(session_id, kind, target, references)
+        if not credential_input and not known_quote and not self.triggers(kind, text, mentioned):
             return
         for att in attachments:
             if att.file_info and kind == "group":
@@ -235,4 +241,5 @@ class OneBotAdapter(ChatGateway):
                                  sender_id=user, raw_event=event),
             text=text,
             attachments=attachments,
+            references=references,
         ))
