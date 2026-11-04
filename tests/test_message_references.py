@@ -317,6 +317,83 @@ class QQReactionTextCase(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual('message_reference' in payload, quoted)
 
 
+class SelfReferenceCase(unittest.IsolatedAsyncioTestCase):
+    async def test_event_references_on_qq_and_onebot(self):
+        cases = [
+            ('exact-self', 'answer', 'answer', {}, None),
+            ('bare-self', 'assistant-msg-answer', 'answer', {}, None),
+            ('prefixed-self', 'answer', 'assistant-msg-answer', {}, None),
+            ('payload-self', 'assistant-msg-answer', None,
+             {'message_id': 'assistant-msg-answer', 'reply_to_message_id': 'answer'}, None),
+            ('both-self', 'assistant-msg-answer', 'answer',
+             {'message_id': 'assistant-msg-answer', 'reply_to_message_id': 'answer',
+              'reply_to_target': None}, None),
+            ('payload-identity', 'carrier', 'answer', {'message_id': 'assistant-msg-answer'}, None),
+            ('explicit-self', 'assistant-msg-answer', None,
+             {'reply_to_target': {'type': 'message', 'message_id': 'answer'}}, None),
+            ('known-message', 'answer', 'old', {}, 'old'),
+            ('missing-message', 'answer', 'missing', {}, 'missing'),
+            ('self-then-payload', 'assistant-msg-answer', 'answer',
+             {'reply_to_message_id': 'old'}, 'old'),
+            ('self-then-explicit', 'assistant-msg-answer', 'answer',
+             {'reply_to_message_id': 'answer',
+              'reply_to_target': {'type': 'message', 'message_id': 'old'}}, 'old'),
+            ('self-then-missing', 'assistant-msg-answer', 'answer',
+             {'reply_to_target': {'type': 'message', 'message_id': 'missing'}}, 'missing'),
+            ('shared-root-is-real-quote', 'answer', 'old',
+             {'metadata': {'root_message_execution_id': 'old'}}, 'old'),
+            ('presentation', 'assistant-msg-answer', 'answer',
+             {'reply_to_target': {'type': 'presentation', 'presentation_event_id': 'card'}}, 'card'),
+            ('presentation-distinct-namespace', 'assistant-msg-answer', 'answer',
+             {'reply_to_target': {'type': 'presentation', 'presentation_event_id': 'answer'}}, 'answer'),
+        ]
+        for platform in ('qq', 'onebot'):
+            for name, mid, reply, payload_fields, expected in cases:
+                with self.subTest(platform=platform, case=name), tempfile.TemporaryDirectory() as tmp:
+                    if platform == 'qq':
+                        p, client = QQReactionTextCase.make_pusher(self, tmp, 'group')
+                        target_id, reference = 'target', ('ref', 'REFIDX_old')
+                    else:
+                        adapter, _ = _make_adapter(tmp)
+                        adapter.session_mapper.bind('group', 'G1', 's')
+                        p, client = adapter.outbound_pusher, adapter.client
+                        target_id, reference = 'G1', ('id', '8')
+                        p.reference_store.remember('s', 'group', target_id, 'old', [reference])
+                    for card_id in ('card', 'answer'):
+                        p.reference_store.remember(
+                            's', 'group', target_id, 'carrier-' + card_id,
+                            [(reference[0], 'REFIDX_' + card_id if platform == 'qq' else 'card-' + card_id)],
+                            reply_target={'type': 'presentation', 'presentation_event_id': card_id})
+                    event = assistant(mid, reply)
+                    event['payload'].update(payload_fields)
+                    await p._scan_and_dispatch([event], 's')
+                    expected_ref = reference[1]
+                    if expected in ('card', 'answer'):
+                        expected_ref = 'REFIDX_' + expected if platform == 'qq' else 'card-' + expected
+                    if platform == 'qq':
+                        client.post_with_retry.assert_called_once()
+                        sent = client.post_with_retry.call_args.args[1]
+                        text = sent['markdown']['content']
+                        native_reference = sent.get('message_reference')
+                        if expected and expected != 'missing':
+                            self.assertEqual(native_reference, {
+                                'message_id': expected_ref, 'ignore_get_message_error': False})
+                        else:
+                            self.assertIsNone(native_reference)
+                    else:
+                        client.send_msg.assert_called_once()
+                        segments = client.send_msg.call_args.args[2]
+                        text = ''.join(seg['data']['text'] for seg in segments if seg['type'] == 'text')
+                        replies = [seg for seg in segments if seg['type'] == 'reply']
+                        self.assertEqual(replies, [{'type': 'reply', 'data': {'id': expected_ref}}]
+                                         if expected and expected != 'missing' else [])
+                    if expected == 'missing':
+                        self.assertIn('原消息在此聊天不可用', text)
+                        self.assertTrue(text.endswith('fictional answer'))
+                    else:
+                        self.assertEqual(text, 'fictional answer')
+
+
 class QQInboundCase(unittest.IsolatedAsyncioTestCase):
     async def test_qq_self_index_and_quote_are_kept_separate(self):
         from test_interactions import TestQQInteractions

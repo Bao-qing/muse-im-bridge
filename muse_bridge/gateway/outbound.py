@@ -901,8 +901,7 @@ class OutboundDispatcher:
                     **({"credential": credential} if credential else {}),
                     delivery=DeliveryReference(
                         session_id or "", mid, clean_text[:240],
-                        event.get("reply_to_message_id") or payload.get("reply_to_message_id")
-                        or self._reply_target_id(payload.get("reply_to_target")),
+                        self._event_reply_id(event),
                         {"type": "presentation", "presentation_event_id": payload.get("presentation_id") or mid}
                         if event_name == "delta.presentation" else None),
                 )
@@ -934,6 +933,27 @@ class OutboundDispatcher:
             return target.get("message_id")
         if target.get("type") == "presentation":
             return target.get("presentation_event_id")
+        return None
+
+    @classmethod
+    def _event_reply_id(cls, event):
+        payload = event.get("payload") or {}
+
+        def message_identity(mid):
+            return mid.removeprefix("assistant-msg-") if isinstance(mid, str) else mid
+
+        # Muse may link an assistant message to its own bare execution ID.
+        own_ids = {
+            message_identity(mid) for mid in (event.get("message_id"), payload.get("message_id"))
+            if mid
+        }
+        for candidate in (event.get("reply_to_message_id"), payload.get("reply_to_message_id")):
+            if candidate and message_identity(candidate) not in own_ids:
+                return candidate
+        target = payload.get("reply_to_target")
+        candidate = cls._reply_target_id(target)
+        if candidate and (target.get("type") == "presentation" or message_identity(candidate) not in own_ids):
+            return candidate
         return None
 
     @staticmethod
