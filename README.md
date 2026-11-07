@@ -67,9 +67,21 @@ muse_bridge/
 pip install -e .
 ```
 
-### 2. 配置 `config.json`
+### 2. 初始化配置
 
-从模板复制并填写凭据：
+**方式一：交互式首次配置向导（推荐）**
+
+直接运行向导脚本，按提示输入各渠道基础凭据（支持 QQ / OneBot），随后在任一渠道发送一条消息，脚本将自动捕获您的身份将其设为管理员、将该渠道设为默认渠道，并自动生成最小 `config.json`：
+
+```bash
+python init_config.py
+# 或
+python main.py --setup
+```
+
+**方式二：手动从模板复制**
+
+从模板复制并手动填写凭据：
 
 ```bash
 cp config.example.json config.json

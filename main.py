@@ -34,6 +34,11 @@ def parse_args(argv=None):
         help="Validate configuration and credentials without connecting to live gateways",
     )
     parser.add_argument(
+        "--setup",
+        action="store_true",
+        help="Run interactive first-run setup wizard to configure adapters and gateway",
+    )
+    parser.add_argument(
         "--login",
         action="store_true",
         help="Run interactive pure-protocol login to acquire new cookies.json",
@@ -43,6 +48,31 @@ def parse_args(argv=None):
 
 def main(argv=None) -> int:
     args = parse_args(argv)
+
+    # 0. Setup mode or auto-prompt on first run without config
+    if args.setup:
+        from init_config import FirstRunWizard
+        try:
+            FirstRunWizard(output_file=args.config or "config.json").run_interactive()
+            return 0
+        except Exception as e:
+            logger.error("Setup failed: %s", safe_error(e))
+            return 1
+
+    if not args.config and not args.login and not args.check:
+        if not os.path.exists("config.json") and not os.path.exists("credentials.json"):
+            print("💡 未检测到配置文件 (config.json)。")
+            try:
+                ans = input("是否立即启动首次配置向导？(Y/n): ").strip().lower()
+            except (KeyboardInterrupt, EOFError):
+                ans = "n"
+            if ans != "n":
+                from init_config import FirstRunWizard
+                try:
+                    FirstRunWizard(output_file="config.json").run_interactive()
+                except Exception as e:
+                    logger.error("Setup failed: %s", safe_error(e))
+                    return 1
 
     # 1. Bootstrap safely without files; loading may already detect egress IP.
     configure_logging(LoggingConfig(file=""))
