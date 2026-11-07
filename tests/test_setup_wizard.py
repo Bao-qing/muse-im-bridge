@@ -183,5 +183,76 @@ class TestFirstRunWizard(unittest.TestCase):
         mock_qq_client.send_message.assert_called_once()
 
 
+class TestFullConfigEditor(unittest.TestCase):
+    def test_editor_modifies_muse_category(self):
+        cfg = {"muse": {"session_id": "old_sid", "cookies_file": "old.json"}}
+        from init_config import FullConfigEditor
+        editor = FullConfigEditor(cfg, file_path="dummy.json")
+
+        # Mock user input to change session_id (option 1) then exit category (option 0)
+        with mock.patch("init_config._prompt_input", side_effect=["1", "new_custom_sid", "0"]):
+            editor._edit_muse_category()
+
+        self.assertEqual(cfg["muse"]["session_id"], "new_custom_sid")
+        self.assertTrue(editor._modified)
+
+    def test_editor_modifies_gateway_category(self):
+        cfg = {"gateway": {"login_through_adapter": "qq"}}
+        from init_config import FullConfigEditor
+        editor = FullConfigEditor(cfg, file_path="dummy.json")
+
+        with mock.patch("init_config._prompt_input", side_effect=["1", "onebot", "0"]):
+            editor._edit_gateway_category()
+
+        self.assertEqual(cfg["gateway"]["login_through_adapter"], "onebot")
+
+    def test_editor_modifies_qq_category(self):
+        cfg = {"adapters": {"qq": {"enabled": False, "app_id": "111"}}}
+        from init_config import FullConfigEditor
+        editor = FullConfigEditor(cfg, file_path="dummy.json")
+
+        # Option 1: enabled -> True, Option 2: app_id -> 222, Option 0: exit
+        with mock.patch("init_config._prompt_input", side_effect=["1", "y", "2", "222", "0"]):
+            editor._edit_qq_category()
+
+        self.assertTrue(cfg["adapters"]["qq"]["enabled"])
+        self.assertEqual(cfg["adapters"]["qq"]["app_id"], "222")
+
+    def test_editor_modifies_onebot_category(self):
+        cfg = {"adapters": {"onebot": {"enabled": True, "base_url": "http://127.0.0.1:3000"}}}
+        from init_config import FullConfigEditor
+        editor = FullConfigEditor(cfg, file_path="dummy.json")
+
+        # Option 5: group_trigger -> at, Option 0: exit
+        with mock.patch("init_config._prompt_input", side_effect=["5", "at", "0"]):
+            editor._edit_onebot_category()
+
+        self.assertEqual(cfg["adapters"]["onebot"]["group_trigger"], "at")
+
+    def test_editor_modifies_logging_and_overrides(self):
+        cfg = {"logging": {"level": "INFO"}, "overrides": {"chunk_chars": 1200}}
+        from init_config import FullConfigEditor
+        editor = FullConfigEditor(cfg, file_path="dummy.json")
+
+        with mock.patch("init_config._prompt_input", side_effect=["1", "DEBUG", "0"]):
+            editor._edit_logging_category()
+        self.assertEqual(cfg["logging"]["level"], "DEBUG")
+
+        with mock.patch("init_config._prompt_input", side_effect=["1", "1500", "0"]):
+            editor._edit_overrides_category()
+        self.assertEqual(cfg["overrides"]["chunk_chars"], 1500)
+
+    def test_editor_save_file(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            p = os.path.join(tmp, "test_config.json")
+            from init_config import FullConfigEditor
+            editor = FullConfigEditor({"muse": {"session_id": "test"}}, file_path=p)
+            editor.save()
+
+            with open(p, "r", encoding="utf-8") as f:
+                saved = json.load(f)
+            self.assertEqual(saved["muse"]["session_id"], "test")
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -36,7 +36,7 @@ def parse_args(argv=None):
     parser.add_argument(
         "--setup",
         action="store_true",
-        help="Run interactive first-run setup wizard to configure adapters and gateway",
+        help="Run interactive configuration manager / setup wizard",
     )
     parser.add_argument(
         "--login",
@@ -51,9 +51,11 @@ def main(argv=None) -> int:
 
     # 0. Setup mode or auto-prompt on first run without config
     if args.setup:
-        from init_config import FirstRunWizard
+        import init_config
         try:
-            FirstRunWizard(output_file=args.config or "config.json").run_interactive()
+            target = args.config or "config.json"
+            sys.argv = [sys.argv[0], target]
+            init_config.main()
             return 0
         except Exception as e:
             logger.error("Setup failed: %s", safe_error(e))

@@ -1,13 +1,9 @@
 #!/usr/bin/env python3
-"""Muse Bridge 首次启动配置向导 (First-run Setup Wizard)
+"""Muse Bridge 配置管理与首次启动向导 (Config Manager & Setup Wizard)
 
-功能流程：
-1. 交互式选择并配置渠道（QQ 官方机器人 / OneBot NapCat，支持多选或单选）；
-2. 启动对应渠道的网关 (Gateway) 监听入站消息；
-3. 提示用户在对应渠道中发送一条消息；
-4. 第一个发消息的渠道成为默认登录渠道 (`gateway.login_through_adapter`)；
-5. 第一个发消息的用户自动成为默认管理员 (`admin_id`)，并加入白名单；
-6. 自动发送回复确认，并生成精简最小配置保存至 `config.json`。
+功能包含：
+1. 【首次启动向导】：交互式配置渠道凭证、开启网关监听、自动捕获首条消息将发送者设为管理员，并将对话绑定至主会话；
+2. 【全量配置分类修改器】：支持按清晰分类（Muse 核心、登录网关、QQ 适配器、OneBot 适配器、日志与追踪、高级与限制）对所有配置项进行交互式编辑、预览和保存。
 """
 
 from __future__ import annotations
@@ -17,6 +13,7 @@ import json
 import os
 import re
 import sys
+import uuid
 from typing import Any, Dict, List, Optional, Tuple
 
 # 确保项目根目录在 sys.path 中
@@ -25,21 +22,76 @@ if ROOT_DIR not in sys.path:
     sys.path.insert(0, ROOT_DIR)
 
 from muse_bridge.config import constants
-from muse_bridge.observability import configure_logging, get_logger, safe_error
 from muse_bridge.config.models import LoggingConfig
+from muse_bridge.observability import configure_logging, get_logger, safe_error
 
 logger = get_logger("setup_wizard")
 
 
-def _prompt_input(prompt: str, default: str = "", secret: bool = False) -> str:
-    """获取用户输入，支持默认值显示。"""
+# ----------------------------------------------------------------------
+# 交互辅助函数
+# ----------------------------------------------------------------------
+
+def _prompt_input(prompt: str, default: str = "") -> str:
     display_prompt = f"{prompt} [{default}]: " if default else f"{prompt}: "
     try:
         val = input(display_prompt).strip()
     except (KeyboardInterrupt, EOFError):
-        print("\n[!] 配置已取消。")
+        print("\n[!] 操作已取消。")
         sys.exit(0)
     return val if val else default
+
+
+def _prompt_str(title: str, current_val: Any, default_val: str = "") -> str:
+    curr_str = "" if current_val is None else str(current_val)
+    disp = curr_str if curr_str else default_val
+    val = _prompt_input(f"{title}", default=disp)
+    return val
+
+
+def _prompt_bool(title: str, current_val: Any) -> bool:
+    curr_bool = bool(current_val) if current_val is not None else False
+    disp = "Y/n" if curr_bool else "y/N"
+    while True:
+        raw = _prompt_input(f"{title} ({disp})", default="y" if curr_bool else "n").strip().lower()
+        if raw in ("y", "yes", "true", "1"):
+            return True
+        if raw in ("n", "no", "false", "0"):
+            return False
+        print("❌ 请输入 y 或 n。")
+
+
+def _prompt_int(title: str, current_val: Any, default_val: int = 0) -> int:
+    curr_int = int(current_val) if (current_val is not None and str(current_val).isdigit()) else default_val
+    while True:
+        raw = _prompt_input(f"{title}", default=str(curr_int))
+        try:
+            return int(raw)
+        except ValueError:
+            print("❌ 请输入有效的整数。")
+
+
+def _prompt_choice(title: str, choices: List[str], current_val: str) -> str:
+    disp_choices = "/".join(choices)
+    while True:
+        raw = _prompt_input(f"{title} ({disp_choices})", default=current_val).strip()
+        if raw in choices:
+            return raw
+        print(f"❌ 请在选项目录中选择: {disp_choices}")
+
+
+def _prompt_str_list(title: str, current_val: Any) -> List[str]:
+    curr_list = current_val if isinstance(current_val, list) else []
+    disp = ", ".join(str(x) for x in curr_list) if curr_list else "空"
+    print(f"当前 {title}: {disp}")
+    print("输入格式：以英文或中文逗号、空格分隔的列表；输入 clear 清空；直接回车保持不变。")
+    raw = _prompt_input("请输入新值", default="").strip()
+    if not raw:
+        return [str(x) for x in curr_list]
+    if raw.lower() in ("clear", "none", "[]", "空"):
+        return []
+    items = re.split(r"[,，\s]+", raw)
+    return [i.strip() for i in items if i.strip()]
 
 
 def _default_ws_url(base_url: str) -> str:
@@ -53,14 +105,409 @@ def _default_ws_url(base_url: str) -> str:
     return f"ws://{url}"
 
 
+# ----------------------------------------------------------------------
+# 全量配置交互修改器
+# ----------------------------------------------------------------------
+
+class FullConfigEditor:
+    """提供按大类层级交互式修改 config.json 全量设置。"""
+
+    def __init__(self, config_data: dict, file_path: str = "config.json"):
+        self.data = config_data
+        self.file_path = file_path
+        self._modified = False
+
+        # 确保关键根节点存在
+        self.data.setdefault("muse", {})
+        self.data.setdefault("adapters", {})
+        self.data.setdefault("gateway", {})
+        self.data.setdefault("logging", {})
+        self.data.setdefault("overrides", {})
+
+    def save(self) -> None:
+        try:
+            os.makedirs(os.path.dirname(os.path.abspath(self.file_path)), exist_ok=True)
+            with open(self.file_path, "w", encoding="utf-8") as f:
+                json.dump(self.data, f, indent=2, ensure_ascii=False)
+                f.write("\n")
+            print(f"✅ 配置文件已成功保存至: {self.file_path}")
+            self._modified = False
+        except Exception as e:
+            print(f"❌ 保存配置文件失败: {safe_error(e)}")
+
+    def run_menu(self) -> None:
+        while True:
+            print("\n" + "=" * 60)
+            print("          ⚙️  Muse IM Bridge 全量配置分类设置")
+            print("=" * 60)
+            print("请选择要修改的配置分类：")
+            print("  [1] 🧠 Muse 核心配置 (会话ID / Cookie / 域名 / 审批模式)")
+            print("  [2] 🚪 默认登录通道 (gateway.login_through_adapter)")
+            print("  [3] 🐧 QQ 官方机器人 (凭据 / 管理员 / 权限开关 / 白名单)")
+            print("  [4] 🤖 OneBot (NapCat) (地址 / Token / 触发策略 / 白名单)")
+            print("  [5] 📝 日志与监控 (级别 / 控制台 / 日志文件 / 追踪 Trace)")
+            print("  [6] ⚡ 高级限制与性能参数 (分块字符 / 消息去重 / 超时参数)")
+            print("  [7] 📄 预览当前完整 JSON 配置")
+            print("  [8] 💾 保存修改到文件")
+            print("  [0] 保存并退出")
+            print("-" * 60)
+
+            choice = _prompt_input("请输入分类编号 (0-8)", default="0")
+            if choice == "0":
+                if self._modified:
+                    self.save()
+                break
+            elif choice == "1":
+                self._edit_muse_category()
+            elif choice == "2":
+                self._edit_gateway_category()
+            elif choice == "3":
+                self._edit_qq_category()
+            elif choice == "4":
+                self._edit_onebot_category()
+            elif choice == "5":
+                self._edit_logging_category()
+            elif choice == "6":
+                self._edit_overrides_category()
+            elif choice == "7":
+                print("\n" + "=" * 60)
+                print(json.dumps(self.data, indent=2, ensure_ascii=False))
+                print("=" * 60)
+            elif choice == "8":
+                self.save()
+            else:
+                print("❌ 无效的选项，请重新输入。")
+
+    # ---------------- 1. Muse 核心分类 ----------------
+    def _edit_muse_category(self) -> None:
+        m = self.data.setdefault("muse", {})
+        appr = m.setdefault("approval", {})
+        while True:
+            print("\n--- [1] 🧠 Muse 核心配置 ---")
+            print(f"  [1] session_id (主会话 ID):      {m.get('session_id') or '(未设置)'}")
+            print(f"  [2] cookies_file (Cookie 文件):    {m.get('cookies_file') or 'cookies.json'}")
+            print(f"  [3] mint_file (Token 凭证文件):    {m.get('mint_file') or '.mint.json'}")
+            print(f"  [4] host (Muse 域名):             {m.get('host') or constants.DEFAULT_MUSE_HOST}")
+            print(f"  [5] client_ip (公网出口 IP):       {m.get('client_ip') or '(留空自动检测)'}")
+            print(f"  [6] timezone (时区):              {m.get('timezone') or constants.DEFAULT_MUSE_TIMEZONE}")
+            print(f"  [7] proxy_url (Muse 专用代理):     {m.get('proxy_url') or '(直连无代理)'}")
+            print(f"  [8] approval.mode (审批决策模式):  {appr.get('mode') or 'manual'} [manual/allow_all/deny_all]")
+            print(f"  [9] approval.notify (审批时通知):  {'是' if appr.get('notify', True) else '否'}")
+            print("  [0] 返回上级菜单")
+
+            c = _prompt_input("请选择要修改的项编号 (0-9)", default="0")
+            if c == "0":
+                break
+            elif c == "1":
+                curr = m.get("session_id", "")
+                val = _prompt_str("主会话 Session ID (留空可随机生成或填已有会话 ID)", curr)
+                m["session_id"] = val
+                self._modified = True
+            elif c == "2":
+                m["cookies_file"] = _prompt_str("Cookie 文件保存路径", m.get("cookies_file", "cookies.json"))
+                self._modified = True
+            elif c == "3":
+                m["mint_file"] = _prompt_str("Token 凭据文件保存路径", m.get("mint_file", ".mint.json"))
+                self._modified = True
+            elif c == "4":
+                m["host"] = _prompt_str("Muse 服务端域名", m.get("host", constants.DEFAULT_MUSE_HOST))
+                self._modified = True
+            elif c == "5":
+                val = _prompt_str("公网出口 IP (留空则在启动时自动探测)", m.get("client_ip", ""))
+                m["client_ip"] = val
+                self._modified = True
+            elif c == "6":
+                m["timezone"] = _prompt_str("时区", m.get("timezone", constants.DEFAULT_MUSE_TIMEZONE))
+                self._modified = True
+            elif c == "7":
+                val = _prompt_str("代理地址 (如 http://127.0.0.1:7890，留空为直连)", m.get("proxy_url", ""))
+                m["proxy_url"] = val if val else None
+                self._modified = True
+            elif c == "8":
+                appr["mode"] = _prompt_choice("审批模式", ["manual", "allow_all", "deny_all"], appr.get("mode", "manual"))
+                self._modified = True
+            elif c == "9":
+                appr["notify"] = _prompt_bool("审批发生时是否向聊天发送通知卡片", appr.get("notify", True))
+                self._modified = True
+
+    # ---------------- 2. Gateway 分类 ----------------
+    def _edit_gateway_category(self) -> None:
+        gw = self.data.setdefault("gateway", {})
+        while True:
+            curr = gw.get("login_through_adapter", "")
+            print("\n--- [2] 🚪 默认登录通道配置 ---")
+            print(f"当前 login_through_adapter: {curr or '(未设置)'}")
+            print("说明：当 Cookie 失效进入登录回落时，系统会优先通过此适配器私聊管理员提示登录。")
+            print("可选值: qq / onebot / 留空")
+            print("  [1] 修改 login_through_adapter")
+            print("  [0] 返回上级菜单")
+
+            c = _prompt_input("请输入选项 (0/1)", default="0")
+            if c == "0":
+                break
+            elif c == "1":
+                gw["login_through_adapter"] = _prompt_choice("请选择登录通知适配器", ["qq", "onebot", ""], curr)
+                self._modified = True
+
+    # ---------------- 3. QQ 适配器分类 ----------------
+    def _edit_qq_category(self) -> None:
+        adapters = self.data.setdefault("adapters", {})
+        qq = adapters.setdefault("qq", {})
+        acc = qq.setdefault("access_requests", {})
+        wl = qq.setdefault("whitelist", {})
+        while True:
+            enabled = qq.get("enabled", False)
+            print("\n--- [3] 🐧 QQ 官方机器人适配器 ---")
+            print(f"  [1] enabled (是否启用):               {'已启用' if enabled else '已禁用'}")
+            print(f"  [2] app_id (Bot AppID):              {qq.get('app_id') or '(未设置)'}")
+            print(f"  [3] app_secret (Bot AppSecret):      {'******' if qq.get('app_secret') else '(未设置)'}")
+            print(f"  [4] admin_id (超级管理员 OpenID 列表): {qq.get('admin_id') or []}")
+            print(f"  [5] admin_only (管理指令仅限管理员私聊): {'是' if qq.get('admin_only', True) else '否'}")
+            print(f"  [6] unbound_push_to_admin (未绑定消息推管理员): {'是' if qq.get('unbound_push_to_admin', True) else '否'}")
+            print(f"  [7] credentials_in_place (群内填凭证): {'允许' if qq.get('credentials_in_place', True) else '禁止'}")
+            print(f"  [8] allow_all_private (私聊全员免白名单): {'是' if qq.get('allow_all_private', False) else '否'}")
+            print(f"  [9] allow_all_group (群聊全员免白名单):   {'是' if qq.get('allow_all_group', False) else '否'}")
+            print(f"  [10] access_requests (白名单申请功能):  {'开启' if acc.get('enabled', True) else '关闭'}, 自动通过: {'是' if acc.get('auto_approve', False) else '否'}")
+            print(f"  [11] whitelist.private (私聊白名单用户): {wl.get('private') or []}")
+            print(f"  [12] catch_up_enabled (启动历史消息补发): {'是' if qq.get('catch_up_enabled', False) else '否'}")
+            print(f"  [13] session_bindings (会话固定映射字典): {qq.get('session_bindings') or {}}")
+            print("  [0] 返回上级菜单")
+
+            c = _prompt_input("请选择要修改的项编号 (0-13)", default="0")
+            if c == "0":
+                break
+            elif c == "1":
+                qq["enabled"] = _prompt_bool("是否启用 QQ 适配器", qq.get("enabled", False))
+                self._modified = True
+            elif c == "2":
+                qq["app_id"] = _prompt_str("QQ Bot AppID", qq.get("app_id", ""))
+                self._modified = True
+            elif c == "3":
+                qq["app_secret"] = _prompt_str("QQ Bot AppSecret", qq.get("app_secret", ""))
+                self._modified = True
+            elif c == "4":
+                qq["admin_id"] = _prompt_str_list("管理员 OpenID 列表", qq.get("admin_id", []))
+                self._modified = True
+            elif c == "5":
+                qq["admin_only"] = _prompt_bool("管理指令(/switch, /new, /delete等)是否仅限管理员在私聊执行", qq.get("admin_only", True))
+                self._modified = True
+            elif c == "6":
+                qq["unbound_push_to_admin"] = _prompt_bool("未绑定聊天的主动推送是否转交首位管理员私聊", qq.get("unbound_push_to_admin", True))
+                self._modified = True
+            elif c == "7":
+                qq["credentials_in_place"] = _prompt_bool("是否允许在群聊中直接填写凭证卡片", qq.get("credentials_in_place", True))
+                self._modified = True
+            elif c == "8":
+                qq["allow_all_private"] = _prompt_bool("是否开放所有私聊（无需加入白名单即可使用）", qq.get("allow_all_private", False))
+                self._modified = True
+            elif c == "9":
+                qq["allow_all_group"] = _prompt_bool("是否开放所有群聊（无需加入白名单即可使用）", qq.get("allow_all_group", False))
+                self._modified = True
+            elif c == "10":
+                acc["enabled"] = _prompt_bool("是否开放 /申请 白名单指令", acc.get("enabled", True))
+                acc["auto_approve"] = _prompt_bool("普通用户发送 /申请 时是否自动通过", acc.get("auto_approve", False))
+                self._modified = True
+            elif c == "11":
+                wl["private"] = _prompt_str_list("私聊白名单 OpenID 列表", wl.get("private", []))
+                self._modified = True
+            elif c == "12":
+                qq["catch_up_enabled"] = _prompt_bool("服务启动时是否追赶补发离线期间的消息", qq.get("catch_up_enabled", False))
+                self._modified = True
+            elif c == "13":
+                print("会话预绑定示例格式：private:OPENID_1=SESSION_ID_1, group:GID_1=SESSION_ID_2")
+                curr_b = qq.get("session_bindings", {})
+                print(f"当前预绑定: {curr_b}")
+                raw_b = _prompt_input("输入映射(输入 clear 清空，回车保持)", default="")
+                if raw_b.lower() in ("clear", "none", "{}"):
+                    qq["session_bindings"] = {}
+                    self._modified = True
+                elif raw_b:
+                    b_dict = {}
+                    for item in re.split(r"[,，\s]+", raw_b):
+                        if "=" in item:
+                            k, _, v = item.partition("=")
+                            b_dict[k.strip()] = v.strip()
+                    qq["session_bindings"] = b_dict
+                    self._modified = True
+
+    # ---------------- 4. OneBot 适配器分类 ----------------
+    def _edit_onebot_category(self) -> None:
+        adapters = self.data.setdefault("adapters", {})
+        ob = adapters.setdefault("onebot", {})
+        acc = ob.setdefault("access_requests", {})
+        wl = ob.setdefault("whitelist", {})
+        while True:
+            enabled = ob.get("enabled", False)
+            print("\n--- [4] 🤖 OneBot (NapCat) 适配器 ---")
+            print(f"  [1] enabled (是否启用):               {'已启用' if enabled else '已禁用'}")
+            print(f"  [2] base_url (NapCat HTTP 接口地址): {ob.get('base_url') or '(未设置)'}")
+            print(f"  [3] access_token (访问 Token 鉴权):   {ob.get('access_token') or '(未设置)'}")
+            print(f"  [4] ws_url (正向 WebSocket 地址):     {ob.get('ws_url') or '(未设置)'}")
+            print(f"  [5] group_trigger (群消息触发策略):    {ob.get('group_trigger', 'all')} [all全部/at艾特/prefix前缀]")
+            print(f"  [6] admin_id (超级管理员 QQ 号列表):   {ob.get('admin_id') or []}")
+            print(f"  [7] admin_only (管理指令仅限管理员私聊): {'是' if ob.get('admin_only', True) else '否'}")
+            print(f"  [8] allow_all_private (私聊全员免白名单): {'是' if ob.get('allow_all_private', False) else '否'}")
+            print(f"  [9] allow_all_group (群聊全员免白名单):   {'是' if ob.get('allow_all_group', False) else '否'}")
+            print(f"  [10] access_requests (白名单申请功能):  {'开启' if acc.get('enabled', True) else '关闭'}, 自动通过: {'是' if acc.get('auto_approve', False) else '否'}")
+            print(f"  [11] whitelist.private (私聊白名单 QQ): {wl.get('private') or []}")
+            print(f"  [12] whitelist.groups (群白名单 群号):   {wl.get('groups') or []}")
+            print(f"  [13] session_bindings (会话预绑定映射):   {ob.get('session_bindings') or {}}")
+            print("  [0] 返回上级菜单")
+
+            c = _prompt_input("请选择要修改的项编号 (0-13)", default="0")
+            if c == "0":
+                break
+            elif c == "1":
+                ob["enabled"] = _prompt_bool("是否启用 OneBot 适配器", ob.get("enabled", False))
+                self._modified = True
+            elif c == "2":
+                url = _prompt_str("NapCat HTTP Base URL (如 http://127.0.0.1:3000)", ob.get("base_url", ""))
+                if url and not url.startswith("http://") and not url.startswith("https://"):
+                    url = "http://" + url
+                ob["base_url"] = url
+                if not ob.get("ws_url") and url:
+                    ob["ws_url"] = _default_ws_url(url)
+                self._modified = True
+            elif c == "3":
+                ob["access_token"] = _prompt_str("Access Token (若未启用 token 鉴权留空)", ob.get("access_token", ""))
+                self._modified = True
+            elif c == "4":
+                ob["ws_url"] = _prompt_str("正向 WebSocket URL", ob.get("ws_url", _default_ws_url(ob.get("base_url", ""))))
+                self._modified = True
+            elif c == "5":
+                ob["group_trigger"] = _prompt_choice("群聊响应规则", ["all", "at", "prefix"], ob.get("group_trigger", "all"))
+                self._modified = True
+            elif c == "6":
+                ob["admin_id"] = _prompt_str_list("管理员 QQ 号列表", ob.get("admin_id", []))
+                self._modified = True
+            elif c == "7":
+                ob["admin_only"] = _prompt_bool("管理指令是否仅限管理员在私聊执行", ob.get("admin_only", True))
+                self._modified = True
+            elif c == "8":
+                ob["allow_all_private"] = _prompt_bool("是否开放所有私聊免白名单", ob.get("allow_all_private", False))
+                self._modified = True
+            elif c == "9":
+                ob["allow_all_group"] = _prompt_bool("是否开放所有群聊免白名单", ob.get("allow_all_group", False))
+                self._modified = True
+            elif c == "10":
+                acc["enabled"] = _prompt_bool("是否开放 /申请 白名单指令", acc.get("enabled", True))
+                acc["auto_approve"] = _prompt_bool("发送 /申请 时是否自动通过", acc.get("auto_approve", False))
+                self._modified = True
+            elif c == "11":
+                wl["private"] = _prompt_str_list("私聊白名单 QQ 号列表", wl.get("private", []))
+                self._modified = True
+            elif c == "12":
+                raw_groups = _prompt_str_list("白名单开放群号列表 (数字群号)", wl.get("groups", []))
+                # 尝试将数字串转为 int 保持规范
+                int_groups = []
+                for g in raw_groups:
+                    try:
+                        int_groups.append(int(g))
+                    except ValueError:
+                        int_groups.append(g)
+                wl["groups"] = int_groups
+                self._modified = True
+            elif c == "13":
+                curr_b = ob.get("session_bindings", {})
+                print(f"当前预绑定: {curr_b}")
+                raw_b = _prompt_input("输入映射(如 private:12345=SESS_1, 输入 clear 清空)", default="")
+                if raw_b.lower() in ("clear", "none", "{}"):
+                    ob["session_bindings"] = {}
+                    self._modified = True
+                elif raw_b:
+                    b_dict = {}
+                    for item in re.split(r"[,，\s]+", raw_b):
+                        if "=" in item:
+                            k, _, v = item.partition("=")
+                            b_dict[k.strip()] = v.strip()
+                    ob["session_bindings"] = b_dict
+                    self._modified = True
+
+    # ---------------- 5. 日志与追踪分类 ----------------
+    def _edit_logging_category(self) -> None:
+        log = self.data.setdefault("logging", {})
+        while True:
+            print("\n--- [5] 📝 日志与追踪配置 ---")
+            print(f"  [1] level (日志输出级别):       {log.get('level', 'INFO')} [DEBUG/INFO/WARNING/ERROR]")
+            print(f"  [2] console (是否输出到控制台):  {'是' if log.get('console', True) else '否'}")
+            print(f"  [3] file (日志文件输出路径):     {log.get('file') or '(留空禁用写文件)'}")
+            print(f"  [4] trace (是否开启诊断追踪):    {'开启' if log.get('trace', False) else '关闭'}")
+            print(f"  [5] trace_file (追踪日志路径):   {log.get('trace_file') or 'logs/trace.jsonl'}")
+            print(f"  [6] max_bytes (单日志文件大小):  {log.get('max_bytes', 10485760)} 字节 ({log.get('max_bytes', 10485760)//(1024*1024)}MB)")
+            print(f"  [7] backup_count (备份轮转数):   {log.get('backup_count', 5)}")
+            print("  [0] 返回上级菜单")
+
+            c = _prompt_input("请选择要修改的项编号 (0-7)", default="0")
+            if c == "0":
+                break
+            elif c == "1":
+                log["level"] = _prompt_choice("日志等级", ["DEBUG", "INFO", "WARNING", "ERROR"], log.get("level", "INFO"))
+                self._modified = True
+            elif c == "2":
+                log["console"] = _prompt_bool("是否输出控制台日志", log.get("console", True))
+                self._modified = True
+            elif c == "3":
+                f_path = _prompt_str("日志文件路径 (留空不写入文件)", log.get("file", "logs/bridge.log"))
+                log["file"] = f_path if f_path else None
+                self._modified = True
+            elif c == "4":
+                log["trace"] = _prompt_bool("是否开启结构化诊断追踪 trace.jsonl", log.get("trace", False))
+                self._modified = True
+            elif c == "5":
+                log["trace_file"] = _prompt_str("追踪日志路径", log.get("trace_file", "logs/trace.jsonl"))
+                self._modified = True
+            elif c == "6":
+                log["max_bytes"] = _prompt_int("单日志最大字节数", log.get("max_bytes", 10485760))
+                self._modified = True
+            elif c == "7":
+                log["backup_count"] = _prompt_int("日志文件备份保留数量", log.get("backup_count", 5))
+                self._modified = True
+
+    # ---------------- 6. 高级性能与覆盖参数 ----------------
+    def _edit_overrides_category(self) -> None:
+        ov = self.data.setdefault("overrides", {})
+        while True:
+            print("\n--- [6] ⚡ 高级性能与全局覆盖参数 ---")
+            print(f"  [1] chunk_chars (长文本单段字符上限):        {ov.get('chunk_chars', constants.DEFAULT_CHUNK_CHARS)}")
+            print(f"  [2] max_chunks (单条回复最多拆分段数):        {ov.get('max_chunks', constants.DEFAULT_MAX_CHUNKS)}")
+            print(f"  [3] max_active_chunks (主动发送限额):       {ov.get('max_active_chunks', constants.DEFAULT_MAX_ACTIVE_CHUNKS)}")
+            print(f"  [4] gateway_dedup_s (网关消息去重窗口秒数):   {ov.get('gateway_dedup_s', constants.DEFAULT_GATEWAY_DEDUP_S)}")
+            print(f"  [5] download_timeout_s (文件下载超时秒数):   {ov.get('download_timeout_s', constants.DEFAULT_DOWNLOAD_TIMEOUT_S)}")
+            print(f"  [6] user_agent (全局 HTTP/WS 请求 User-Agent): {ov.get('user_agent', constants.DEFAULT_USER_AGENT[:40])}...")
+            print("  [0] 返回上级菜单")
+
+            c = _prompt_input("请选择要修改的项编号 (0-6)", default="0")
+            if c == "0":
+                break
+            elif c == "1":
+                ov["chunk_chars"] = _prompt_int("长文本单段字符上限", ov.get("chunk_chars", constants.DEFAULT_CHUNK_CHARS))
+                self._modified = True
+            elif c == "2":
+                ov["max_chunks"] = _prompt_int("单条回复最多拆分段数", ov.get("max_chunks", constants.DEFAULT_MAX_CHUNKS))
+                self._modified = True
+            elif c == "3":
+                ov["max_active_chunks"] = _prompt_int("主动消息分段上限", ov.get("max_active_chunks", constants.DEFAULT_MAX_ACTIVE_CHUNKS))
+                self._modified = True
+            elif c == "4":
+                ov["gateway_dedup_s"] = _prompt_int("消息防重复去重窗口时长 (秒)", ov.get("gateway_dedup_s", constants.DEFAULT_GATEWAY_DEDUP_S))
+                self._modified = True
+            elif c == "5":
+                ov["download_timeout_s"] = _prompt_int("媒体附件下载超时时长 (秒)", ov.get("download_timeout_s", constants.DEFAULT_DOWNLOAD_TIMEOUT_S))
+                self._modified = True
+            elif c == "6":
+                ov["user_agent"] = _prompt_str("全局 User-Agent", ov.get("user_agent", constants.DEFAULT_USER_AGENT))
+                self._modified = True
+
+
+# ----------------------------------------------------------------------
+# 首次启动引导向导
+# ----------------------------------------------------------------------
+
 class FirstRunWizard:
     def __init__(self, output_file: str = "config.json"):
         self.output_file = output_file
         self.selected_channels: List[str] = []
         self.channel_configs: Dict[str, dict] = {}
-
-        # 捕获到的首条消息结果
-        # (channel_name, user_id, chat_type, target_id, raw_msg_id)
         self.first_message_event: Optional[Tuple[str, str, str, str, Optional[str]]] = None
         self._captured_event = asyncio.Event()
 
@@ -68,15 +515,8 @@ class FirstRunWizard:
         print("=" * 60)
         print("     🚀 Muse IM Bridge 首次启动配置向导")
         print("=" * 60)
-        print("本向导将帮助您快速配置聊天渠道，并通过发送一条消息")
-        print("自动识别并绑定您的管理员身份与默认渠道。\n")
-
-        if os.path.exists(self.output_file):
-            print(f"⚠️  检测到已存在配置文件: {self.output_file}")
-            override = _prompt_input("是否重新配置并覆盖该文件？(y/N)", default="n").lower()
-            if override != "y":
-                print("已退出向导，保留现有配置。")
-                return
+        print("本向导将帮助您配置聊天渠道，并通过发送一条消息")
+        print("自动识别并绑定您的管理员身份与主会话。\n")
 
         # 1. 选择渠道
         self._select_channels()
@@ -148,7 +588,7 @@ class FirstRunWizard:
 
         access_token = _prompt_input("请输入 OneBot Access Token (若未设置留空即可)", default="").strip()
         default_ws = _default_ws_url(base_url)
-        ws_url = _prompt_input(f"请输入 OneBot 正向 WebSocket URL", default=default_ws).strip()
+        ws_url = _prompt_input("请输入 OneBot 正向 WebSocket URL", default=default_ws).strip()
 
         self.channel_configs["onebot"] = {
             "base_url": base_url,
@@ -158,7 +598,6 @@ class FirstRunWizard:
 
     async def _listen_for_first_message(self) -> None:
         """启动各选定渠道的轻量网关，等待第一个发消息的用户。"""
-        # 配置静默日志，避免刷屏干扰用户输入引导
         configure_logging(LoggingConfig(level="INFO", console=True, file=None))
 
         tasks = []
@@ -179,7 +618,6 @@ class FirstRunWizard:
                 )
                 clients["qq"] = qq_client
 
-                # 先测试一次 access_token 获取，以便提早发现 AppID/AppSecret 错误
                 print("[QQ] 正在校验 AppID 与 AppSecret 并获取 AccessToken...")
                 loop = asyncio.get_running_loop()
                 await loop.run_in_executor(None, qq_client.get_access_token)
@@ -221,7 +659,6 @@ class FirstRunWizard:
                 ob_client = OneBotClient(base_url=ob_cfg["base_url"], access_token=ob_cfg["access_token"])
                 clients["onebot"] = ob_client
 
-                # 测试 HTTP 连通性
                 print(f"[OneBot] 正在测试连接 NapCat API: {ob_cfg['base_url']} ...")
                 loop = asyncio.get_running_loop()
                 try:
@@ -239,7 +676,6 @@ class FirstRunWizard:
                     if event.get("post_type") == "message":
                         msg_type = event.get("message_type")  # "private" or "group"
                         user_id = str(event.get("user_id") or "")
-                        # 忽略机器人自己发的消息
                         if bot_id and user_id == bot_id:
                             return
                         target_id = str(event.get("group_id") if msg_type == "group" else user_id)
@@ -267,15 +703,14 @@ class FirstRunWizard:
         print("👉 请在您刚刚配置的机器人聊天中，发送任意一条消息（私聊或群聊发送）：")
         print("   - 第一个发消息的渠道将自动设为【默认登录渠道】")
         print("   - 您将自动成为【系统超级管理员】并加入白名单")
+        print("   - 您的本次私聊对话将自动绑定至【主会话】")
         print("*" * 60 + "\n")
 
-        # 等待第一条消息到达
         try:
             await self._captured_event.wait()
         except asyncio.CancelledError:
             pass
 
-        # 捕获到了第一条消息，给用户发送成功回复反馈
         ch, user_id, chat_type, target_id, msg_id = self.first_message_event
         print(f"\n🎉 成功捕获首次消息！")
         print(f"  • 触发渠道: {ch.upper()}")
@@ -287,7 +722,7 @@ class FirstRunWizard:
             "🎉 身份识别成功！\n"
             f"已将您设为系统默认管理员（ID: {user_id}），\n"
             f"当前渠道已成为默认登录渠道（login_through_adapter: {ch}）。\n"
-            "正在为您生成最小配置文件 config.json..."
+            "正在为您生成配置文件 config.json..."
         )
 
         try:
@@ -320,7 +755,6 @@ class FirstRunWizard:
         except Exception as e:
             logger.debug("发送确认回复遇到异常: %s", safe_error(e))
 
-        # 停止所有网关
         print("正在停止配置监听网关...")
         for gw in gateways:
             try:
@@ -361,7 +795,6 @@ class FirstRunWizard:
 
         first_channel, admin_id, chat_type, target_id, _ = self.first_message_event
 
-        import uuid
         main_session_id = str(uuid.uuid4())
 
         # 组装最小配置结构
@@ -387,11 +820,9 @@ class FirstRunWizard:
                 "private": [admin_id] if is_qq_first else ["<USER_ID>"]
             }
 
-            # 如果第一条消息来自 QQ 群聊，自动将该群加入白名单
             if is_qq_first and chat_type == "group":
                 qq_whitelist[target_id] = "*"
             else:
-                # 保留示例占位群
                 qq_whitelist["<GUILD_OR_GROUP_ID>"] = "*"
                 qq_whitelist["<OPENID_OR_GROUP_HASH>"] = "*"
 
@@ -406,7 +837,6 @@ class FirstRunWizard:
                 "credentials_in_place": True
             }
 
-            # 若首次消息来自 QQ，直接把该管理员私聊对话预先绑定到主会话
             if is_qq_first:
                 qq_entry["session_bindings"] = {f"private:{admin_id}": main_session_id}
                 self._save_session_map("data/qq_session_map.json", f"private:{admin_id}", main_session_id)
@@ -441,7 +871,6 @@ class FirstRunWizard:
                 else:
                     ob_whitelist["groups"] = []
 
-                # 若首次消息来自 OneBot，直接把该管理员私聊对话预先绑定到主会话
                 ob_entry["session_bindings"] = {f"private:{admin_id}": main_session_id}
                 self._save_session_map("data/onebot_session_map.json", f"private:{admin_id}", main_session_id)
             else:
@@ -470,14 +899,77 @@ class FirstRunWizard:
         print("=" * 60 + "\n")
 
 
+# ----------------------------------------------------------------------
+# 脚本主程序入口
+# ----------------------------------------------------------------------
+
 def main():
-    wizard = FirstRunWizard()
-    try:
-        wizard.run_interactive()
-    except KeyboardInterrupt:
-        print("\n[!] 用户中断，向导退出。")
-        sys.exit(0)
+    target_file = "config.json"
+    if len(sys.argv) > 1 and not sys.argv[1].startswith("-"):
+        target_file = sys.argv[1]
+
+    print("=" * 60)
+    print("      🛠️  Muse IM Bridge 配置管理控制台")
+    print("=" * 60)
+
+    # 1. 如果目标配置文件已存在，提供查看/分类修改/重新初始化的主菜单
+    if os.path.exists(target_file):
+        try:
+            with open(target_file, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except Exception as e:
+            print(f"⚠️ 读取现有配置文件 {target_file} 出错: {safe_error(e)}")
+            data = {}
+
+        print(f"检测到配置文件: {target_file}")
+        print("请选择操作模式：")
+        print("  [1] 交互式修改配置（按分类修改完整设置）")
+        print("  [2] 首次启动向导（重新开启网关监听并自动认领管理员与绑定主会话）")
+        print("  [3] 查看当前完整配置")
+        print("  [0] 退出")
+
+        choice = _prompt_input("请输入选项编号 (0/1/2/3)", default="1")
+        if choice == "1":
+            editor = FullConfigEditor(data, target_file)
+            editor.run_menu()
+            return
+        elif choice == "2":
+            wizard = FirstRunWizard(output_file=target_file)
+            wizard.run_interactive()
+            return
+        elif choice == "3":
+            print("\n" + "=" * 60)
+            print(json.dumps(data, indent=2, ensure_ascii=False))
+            print("=" * 60)
+            return
+        elif choice == "0":
+            print("退出配置管理。")
+            return
+        else:
+            editor = FullConfigEditor(data, target_file)
+            editor.run_menu()
+            return
+
+    # 2. 如果文件尚不存在，走首次启动向导生成最小配置
+    print(f"💡 未检测到配置文件: {target_file}，即将进入首次配置向导。")
+    wizard = FirstRunWizard(output_file=target_file)
+    wizard.run_interactive()
+
+    # 向导结束后询问是否进入分类修改器继续微调
+    ans = _prompt_input("是否需要进一步微调全量详细配置？(y/N)", default="n").lower()
+    if ans == "y":
+        try:
+            with open(target_file, "r", encoding="utf-8") as f:
+                new_data = json.load(f)
+            editor = FullConfigEditor(new_data, target_file)
+            editor.run_menu()
+        except Exception:
+            pass
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except KeyboardInterrupt:
+        print("\n[!] 用户中断，退出。")
+        sys.exit(0)
