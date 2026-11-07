@@ -241,11 +241,13 @@ class TestAccessRequests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(results[0][0]["status"], results[1][0]["status"])
         self.assertEqual(self.allowed(), results[0][0]["status"] == "approved")
 
-    def test_store_expiry_capacity_cooldown_and_scope_validation(self):
+    def test_store_expiry_capacity_and_scope_validation(self):
         store = self.adapter.access_requests.store
         row, _ = store.apply("group", "G", "NEW", "self", now=1000)
-        with self.assertRaises(ValueError):
-            store.apply("group", "G2", "NEW", "self", now=1010)
+        # Re-applying should succeed and return the existing pending request without artificial cooldown/rate-limit error
+        same_row, created = store.apply("group", "G", "NEW", "self", now=1010)
+        self.assertFalse(created)
+        self.assertEqual(same_row["id"], row["id"])
         with patch.object(store, "MAX_PENDING", 1):
             with self.assertRaises(ValueError):
                 store.apply("group", "G", "OTHER", "self", now=1100)
@@ -300,15 +302,31 @@ class TestAccessRequests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(again.allows("group", "G", "ANYONE"))
         self.assertFalse(again.allows("group", "ELSE", "ANYONE"))
 
-    def test_processed_request_cooldown_survives_restart(self):
+    def test_same_user_can_apply_across_chats_and_scopes_immediately(self):
+        store = self.adapter.access_requests.store
+        for automatic in (False, True):
+            with self.subTest(automatic=automatic):
+                user = "AUTO" if automatic else "MANUAL"
+                ids = set()
+                for kind, target, scope in (
+                    ("group", "G", "self"),
+                    ("group", "G2", "self"),
+                    ("group", "G", "all"),
+                    ("private", user, "self"),
+                ):
+                    row, created = store.apply(
+                        kind, target, user, scope, automatic=automatic, now=1000)
+                    self.assertTrue(created)
+                    ids.add(row["id"])
+                self.assertEqual(len(ids), 4)
+
+    def test_reapplying_after_decision_creates_new_request(self):
         store = self.adapter.access_requests.store
         row, _ = store.apply("group", "G", "NEW", "self", now=1000)
         with patch("muse_bridge.gateway.access.time.time", return_value=1100):
             store.decide(row["id"], False, "ADMIN")
         restored = AccessRequestStore(store.path, "APP")
-        with self.assertRaises(ValueError):
-            restored.apply("group", "G", "NEW", "self", now=1699)
-        new, created = restored.apply("group", "G", "NEW", "self", now=1700)
+        new, created = restored.apply("group", "G", "NEW", "self", now=1100)
         self.assertTrue(created)
         self.assertNotEqual(new["id"], row["id"])
         self.assertFalse(restored.allows("group", "G", "NEW"))
@@ -321,6 +339,18 @@ class TestAccessRequests(unittest.IsolatedAsyncioTestCase):
         self.adapter.client.send_message.assert_not_called()
         self.service.post_message.assert_not_called()
         self.assertFalse(self.adapter.is_allowed("C2C_MESSAGE_CREATE", {"author": None}))
+
+    def test_group_sender_info_config_defaults_and_loader(self):
+        self.assertTrue(QQConfig().group_sender_info)
+        with self.assertRaises(ValueError):
+            QQConfig(group_sender_info="false")
+        path = self.root / "sender-config.json"
+        path.write_text(json.dumps({"muse": {"client_ip": "127.0.0.1"},
+            "adapters": {"qq": {"group_sender_info": False},
+                         "onebot": {"group_sender_info": False}}}), encoding="utf-8")
+        loaded = ConfigLoader.load(str(path))
+        self.assertFalse(loaded.qq.group_sender_info)
+        self.assertFalse(loaded.onebot.group_sender_info)
 
     def test_configuration_strict_boolean_and_loader(self):
         self.assertFalse(AccessRequestsConfig().auto_approve)

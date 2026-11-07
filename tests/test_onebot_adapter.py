@@ -217,6 +217,23 @@ def _sent_texts(adapter):
 
 
 class TestOneBotInbound(unittest.IsolatedAsyncioTestCase):
+    async def test_group_sender_info_default_and_disabled(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            adapter, muse = _make_adapter(tmp)
+            event = _group("G1", 123, "hello", 901)
+            event["sender"] = {"nickname": "小明", "card": "群名片"}
+            await adapter.handle_event(event)
+            text = muse.post_message.call_args.args[1]
+            self.assertIn('"用户ID": "123"', text)
+            self.assertIn('"昵称": "小明"', text)
+            self.assertIn('"群名片": "群名片"', text)
+            self.assertTrue(text.endswith("\nhello"))
+            adapter.config.group_sender_info = False
+            await adapter.handle_event(_group("G1", 123, "plain", 902))
+            self.assertEqual(muse.post_message.call_args.args[1], "plain")
+            await adapter.handle_event(_private(100, "private", 903))
+            self.assertEqual(muse.post_message.call_args.args[1], "private")
+
     async def test_each_chat_gets_its_own_session_and_route(self):
         with tempfile.TemporaryDirectory() as tmp:
             adapter, muse = _make_adapter(tmp)
@@ -227,7 +244,8 @@ class TestOneBotInbound(unittest.IsolatedAsyncioTestCase):
             sids = [c.args[0] for c in muse.post_message.call_args_list]
             self.assertEqual(sids[0], sids[2])
             self.assertEqual(len({sids[0], sids[1], sids[3]}), 3)
-            route = adapter.route_manager.get(f"mid-{sids[1]}-hi 2")
+            route = adapter.route_manager.get(
+                f"mid-{sids[1]}-{muse.post_message.call_args_list[1].args[1]}")
             self.assertEqual((route.target_type, route.target_id, route.msg_id), ("group", "G2", "12"))
             self.assertEqual(adapter.session_mapper.owners(sids[3]), [("private", "100")])
 
@@ -240,7 +258,7 @@ class TestOneBotInbound(unittest.IsolatedAsyncioTestCase):
             await adapter.handle_event(_group("G9", 5, "stranger group", 3))
             await adapter.handle_event(_private(999, "stranger dm", 4))
             await adapter.handle_event({"post_type": "notice", "notice_type": "group_upload"})
-            self.assertEqual([c.args[1] for c in muse.post_message.call_args_list], ["once"])
+            self.assertEqual([c.args[1] for c in muse.post_message.call_args_list], ['【群消息发送者 {"用户ID": "5"}】\nonce'])
             adapter.client.send_msg.assert_not_called()
 
     async def test_group_trigger_at_needs_mention_or_command(self):
@@ -250,7 +268,7 @@ class TestOneBotInbound(unittest.IsolatedAsyncioTestCase):
             await adapter.handle_event(_group("G1", 5, "called", 2, at=True))
             await adapter.handle_event(_private(100, "dm needs no mention", 3))
             self.assertEqual([c.args[1] for c in muse.post_message.call_args_list],
-                             ["called", "dm needs no mention"])
+                             ['【群消息发送者 {"用户ID": "5"}】\ncalled', "dm needs no mention"])
             await adapter.handle_event(_group("G1", 5, "/help", 4))
             self.assertIn("/sessions", _sent_texts(adapter)[-1])
 

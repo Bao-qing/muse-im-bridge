@@ -271,11 +271,15 @@ class FullConfigEditor:
             print(f"  [11] whitelist.private (私聊白名单用户): {wl.get('private') or []}")
             print(f"  [12] catch_up_enabled (启动历史消息补发): {'是' if qq.get('catch_up_enabled', False) else '否'}")
             print(f"  [13] session_bindings (会话固定映射字典): {qq.get('session_bindings') or {}}")
+            print(f"  [14] group_sender_info (群消息附带发送者信息): {qq.get('group_sender_info', True)}")
             print("  [0] 返回上级菜单")
 
-            c = _prompt_input("请选择要修改的项编号 (0-13)", default="0")
+            c = _prompt_input("请选择要修改的项编号 (0-14)", default="0")
             if c == "0":
                 break
+            elif c == "14":
+                qq["group_sender_info"] = _prompt_bool("群消息是否附带发送者信息", qq.get("group_sender_info", True))
+                self._modified = True
             elif c == "1":
                 qq["enabled"] = _prompt_bool("是否启用 QQ 适配器", qq.get("enabled", False))
                 self._modified = True
@@ -352,11 +356,15 @@ class FullConfigEditor:
             print(f"  [11] whitelist.private (私聊白名单 QQ): {wl.get('private') or []}")
             print(f"  [12] whitelist.groups (群白名单 群号):   {wl.get('groups') or []}")
             print(f"  [13] session_bindings (会话预绑定映射):   {ob.get('session_bindings') or {}}")
+            print(f"  [14] group_sender_info (群消息附带发送者信息): {ob.get('group_sender_info', True)}")
             print("  [0] 返回上级菜单")
 
-            c = _prompt_input("请选择要修改的项编号 (0-13)", default="0")
+            c = _prompt_input("请选择要修改的项编号 (0-14)", default="0")
             if c == "0":
                 break
+            elif c == "14":
+                ob["group_sender_info"] = _prompt_bool("群消息是否附带发送者信息", ob.get("group_sender_info", True))
+                self._modified = True
             elif c == "1":
                 ob["enabled"] = _prompt_bool("是否启用 OneBot 适配器", ob.get("enabled", False))
                 self._modified = True

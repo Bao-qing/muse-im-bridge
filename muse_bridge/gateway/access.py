@@ -21,7 +21,6 @@ def valid_id(value):
 
 
 class AccessRequestStore:
-    COOLDOWN = 600
     PENDING_TTL = 7 * 86400
     MAX_PENDING = 1000
     MAX_HISTORY = 1000
@@ -142,11 +141,6 @@ class AccessRequestStore:
             pending = next((r for r in matches if r["status"] == "pending"), None)
             if pending:
                 return copy.deepcopy(pending), False
-            if any(r["requester"] == user and now - r["created_at"] < 60
-                   for r in data["requests"]):
-                raise ValueError("申请较频繁，请稍后再试。")
-            if matches and now - max(r["updated_at"] for r in matches) < self.COOLDOWN:
-                raise ValueError("申请已处理，请稍后再试。")
             if sum(r["status"] == "pending" for r in data["requests"]) >= self.MAX_PENDING:
                 raise ValueError("待处理申请较多，请稍后再试。")
             row = {"id": "W" + secrets.token_hex(4).upper(), "kind": kind,

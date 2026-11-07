@@ -123,6 +123,7 @@ class ChatConfig:
     approvals_in_place: bool = constants.DEFAULT_APPROVALS_IN_PLACE
     allow_all_private: bool = constants.DEFAULT_ALLOW_ALL_PRIVATE
     allow_all_group: bool = constants.DEFAULT_ALLOW_ALL_GROUP
+    group_sender_info: bool = True
     access_requests: AccessRequestsConfig = dataclasses.field(default_factory=AccessRequestsConfig)
     whitelist: Dict[str, Union[List[str], str]] = dataclasses.field(default_factory=dict)
     delivered_file: str = "data/qq_delivered.jsonl"
@@ -165,7 +166,7 @@ class ChatConfig:
 
     def __post_init__(self):
         for name in ("credentials_in_place", "approvals_in_place", "unbound_push_to_admin",
-                     "allow_all_private", "allow_all_group"):
+                     "allow_all_private", "allow_all_group", "group_sender_info"):
             if type(getattr(self, name)) is not bool:
                 raise ValueError(f"{self.section}.{name} must be a boolean")
 
@@ -399,6 +400,7 @@ class ConfigLoader:
                 allow_all_private=_get_val(raw, "allow_all_private",
                                            constants.DEFAULT_ALLOW_ALL_PRIVATE),
                 allow_all_group=val_grp,
+                group_sender_info=_get_val(raw, "group_sender_info", True),
                 whitelist=raw.get("whitelist") or {},
                 delivered_file=raw.get("delivered_file", defaults["delivered_file"]),
                 session_map_file=raw.get("session_map_file", defaults["session_map_file"]),

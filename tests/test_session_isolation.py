@@ -187,8 +187,8 @@ class TestInboundIsolation(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(len({sa1, sb, sp}), 3)
             self.assertNotIn("GLOBAL", {sa1, sb, sp})
             # routes registered per chat
-            self.assertEqual(adapter.route_manager.get(f"mid-{sa1}-hi A").target_id, "GA")
-            self.assertEqual(adapter.route_manager.get(f"mid-{sb}-hi B").target_id, "GB")
+            self.assertEqual(adapter.route_manager.get(f"mid-{sa1}-{muse.post_message.call_args_list[0].args[1]}").target_id, "GA")
+            self.assertEqual(adapter.route_manager.get(f"mid-{sb}-{muse.post_message.call_args_list[1].args[1]}").target_id, "GB")
             self.assertEqual(adapter.route_manager.get(f"mid-{sp}-hi priv").target_type, "private")
             # outbound watches all three
             self.assertEqual(set(adapter.session_mapper.session_ids()), {sa1, sb, sp})

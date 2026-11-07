@@ -233,7 +233,8 @@ class QQAdapter(ChatGateway):
         await self.handle_inbound(InboundMessage(
             id=msg_id or "",
             source=MessageSource(platform="qq", chat_type=kind, target_id=target,
-                                 sender_id=user, raw_event=d),
+                                 sender_id=user, raw_event=d,
+                                 sender_name=author.get("username") or author.get("nickname") or ""),
             text=content,
             attachments=self.extract_attachments(d),
         ))

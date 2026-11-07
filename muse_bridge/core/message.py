@@ -28,6 +28,7 @@ class MessageSource:
     sender_id: str = ""
     sender_name: str = ""
     raw_event: Optional[Any] = None
+    sender_card: str = ""
 
     @property
     def is_group(self) -> bool:

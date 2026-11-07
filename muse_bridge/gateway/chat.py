@@ -17,6 +17,7 @@ back through the outbound dispatcher, never through this call.
 from __future__ import annotations
 
 import asyncio
+import json
 from typing import Dict, List, Optional, Tuple
 
 from ..adapters.base import BaseAdapter
@@ -218,6 +219,12 @@ class ChatGateway(BaseAdapter):
         chat_lock = self._chat_send_locks.setdefault((target_type, target_id), asyncio.Lock())
         async with chat_lock:
             references = msg.references or self.interaction_router.message_references(event)
+            if kind == "group" and self.config.group_sender_info:
+                info = {"用户ID": user}
+                for label, value in (("昵称", msg.source.sender_name), ("群名片", msg.source.sender_card)):
+                    if isinstance(value, str) and value.strip():
+                        info[label] = value.strip()
+                content = "【群消息发送者 " + json.dumps(info, ensure_ascii=False) + "】\n" + content
             await self._forward(target_type, target_id, content, attachments, msg_id, is_admin, references, event)
 
     async def _run_command(self, parsed, target_type, target_id, msg_id, is_admin) -> None:

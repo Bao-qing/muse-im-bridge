@@ -235,10 +235,14 @@ class OneBotAdapter(ChatGateway):
                 self._file_groups[att.file_info] = target
                 while len(self._file_groups) > 512:
                     self._file_groups.pop(next(iter(self._file_groups)))
+        sender = event.get("sender")
+        sender = sender if isinstance(sender, dict) else {}
         await self.handle_inbound(InboundMessage(
             id=msg_id,
             source=MessageSource(platform="onebot", chat_type=kind, target_id=target,
-                                 sender_id=user, raw_event=event),
+                                 sender_id=user, raw_event=event,
+                                 sender_name=sender.get("nickname") or "",
+                                 sender_card=sender.get("card") or ""),
             text=text,
             attachments=attachments,
             references=references,
