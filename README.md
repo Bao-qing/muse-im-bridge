@@ -1,6 +1,8 @@
-# Muse Bridge (面向对象架构)
+# Muse im Bridge
 
-Muse Bridge 是一个解耦、面向对象的通用虚拟助理消息桥接系统。支持将 Muse 虚拟助理接入到 **QQ 官方机器人**、**OneBot (NapCat v11)**，并为未来接入 **微信 OpenClaw** 预留了统一的架构扩展规范。
+Muse im Bridge 是一 Muse 助理消息桥接系统。支持将 Muse 虚拟助理接入到 **QQ 官方机器人**、**OneBot (推荐 NapCat )**，并将在未来接入 **微信 OpenClaw** 。
+
+> **非官方项目**：本项目与 Muse、腾讯 QQ 无隶属关系，接入方式依赖对网页端协议的逆向分析，可能违反目标平台的服务条款，也可能随服务端更新而失效，使用风险自负。
 
 ---
 
@@ -8,7 +10,7 @@ Muse Bridge 是一个解耦、面向对象的通用虚拟助理消息桥接系�
 
 ```
 muse_bridge/
-├── main.py                   # 简洁的主程序入口（加载配置、初始化引擎、优雅启停）
+├── main.py                   # 主程序入口（加载配置、初始化引擎、优雅启停）
 ├── config.example.json       # 用户配置文件模板（无敏感信息，复制为 config.json）
 ├── muse_bridge/              # 核心框架包
 │   ├── config/               # 配置系统（分清用户凭据与程序默认值，支持覆盖）
@@ -16,7 +18,7 @@ muse_bridge/
 │   │   └── models.py         # 配置模型与深层合并加载器
 │   ├── core/                 # 领域核心
 │   │   ├── message.py        # 统一消息定义（Inbound/Outbound/Attachment/Markdown分块）
-│   │   ├── deduplicator.py   # 3状态消息去重器（防重防漏、支持故障回退）
+│   │   ├── deduplicator.py   # 3状态消息去重
 │   │   └── commands.py       # 通用斜杠指令层（/sessions, /switch, /new 等）
 │   ├── muse/                 # Muse 独立业务服务层
 │   │   ├── client/           # 底层 Noise_XX 加密协议与 WebSocket 传输客户端
@@ -45,33 +47,19 @@ muse_bridge/
 ├── tools/
 │   └── export_cookies.js     # 网页端 Cookie 一键导出辅助工具
 └── tests/
-    └── test_bridge.py        # 全新架构单元测试集
+    └── test_bridge.py       
 ```
 
 ---
 
 ## 核心设计与特性
 
-1. **面向对象领域模型**：
-   - 彻底摆脱原有的全局状态字典传递，构建了清晰的 `BridgeEngine`、`MuseService`、`BaseAdapter`、`QQAdapter`、`OneBotAdapter`、`MessageDeduplicator` 等类层次。
-2. **QQ Push 归入 QQ 子集统一管理**：
-   - 主动推送（`QQPushService`）作为 `QQAdapter` 的子组件统一运行，共享 QQClient 鉴权（无需重复刷新 Token）与 Deduplicator。
-   - **推送目标策略**：默认自动推送到白名单中的第一个私人会话（`whitelist.private[0]`），同时支持在配置中显式指定目标（私聊或群聊），并具备候选目标容错能力。
-3. **配置文件设计（用户可改 vs 程序默认）**：
-   - 用户只需在单一 `config.json`（或 `credentials.json`）中填写自己的凭证与白名单。
-   - 所有内部运行参数（如分块字符数、每轮消息上限、图片/文件限制、超时时间等）均有内置默认常量，用户如需调整可在配置文件相应位置或 `overrides` 中覆盖。
-   - 敏感信息（AppID, Secret, Token, Cookies, OpenID）绝不硬编码，示例模板均使用标准占位符。
-4. **Muse 凭证静默续期**：
-   - 配合 `cookies.json`，在启动和运行过程中自动推导 `vm_id` 并从接口换取 `.mint.json` 中的 `token` 与 `notary_token`。按 JWT 的 `exp`（若有）与 notary 的 `timeout` 中较早时间提前续期，持久订阅也会轮换连接；JWT 没有 `exp` 时不猜测固定寿命。
-   - 网关拒绝运行凭据时先用现有 Cookie 刷新；网络超时、5xx、普通 403、缓存写入失败不会把 Cookie 标为过期。`hatch_vm_auth_no_match` 会为自动解析的 VM 重新定位一次，不覆盖显式配置的 VM。
-   - 只有 Cookie 缺失，或 Cookie 支持的 mint 接口确认会话失效（排除 VM 认证错误的 401）才要求管理员 `/login`；后台不会弹终端登录提示或自行发送验证码。替换 Cookie 内容后自动恢复尝试，无需删除 mint。
-   - 临时刷新失败短暂退避后重试，并发恢复复用已更新的凭据；可能已发出的消息、凭证与审批不会因认证恢复而自动重放。
-5. **消息不漏不重**：
-   - 采用完善的 3 状态机模型（`Absent -> Processing -> Delivered / Rollback`），无论是被动回复还是主动推送，均做严格原子标记，杜绝重复回复，遇到错误立即回滚。
 
 ---
 
 ## 快速开始
+
+环境要求：Python 3.11 或更高版本。
 
 ### 1. 安装依赖
 
@@ -91,8 +79,7 @@ cp config.example.json config.json
 {
   "muse": {
     "cookies_file": "cookies.json",
-    "session_id": "YOUR_MUSE_SESSION_ID",
-    "reply_mode": "push"
+    "session_id": "YOUR_MUSE_SESSION_ID"
   },
   "adapters": {
     "qq": {
@@ -159,7 +146,6 @@ python -m unittest discover tests
     "timezone": "Asia/Shanghai",                   // [可选] 时区 (默认: "Asia/Shanghai")
     "proxy_url": null,                             // [可选] 网络代理 URL，例如 "http://127.0.0.1:7890" (默认: null)
     "direct": true,                                // [可选] 是否直连 (默认: true)
-    "reply_mode": "push",                          // [可选] 会话等待模式: "push" (事件流监听) 或 "poll" (历史轮询) (默认: "push")
     "approval": {                                // [可选] 原生审批策略，不改变长期权限规则
       "mode": "manual",                         // manual / allow_all / deny_all
       "notify": true                              // 自动决定后通知，默认开启
@@ -176,6 +162,8 @@ python -m unittest discover tests
       "admin_only": true,                          // [可选] 会话管理指令的管理员限制 (默认: true)
       "credentials_in_place": true,                // [可选] 允许管理员在凭证所在群填写；群成员可见输入，设 false 则只能私聊填写 (默认: true)
       "approvals_in_place": true,                  // [可选] 审批卡只推送到会话所在聊天，不另发管理员 (默认: true)
+      "allow_all_private": false,                  // [可选] 是否放开所有私聊访问（默认: false）
+      "allow_all_group": false,                    // [可选] 是否放开所有群聊互动（默认: false）
       "whitelist": {                               // [必填] 权限白名单
         "private": [
           "YOUR_C2C_OPENID"                        // 允许私聊机器人的用户 OpenID 列表
@@ -238,14 +226,14 @@ python -m unittest discover tests
 ## 日志与 JSONL 追踪
 
 在配置文件顶层增加 `logging`（完整示例见 `config.example.json`）：
-
+警告！：开启追踪会生成大量日志，可能影响性能和磁盘空间，日志已脱敏，但仍包含QQ消息等隐私信息，请妥善管理，谨慎使用！
 ```json
 {
   "logging": {
     "level": "INFO",
     "console": true,
     "file": "logs/bridge.log",
-    "trace": false,
+    "trace": false,                 // [可选] 是否开启 JSONL 追踪 (默认: false)
     "trace_file": "logs/trace.jsonl",
     "payload_limit": 65536,
     "max_bytes": 10485760,
@@ -268,7 +256,19 @@ python tools/login.py --config config.json --output cookies.json
 
 临时诊断可将 `trace` 改为 `true`，排查后关闭并按需删除本地日志；日志目录不可写等日志故障不应阻止认证或消息投递。不要为排查而把真实 Cookie、Token、验证码或密码写进示例配置、日志消息或测试。
 
-## 白名单申请
+## 白名单与权限管理
+
+系统支持细粒度白名单、动态申请审批，以及全局放开模式（QQ 与 OneBot 通用）：
+
+### 全局放开选项
+
+在对应适配器（`adapters.qq` 或 `adapters.onebot`）中配置：
+
+- `allow_all_private: true`：允许任意用户通过私聊与机器人互动，跳过私聊白名单检查。
+- `allow_all_group: true`：允许任意群聊及其全体成员与机器人互动，跳过群白名单检查。
+- 两项默认均为 `false`，此时严格执行静态 `whitelist` 及动态申请授权。
+
+### 白名单申请
 
 新私聊或新群无需先加入白名单即可向机器人发送申请；普通消息仍不会转发。
 
@@ -389,3 +389,18 @@ OneBot 与 QQ 走同一个 Gateway 层（`muse_bridge/gateway/`），会话隔�
 - **凭证引用**：回复（引用）凭证提示消息即可选中该凭证，等同 QQ 的引用回复。
 - **白名单**：与 QQ 同格式，QQ 号、群号写成字符串或数字均可；为空时拒绝所有聊天（旧版 OneBot 原型为空即放行，已改）。旧写法 `"groups": [群号]` 等价于这些群 `"*"`。
 - **审批卡与登录**：审批卡只推送到拥有该会话的适配器；没有任何聊天绑定的会话（如 `muse.session_id`）才推送到所有适配器的管理员。`gateway.login_through_adapter` 设为 `"onebot"` 时，凭据失效的登录提醒发给 OneBot 管理员。
+
+## 安全与免责声明
+
+- 本项目为非官方工具，与 Muse、腾讯 QQ 官方无关。Muse 接入依赖对网页端协议的逆向分析，可能随服务端更新而失效，也可能违反其服务条款；请只使用自己的账号与机器人，并自行承担使用风险。
+- 仓库不包含任何真实凭据。`config.json`、`cookies.json`、`.mint.json`、`.env*`、`data/`、`logs/` 等均已加入 `.gitignore`。提交前请再次确认没有把 Cookie、Token、OpenID、QQ 号或私有服务器地址带入版本库。
+- 运行日志与 `data/` 下的状态文件可能包含聊天摘要和消息 ID，请按敏感数据处理，不要公开上传。
+- 发现安全问题时请通过 GitHub Security Advisories 私下报告，不要在公开 Issue 中附带凭据或可复现的账号信息。
+
+## 贡献
+
+欢迎提交 Issue 和 Pull Request。提交前请确保 `python -m unittest discover tests` 全部通过，并确认改动没有引入真实凭据或个人数据。
+
+## 许可证
+
+本项目基于 [MIT License](LICENSE) 开源。

@@ -118,7 +118,7 @@ class TestPushSubscriptionAndMultiplexing(unittest.TestCase):
     def test_client_subscription_dispatch(self):
         client = MuseClient(
             token="t", notary_token="nt", vm_id="vm", client_ip="127.0.0.1",
-            reply_mode="push", direct=True,
+            direct=True,
         )
         sub1 = PushSubscription(client, stream_id=10)
         sub2 = PushSubscription(client, stream_id=20)

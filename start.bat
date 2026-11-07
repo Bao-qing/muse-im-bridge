@@ -1,6 +1,6 @@
 @echo off
 rem ============================================================
-rem muse-relay-lib 启动脚本（QQ 适配器 + Muse 库）
+rem muse-im-bridge 启动脚本（QQ 适配器 + Muse 库）
 rem 用法：把 start.bat 放在项目根目录（main.py 旁边），双击运行。
 rem 这个文件不含任何 ID 和密钥：
 rem   配置读 config.json（没有就按环境变量来）；
@@ -20,7 +20,7 @@ if exist .venv\Scripts\python.exe (
 ) else (
   set "PY=python"
 )
-echo 正在启动 muse-relay-lib ...
+echo 正在启动 muse-im-bridge ...
 echo 如果 QQ 适配器启用，启动后会提示粘贴 AppSecret，粘贴后按回车。
 "%PY%" main.py
 echo.

@@ -3,6 +3,9 @@
 Reads endpoints from the environment (see ``.env.onebot``, git-ignored):
   USER_OB_URL / USER_OB_TOKEN   the simulated user (sends test messages)
   MUSE_OB_URL / MUSE_OB_TOKEN   the bot the bridge serves (read-only here)
+  MUSE_OB_SELF                  the bot's own QQ number
+  MUSE_OB_TEST_GROUPS           comma-separated group ids this tool may message
+  MUSE_OB_TEST_PRIVATE          comma-separated private ids this tool may message
 
 Usage:
   python tools/onebot_live.py send group <group_id> <text>
@@ -26,8 +29,12 @@ import sys
 import time
 import urllib.request
 
-ALLOWED_GROUPS = {"300000002", "300000004", "300000005"}
-ALLOWED_PRIVATE = {"300000001", "300000003"}  # Muse bot, progress reports
+def _ids(name: str) -> set:
+    return {x.strip() for x in os.environ.get(name, "").split(",") if x.strip()}
+
+
+ALLOWED_GROUPS = _ids("MUSE_OB_TEST_GROUPS")
+ALLOWED_PRIVATE = _ids("MUSE_OB_TEST_PRIVATE")
 
 
 def call(side: str, action: str, params: dict) -> dict:
@@ -65,7 +72,7 @@ def main(argv):
         kind, target, text = argv[1], argv[2], " ".join(argv[3:]).replace("\\n", "\n")
         allowed = ALLOWED_GROUPS if kind == "group" else ALLOWED_PRIVATE
         if target not in allowed:
-            raise SystemExit(f"refusing to message {kind}:{target} (not a test target)")
+            raise SystemExit(f"refusing to message {kind}:{target} (add it to MUSE_OB_TEST_GROUPS / MUSE_OB_TEST_PRIVATE)")
         key = "group_id" if kind == "group" else "user_id"
         res = call("user", f"send_{kind}_msg", {key: int(target), "message": [{"type": "text", "data": {"text": text}}]})
         print(json.dumps({"retcode": res.get("retcode"), "message_id": (res.get("data") or {}).get("message_id"),
@@ -95,7 +102,7 @@ def main(argv):
         import base64
         kind, target, path = argv[1], argv[2], argv[3]
         if target not in (ALLOWED_GROUPS if kind == "group" else ALLOWED_PRIVATE):
-            raise SystemExit(f"refusing to message {kind}:{target} (not a test target)")
+            raise SystemExit(f"refusing to message {kind}:{target} (add it to MUSE_OB_TEST_GROUPS / MUSE_OB_TEST_PRIVATE)")
         b64 = "base64://" + base64.b64encode(open(path, "rb").read()).decode()
         key = "group_id" if kind == "group" else "user_id"
         if cmd == "image":
@@ -116,7 +123,7 @@ def main(argv):
             since = int(time.time()) - 1
         else:
             since = int(argv[4])
-        bot = os.environ.get("MUSE_OB_SELF", "300000001")
+        bot = os.environ.get("MUSE_OB_SELF", "")
         seen, last_new, deadline = set(), time.time(), time.time() + wait_s
         while time.time() < deadline:
             time.sleep(3)

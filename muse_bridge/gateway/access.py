@@ -220,6 +220,10 @@ class ChatAccessRequests:
         return bool(parts) and parts[0] in {"/申请", "/申请审批"}
 
     def allows(self, kind, target, user, scope="self"):
+        if kind == "private" and getattr(self.adapter.config, "allow_all_private", False):
+            return True
+        if kind == "group" and getattr(self.adapter.config, "allow_all_group", False):
+            return True
         static = self.adapter.config.whitelist
         members = static.get("private" if kind == "private" else target, [])
         allowed = (user in members if kind == "private" and isinstance(members, list) else

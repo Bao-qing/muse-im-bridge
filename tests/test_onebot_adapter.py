@@ -40,6 +40,10 @@ class TestOneBotConfig(unittest.TestCase):
             OneBotConfig(group_trigger="sometimes")
         with self.assertRaisesRegex(ValueError, "adapters.onebot.approvals_in_place"):
             OneBotConfig(approvals_in_place="yes")
+        with self.assertRaisesRegex(ValueError, "adapters.onebot.allow_all_private"):
+            OneBotConfig(allow_all_private="yes")
+        with self.assertRaisesRegex(ValueError, "adapters.onebot.allow_all_group"):
+            OneBotConfig(allow_all_group="yes")
 
     def test_loader_uses_onebot_state_files_and_env_token(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -55,6 +59,8 @@ class TestOneBotConfig(unittest.TestCase):
         self.assertEqual(cfg.admin_id, ["42"])
         self.assertEqual(cfg.group_trigger, "at")
         self.assertEqual(cfg.whitelist, {"7": "*"})
+        self.assertFalse(cfg.allow_all_private)
+        self.assertFalse(cfg.allow_all_group)
         self.assertEqual(cfg.session_map_file, "data/onebot_session_map.json")
         self.assertEqual(cfg.routes_file, "data/onebot_routes.json")
         self.assertEqual(cfg.access_requests.state_file, "data/onebot_access.local.json")

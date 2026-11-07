@@ -194,18 +194,11 @@ class PushSubscription:
 class MuseClient:
     def __init__(self, token, notary_token, vm_id, client_ip,
                  host="hatch.metaaivm.com",
-                 timezone="Asia/Shanghai", proxy_url=None, direct=False,
-                 reply_mode="poll"):
+                 timezone="Asia/Shanghai", proxy_url=None, direct=False):
         # vm_id and client_ip are required, with no defaults: they are
         # deployment values (your VM, your egress IP), not library
         # constants. host is the shared service endpoint and timezone a
         # generic default; both are overridable.
-        # reply_mode: "poll" (history polling + settle window, the
-        # original, always kept) or "push" (/chat/subscribe live events
-        # for timing + one history fetch for content, falling back to
-        # polling on any push failure). Unknown values fail fast.
-        if reply_mode not in ("poll", "push"):
-            raise ValueError(f"unknown reply_mode: {reply_mode!r}")
         self.token = token
         self.notary_token = notary_token
         self.vm_id = vm_id
@@ -214,7 +207,6 @@ class MuseClient:
         self.timezone = timezone
         self.proxy_url = proxy_url
         self.direct = direct
-        self.reply_mode = reply_mode
         self._ws = None
         self._send_cs = None
         self._recv_cs = None
@@ -1045,51 +1037,37 @@ class MuseClient:
                           text="\n\n".join(m.text for m in messages if m.text),
                           user_message_id=sent_mid or "")
 
-    def send_and_wait(self, session_id, text, reply_mode=None,
+    def send_and_wait(self, session_id, text,
                       on_progress=None, timeout=None, poll_interval=5,
                       quiet_polls=2, grace_seconds=2, images=None,
                       files=None, file_refs=None):
         """One full turn: send, wait for the reply, mark seen
         (best-effort). Returns a TurnResult.
-        reply_mode (default: this client's reply_mode): "poll" runs the
-        original history-polling + settle window; "push" runs the
-        subscribe route and falls back to polling on ANY push failure,
-        so push mode never loses a message, it only ever gets slower."""
-        mode = reply_mode or self.reply_mode
-        if mode == "push":
-            try:
-                turn = self.push_turn(session_id, text,
-                                      timeout=timeout or 120,
-                                      grace_seconds=grace_seconds,
-                                      on_progress=on_progress,
-                                      images=images, files=files,
-                                      file_refs=file_refs)
-                self.mark_seen(session_id)
-                return turn
-            except PushFailed as e:
-                if on_progress is not None:
-                    on_progress(f"push failed ({e}); falling back to polling")
-                sent_mid = e.sent_mid
-                if sent_mid is None:
-                    sent_mid = self.send_message(session_id, text,
-                                                 images=images,
-                                                 files=files,
-                                                 file_refs=file_refs)
-                turn = self.wait_turn(session_id, text, sent_mid=sent_mid,
-                                      timeout=timeout or 180,
-                                      poll_interval=poll_interval,
-                                      quiet_polls=quiet_polls,
-                                      on_progress=on_progress)
-                self.mark_seen(session_id)
-                return turn
-        # poll (default, original — kept exactly as before)
-        self._ensure_connected()
-        sent_mid = self.send_message(session_id, text, images=images,
-                                     files=files, file_refs=file_refs)
-        turn = self.wait_turn(session_id, text, sent_mid=sent_mid,
-                              timeout=timeout or 180,
-                              poll_interval=poll_interval,
-                              quiet_polls=quiet_polls,
-                              on_progress=on_progress)
-        self.mark_seen(session_id)
-        return turn
+
+        The subscribe event stream provides turn timing; a history poll
+        takes over if the stream fails, so a reply is never lost."""
+        try:
+            turn = self.push_turn(session_id, text,
+                                  timeout=timeout or 120,
+                                  grace_seconds=grace_seconds,
+                                  on_progress=on_progress,
+                                  images=images, files=files,
+                                  file_refs=file_refs)
+            self.mark_seen(session_id)
+            return turn
+        except PushFailed as e:
+            if on_progress is not None:
+                on_progress(f"push failed ({e}); falling back to polling")
+            sent_mid = e.sent_mid
+            if sent_mid is None:
+                sent_mid = self.send_message(session_id, text,
+                                             images=images,
+                                             files=files,
+                                             file_refs=file_refs)
+            turn = self.wait_turn(session_id, text, sent_mid=sent_mid,
+                                  timeout=timeout or 180,
+                                  poll_interval=poll_interval,
+                                  quiet_polls=quiet_polls,
+                                  on_progress=on_progress)
+            self.mark_seen(session_id)
+            return turn

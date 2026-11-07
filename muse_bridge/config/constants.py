@@ -8,7 +8,6 @@ can be overridden via user configuration (`config.json`) if desired.
 DEFAULT_MUSE_HOST = "hatch.metaaivm.com"
 DEFAULT_MUSE_TIMEZONE = "Asia/Shanghai"
 DEFAULT_MUSE_DIRECT = True
-DEFAULT_MUSE_REPLY_MODE = "push"  # "push" (subscribe event stream) or "poll"
 
 # Egress IP Detection Services
 EGRESS_IP_SERVICES = (
@@ -58,6 +57,8 @@ DEFAULT_ADMIN_ONLY = True
 DEFAULT_UNBOUND_PUSH_TO_ADMIN = True
 # Push approval cards only to the chat the session belongs to (no admin copy).
 DEFAULT_APPROVALS_IN_PLACE = True
+DEFAULT_ALLOW_ALL_PRIVATE = False
+DEFAULT_ALLOW_ALL_GROUP = False
 # Let admins fill credential cards in the group that shows them (input visible to members).
 DEFAULT_CREDENTIALS_IN_PLACE = True
 

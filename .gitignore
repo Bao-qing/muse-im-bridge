@@ -11,7 +11,9 @@ tools/req_*.json
 # Environment & local settings
 .env
 .env.*
+!.env.example
 *.local.json
+.live/
 
 # Runtime logs & state files
 logs/
@@ -35,6 +37,9 @@ __pycache__/
 dist/
 build/
 .eggs/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
 
 # Virtual environments
 .venv/
@@ -48,4 +53,3 @@ ENV/
 .DS_Store
 Thumbs.db
 *.tmp
-uv.lock

@@ -71,13 +71,14 @@ def main(argv=None) -> int:
         print(f"Cookies File:   {config.muse.cookies_file} ({'exists' if os.path.exists(config.muse.cookies_file) else 'missing'})")
         print(f"Mint File:      {config.muse.mint_file} ({'exists' if os.path.exists(config.muse.mint_file) else 'missing'})")
         print(f"VM ID:          {config.muse.vm_id or '(auto-derived)'}")
-        print(f"Reply Mode:     {config.muse.reply_mode}")
         print("--- Adapters ---")
         if config.qq.enabled:
             wl_priv = len(config.qq.whitelist.get("private") or []) if isinstance(config.qq.whitelist.get("private"), list) else 0
             wl_grp = len([k for k in config.qq.whitelist if k != "private"])
+            priv_desc = "ALL" if config.qq.allow_all_private else f"{wl_priv} private user(s)"
+            grp_desc = "ALL" if config.qq.allow_all_group else f"{wl_grp} group(s)"
             print(f"QQ Adapter:     ENABLED (AppID: {config.qq.app_id})")
-            print(f"  Whitelist:    {wl_priv} private user(s), {wl_grp} group(s)")
+            print(f"  Whitelist:    {priv_desc}, {grp_desc}")
             admin = config.qq.admin_target()
             fallback = "unbound -> admin" if config.qq.unbound_push_to_admin else "unbound dropped"
             print(f"  Admin:        {admin or '(none)'} ({fallback})")
@@ -89,8 +90,10 @@ def main(argv=None) -> int:
             ob = config.onebot
             wl_priv = len(ob.whitelist.get("private") or []) if isinstance(ob.whitelist.get("private"), list) else 0
             wl_grp = len([k for k in ob.whitelist if k != "private"])
+            priv_desc = "ALL" if ob.allow_all_private else f"{wl_priv} private user(s)"
+            grp_desc = "ALL" if ob.allow_all_group else f"{wl_grp} group(s)"
             print(f"OneBot Adapter: ENABLED ({ob.base_url})")
-            print(f"  Whitelist:    {wl_priv} private user(s), {wl_grp} group(s); group trigger: {ob.group_trigger}")
+            print(f"  Whitelist:    {priv_desc}, {grp_desc}; group trigger: {ob.group_trigger}")
             admin = ob.admin_target()
             fallback = "unbound -> admin" if ob.unbound_push_to_admin else "unbound dropped"
             print(f"  Admin:        {admin or '(none)'} ({fallback})")

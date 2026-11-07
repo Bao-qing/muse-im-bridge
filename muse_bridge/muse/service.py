@@ -66,7 +66,6 @@ class MuseService:
             timezone=self.config.timezone,
             proxy_url=self.config.proxy_url,
             direct=self.config.direct,
-            reply_mode=self.config.reply_mode,
         )
 
         orig_connect = client.connect
@@ -249,15 +248,12 @@ class MuseService:
                 if should_cancel and should_cancel():
                     raise TurnCancelled("turn cancelled before wait")
 
-                # Wait for turn completion
-                if self.config.reply_mode == "push":
-                    try:
-                        sub = client.subscribe(session_id, timeout=20)
-                        turn = client.wait_push(sub, session_id, processed_text, sent_mid, timeout=120)
-                    except Exception:
-                        # Fallback to polling
-                        turn = client.wait_turn(session_id, processed_text, sent_mid=sent_mid, timeout=180, should_cancel=should_cancel)
-                else:
+                # Wait for turn completion on the subscribe stream; a history
+                # poll takes over when the stream fails.
+                try:
+                    sub = client.subscribe(session_id, timeout=20)
+                    turn = client.wait_push(sub, session_id, processed_text, sent_mid, timeout=120)
+                except Exception:
                     turn = client.wait_turn(session_id, processed_text, sent_mid=sent_mid, timeout=180, should_cancel=should_cancel)
 
                 client.mark_seen(session_id)

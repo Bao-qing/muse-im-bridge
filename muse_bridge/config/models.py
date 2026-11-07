@@ -69,7 +69,6 @@ class MuseConfig:
     timezone: str = constants.DEFAULT_MUSE_TIMEZONE
     proxy_url: Optional[str] = None
     direct: bool = constants.DEFAULT_MUSE_DIRECT
-    reply_mode: str = constants.DEFAULT_MUSE_REPLY_MODE
     approval: ApprovalConfig = dataclasses.field(default_factory=ApprovalConfig)
 
 
@@ -122,6 +121,8 @@ class ChatConfig:
     unbound_push_to_admin: bool = constants.DEFAULT_UNBOUND_PUSH_TO_ADMIN
     credentials_in_place: bool = constants.DEFAULT_CREDENTIALS_IN_PLACE
     approvals_in_place: bool = constants.DEFAULT_APPROVALS_IN_PLACE
+    allow_all_private: bool = constants.DEFAULT_ALLOW_ALL_PRIVATE
+    allow_all_group: bool = constants.DEFAULT_ALLOW_ALL_GROUP
     access_requests: AccessRequestsConfig = dataclasses.field(default_factory=AccessRequestsConfig)
     whitelist: Dict[str, Union[List[str], str]] = dataclasses.field(default_factory=dict)
     delivered_file: str = "data/qq_delivered.jsonl"
@@ -163,7 +164,8 @@ class ChatConfig:
     download_timeout_s: int = constants.DEFAULT_DOWNLOAD_TIMEOUT_S
 
     def __post_init__(self):
-        for name in ("credentials_in_place", "approvals_in_place", "unbound_push_to_admin"):
+        for name in ("credentials_in_place", "approvals_in_place", "unbound_push_to_admin",
+                     "allow_all_private", "allow_all_group"):
             if type(getattr(self, name)) is not bool:
                 raise ValueError(f"{self.section}.{name} must be a boolean")
 
@@ -347,7 +349,6 @@ class ConfigLoader:
             timezone=_get_val(m_raw, "timezone", os.environ.get("MUSE_TIMEZONE") or constants.DEFAULT_MUSE_TIMEZONE),
             proxy_url=_get_val(m_raw, "proxy_url", os.environ.get("MUSE_PROXY_URL")),
             direct=_get_val(m_raw, "direct", constants.DEFAULT_MUSE_DIRECT),
-            reply_mode=_get_val(m_raw, "reply_mode", os.environ.get("MUSE_REPLY_MODE") or constants.DEFAULT_MUSE_REPLY_MODE),
         )
 
         if not muse_cfg.client_ip:
@@ -380,6 +381,10 @@ class ConfigLoader:
             def _int(key: str) -> int:
                 return int(_get_val(raw, key, defaults[key]))
 
+            val_grp = _get_val(raw, "allow_all_group", None)
+            if val_grp is None:
+                val_grp = _get_val(raw, "allow_all_groups", constants.DEFAULT_ALLOW_ALL_GROUP)
+
             return dict(
                 access_requests=access_cfg,
                 enabled=raw.get("enabled", defaults["enabled"]),
@@ -391,6 +396,9 @@ class ConfigLoader:
                                               constants.DEFAULT_CREDENTIALS_IN_PLACE),
                 approvals_in_place=_get_val(raw, "approvals_in_place",
                                             constants.DEFAULT_APPROVALS_IN_PLACE),
+                allow_all_private=_get_val(raw, "allow_all_private",
+                                           constants.DEFAULT_ALLOW_ALL_PRIVATE),
+                allow_all_group=val_grp,
                 whitelist=raw.get("whitelist") or {},
                 delivered_file=raw.get("delivered_file", defaults["delivered_file"]),
                 session_map_file=raw.get("session_map_file", defaults["session_map_file"]),

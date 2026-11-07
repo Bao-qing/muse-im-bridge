@@ -336,3 +336,41 @@ class TestAccessRequests(unittest.IsolatedAsyncioTestCase):
         loaded = ConfigLoader.load(str(path))
         self.assertTrue(loaded.qq.access_requests.auto_approve)
         self.assertTrue(loaded.qq.access_requests.enabled)
+
+    def test_allow_all_flags_bypass_whitelist(self):
+        self.assertFalse(self.allowed(user="STRANGER", group=None))
+        self.assertFalse(self.allowed(user="STRANGER", group="STRANGE_GRP"))
+
+        self.config.allow_all_private = True
+        self.assertTrue(self.allowed(user="STRANGER", group=None))
+        self.assertFalse(self.allowed(user="STRANGER", group="STRANGE_GRP"))
+
+        self.config.allow_all_private = False
+        self.config.allow_all_group = True
+        self.assertFalse(self.allowed(user="STRANGER", group=None))
+        self.assertTrue(self.allowed(user="STRANGER", group="STRANGE_GRP"))
+
+        self.config.allow_all_private = True
+        self.assertTrue(self.allowed(user="STRANGER", group=None))
+        self.assertTrue(self.allowed(user="STRANGER", group="STRANGE_GRP"))
+
+    def test_allow_all_boolean_validation(self):
+        for val in ("yes", 1, None):
+            with self.assertRaises(ValueError):
+                QQConfig(allow_all_private=val)
+            with self.assertRaises(ValueError):
+                QQConfig(allow_all_group=val)
+
+        path = self.root / "allow_all.json"
+        path.write_text(json.dumps({
+            "muse": {"client_ip": "127.0.0.1"},
+            "adapters": {
+                "qq": {
+                    "allow_all_private": True,
+                    "allow_all_group": True,
+                }
+            }
+        }), encoding="utf-8")
+        loaded = ConfigLoader.load(str(path))
+        self.assertTrue(loaded.qq.allow_all_private)
+        self.assertTrue(loaded.qq.allow_all_group)

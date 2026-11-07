@@ -2,7 +2,6 @@
   "muse": {
     "cookies_file": "cookies.json",
     "session_id": "YOUR_MUSE_SESSION_ID",
-    "reply_mode": "push",
     "approval": {
       "mode": "manual",
       "notify": true
@@ -30,6 +29,8 @@
       "session_bindings": {},
       "push_state_file": "data/qq_push_state.json",
       "catch_up_enabled": false,
+      "allow_all_private": false,
+      "allow_all_group": false,
       "whitelist": {
         "private": [
           "YOUR_C2C_OPENID"
@@ -58,6 +59,8 @@
       "session_map_file": "data/onebot_session_map.json",
       "push_state_file": "data/onebot_push_state.json",
       "routes_file": "data/onebot_routes.json",
+      "allow_all_private": false,
+      "allow_all_group": false,
       "whitelist": {
         "private": [
           "YOUR_ADMIN_QQ"
