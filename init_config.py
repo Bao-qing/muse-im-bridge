@@ -335,6 +335,25 @@ class FirstRunWizard:
             self.first_message_event = (channel, user_id, chat_type, target_id, msg_id)
             self._captured_event.set()
 
+    @staticmethod
+    def _save_session_map(map_file_path: str, chat_key: str, session_id: str) -> None:
+        """预先将私聊会话绑定写入持久化文件。"""
+        try:
+            os.makedirs(os.path.dirname(os.path.abspath(map_file_path)), exist_ok=True)
+            current_map = {}
+            if os.path.exists(map_file_path):
+                try:
+                    with open(map_file_path, "r", encoding="utf-8") as f:
+                        current_map = json.load(f)
+                except Exception:
+                    current_map = {}
+            current_map[chat_key] = session_id
+            with open(map_file_path, "w", encoding="utf-8") as f:
+                json.dump(current_map, f, indent=2, ensure_ascii=False)
+                f.write("\n")
+        except Exception as e:
+            logger.debug("Failed to write initial session map %s: %s", map_file_path, safe_error(e))
+
     def _generate_and_save_config(self) -> None:
         if not self.first_message_event:
             print("⚠️ 未收到任何消息，未生成配置。")
@@ -342,11 +361,15 @@ class FirstRunWizard:
 
         first_channel, admin_id, chat_type, target_id, _ = self.first_message_event
 
+        import uuid
+        main_session_id = str(uuid.uuid4())
+
         # 组装最小配置结构
         config_data: Dict[str, Any] = {
             "muse": {
                 "cookies_file": "cookies.json",
-                "mint_file": ".mint.json"
+                "mint_file": ".mint.json",
+                "session_id": main_session_id
             },
             "adapters": {},
             "gateway": {
@@ -372,7 +395,7 @@ class FirstRunWizard:
                 qq_whitelist["<GUILD_OR_GROUP_ID>"] = "*"
                 qq_whitelist["<OPENID_OR_GROUP_HASH>"] = "*"
 
-            config_data["adapters"]["qq"] = {
+            qq_entry: Dict[str, Any] = {
                 "enabled": True,
                 "app_id": qq_raw["app_id"],
                 "app_secret": qq_raw["app_secret"],
@@ -382,6 +405,13 @@ class FirstRunWizard:
                 "user_agent": constants.DEFAULT_USER_AGENT,
                 "credentials_in_place": True
             }
+
+            # 若首次消息来自 QQ，直接把该管理员私聊对话预先绑定到主会话
+            if is_qq_first:
+                qq_entry["session_bindings"] = {f"private:{admin_id}": main_session_id}
+                self._save_session_map("data/qq_session_map.json", f"private:{admin_id}", main_session_id)
+
+            config_data["adapters"]["qq"] = qq_entry
 
         # 2. OneBot 适配器配置生成
         if "onebot" in self.selected_channels:
@@ -410,6 +440,10 @@ class FirstRunWizard:
                         ob_whitelist[target_id] = "*"
                 else:
                     ob_whitelist["groups"] = []
+
+                # 若首次消息来自 OneBot，直接把该管理员私聊对话预先绑定到主会话
+                ob_entry["session_bindings"] = {f"private:{admin_id}": main_session_id}
+                self._save_session_map("data/onebot_session_map.json", f"private:{admin_id}", main_session_id)
             else:
                 ob_entry["target_group_id"] = 123456789
                 ob_whitelist["groups"] = [123456789]
@@ -424,13 +458,14 @@ class FirstRunWizard:
 
         print("\n" + "=" * 60)
         print(f"🎉 最小配置文件已成功生成并保存至: {self.output_file}")
+        print(f"🔗 本次私聊对话已直接绑定至主会话 (Session ID: {main_session_id})")
         print("=" * 60)
         print(json.dumps(config_data, indent=2, ensure_ascii=False))
         print("=" * 60)
         print("\n接下来您可以：")
         print(f"1. 运行登录向导获取 Muse Cookie（如果尚未登录）：")
         print(f"   python main.py --login")
-        print(f"2. 启动网桥服务：")
+        print(f"2. 或者启动网桥服务在消息渠道进行登录：")
         print(f"   python main.py")
         print("=" * 60 + "\n")
 

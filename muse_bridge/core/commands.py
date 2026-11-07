@@ -103,6 +103,7 @@ class CommandHandler:
         args: str,
         client: Any,
         active_session_id: str,
+        main_session_id: str = "",
     ) -> Tuple[str, str]:
         """Execute a local slash command.
 
@@ -118,7 +119,8 @@ class CommandHandler:
             return f"已开启新会话：{new_id}", new_id
 
         if name == "current":
-            return f"当前会话：{active_session_id}", active_session_id
+            main_tag = " [主会话]" if (main_session_id and active_session_id == main_session_id) else ""
+            return f"当前会话：{active_session_id}{main_tag}", active_session_id
 
         if client is None:
             raise CommandError("Muse 客户端未连接，无法执行此指令")
@@ -143,7 +145,8 @@ class CommandHandler:
                 title = s.get("title") or "未命名会话"
                 prefix = "* " if sid == active_session_id else "  "
                 pin = "[顶] " if s.get("pinned") else ""
-                lines.append(f"{prefix}{i}. {pin}{title} ({sid[:8]}...)")
+                main_tag = "[主会话] " if (main_session_id and sid == main_session_id) else ""
+                lines.append(f"{prefix}{i}. {pin}{main_tag}{title} ({sid[:8]}...)")
             return "\n".join(lines), active_session_id
 
         sid = cls.resolve_session(args.split()[0] if args else "", sessions)
@@ -152,6 +155,10 @@ class CommandHandler:
             return f"已切换至会话：{sid}", sid
 
         if name == "delete":
+            if main_session_id and sid == main_session_id:
+                raise CommandError("主会话不能删除")
+            client.delete_session(sid)
+            return f"已删除会话：{sid}", active_session_id
             client.delete_session(sid)
             return f"已删除会话：{sid}", active_session_id
 

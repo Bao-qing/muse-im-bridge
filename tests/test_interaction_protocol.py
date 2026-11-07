@@ -364,6 +364,18 @@ class DecisionCase(unittest.IsolatedAsyncioTestCase):
         body = [c[2] for c in self.calls if c[0] == "POST"][0]
         self.assertEqual(body["decision"], "deny")
 
+    async def test_run_pauses_quietly_when_credentials_missing(self):
+        self.service.token_manager.has_credentials.return_value = False
+        self.p.reconcile = AsyncMock()
+        running = iter([True, False])
+        with unittest.mock.patch("muse_bridge.muse.interactions.asyncio.sleep", new=AsyncMock()) as mock_sleep, \
+             unittest.mock.patch("muse_bridge.muse.interactions.logger.warning") as mock_warn:
+            await self.p.run(AsyncMock(), lambda: next(running))
+        self.p.reconcile.assert_not_called()
+        mock_warn.assert_not_called()
+        self.assertFalse(self.p.manager.approvals_ready)
+        mock_sleep.assert_called_with(3)
+
 
 if __name__ == "__main__":
     unittest.main()

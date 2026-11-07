@@ -230,9 +230,39 @@ class TestCommandHandler(unittest.TestCase):
             # Persistence belongs to SessionMapper; the command writes no file
             self.assertEqual(os.listdir(tmp), [])
 
-            reply2, cur_id = CommandHandler.execute("current", "", None, new_id)
+            reply2, cur_id = CommandHandler.execute("current", "", None, new_id, main_session_id=new_id)
             self.assertIn(new_id, reply2)
+            self.assertIn("[主会话]", reply2)
             self.assertEqual(cur_id, new_id)
+
+    def test_sessions_command_marks_main_session(self):
+        client = mock.MagicMock()
+        client.list_sessions.return_value = [
+            {"session_id": "main-123456", "title": "默认主会话", "updated_at_ms": 200},
+            {"session_id": "other-789012", "title": "日常会话", "updated_at_ms": 100},
+        ]
+        reply, active = CommandHandler.execute(
+            "sessions", "", client, active_session_id="other-789012", main_session_id="main-123456"
+        )
+        self.assertIn("[主会话] 默认主会话", reply)
+        self.assertIn("* 2. 日常会话", reply)
+        self.assertEqual(active, "other-789012")
+
+    def test_delete_main_session_prevented(self):
+        client = mock.MagicMock()
+        client.list_sessions.return_value = [
+            {"session_id": "main-123456", "title": "默认主会话", "updated_at_ms": 200},
+            {"session_id": "other-789012", "title": "日常会话", "updated_at_ms": 100},
+        ]
+        with self.assertRaises(CommandError) as ctx:
+            CommandHandler.execute("delete", "1", client, active_session_id="other-789012", main_session_id="main-123456")
+        self.assertIn("主会话不能删除", str(ctx.exception))
+        client.delete_session.assert_not_called()
+
+        # Deleting non-main session works
+        reply, _ = CommandHandler.execute("delete", "2", client, active_session_id="other-789012", main_session_id="main-123456")
+        client.delete_session.assert_called_once_with("other-789012")
+        self.assertIn("已删除会话", reply)
 
 
 class TestQQAdapterLogic(unittest.TestCase):

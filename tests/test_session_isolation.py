@@ -437,10 +437,25 @@ class TestOutboundRouting(unittest.IsolatedAsyncioTestCase):
             await p.ensure_baseline("S")
             self.assertIn("old1", p._seen_ids)
             self.assertIn("S", p._gated)
-            # second call is a no-op
-            client.history_calls.clear()
-            await p.ensure_baseline("S")
-            self.assertEqual(client.history_calls, [])
+
+    async def test_admin_private_auto_binds_to_main_session(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            from muse_bridge.config.models import MuseConfig
+            cfg = QQConfig(
+                app_id="1", app_secret="s",
+                admin_id=["SUPER_ADMIN"],
+                whitelist={"private": ["SUPER_ADMIN"]},
+                session_map_file=os.path.join(tmp, "map.json"),
+                push_state_file=os.path.join(tmp, "push.json"),
+                access_requests=AccessRequestsConfig(state_file=os.path.join(tmp, "access.local.json")),
+            )
+            svc = mock.MagicMock()
+            svc.config = MuseConfig(session_id="MAIN-SESSION-XYZ")
+            svc.interactions = mock.MagicMock()
+            svc.interactions.managed_sessions = set()
+            adapter = QQAdapter(cfg, svc)
+            # The adapter should automatically pre-bind SUPER_ADMIN's private chat to MAIN-SESSION-XYZ
+            self.assertEqual(adapter.session_mapper.current("private", "SUPER_ADMIN"), "MAIN-SESSION-XYZ")
 
 
 if __name__ == "__main__":

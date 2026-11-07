@@ -65,6 +65,13 @@ class ChatGateway(BaseAdapter):
             state_file=self.config.session_map_file,
             bindings=self.config.session_bindings,
         )
+
+        # Bind configured main session to admin's private chat if not already bound
+        main_sid = self.muse_service.config.session_id
+        admin_target = self.config.admin_target()
+        if main_sid and admin_target and not self.session_mapper.current("private", admin_target):
+            self.session_mapper.bind("private", admin_target, main_sid)
+
         self.muse_service.interactions.managed_sessions.update(self.session_mapper.session_ids())
 
         # Sole exit to the chat for both replies & proactive pushes
@@ -244,6 +251,7 @@ class ChatGateway(BaseAdapter):
                 cmd_args,
                 client,
                 chat_session_id,
+                self.muse_service.config.session_id,
             )
             if new_sid != chat_session_id:
                 self.session_mapper.bind(target_type, target_id, new_sid)
@@ -300,6 +308,11 @@ class ChatGateway(BaseAdapter):
                     content += f"\n[{att.type}下载失败：{e}]"
 
         try:
+            # Bind configured main session to admin's private chat if not yet bound
+            if target_type == "private" and is_admin and self.muse_service.config.session_id:
+                if not self.session_mapper.current("private", target_id):
+                    self.session_mapper.bind("private", target_id, self.muse_service.config.session_id)
+
             # Resolve which Muse session this chat talks to
             session_id, created = self.session_mapper.resolve(target_type, target_id)
             if created:

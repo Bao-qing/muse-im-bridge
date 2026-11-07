@@ -48,6 +48,11 @@ class TestFirstRunWizard(unittest.TestCase):
             self.assertTrue(qq["admin_only"])
             self.assertTrue(qq["credentials_in_place"])
 
+            # Verify main_session_id generated and private chat bound to it
+            main_sid = data["muse"]["session_id"]
+            self.assertTrue(bool(main_sid))
+            self.assertEqual(qq.get("session_bindings", {}).get("private:USER_OPENID_123"), main_sid)
+
     def test_generate_minimal_config_qq_group(self):
         with tempfile.TemporaryDirectory() as tmp:
             out_file = os.path.join(tmp, "config.json")

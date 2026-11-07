@@ -12,6 +12,7 @@ import threading
 import uuid
 from urllib.parse import parse_qs, quote, urlparse
 
+from .client.errors import LoginRequired
 from ..observability import get_logger, safe_error, trace_event
 
 
@@ -618,6 +619,13 @@ class MuseInteractions:
     async def run(self, notify, running):
         """Use explicit sentinel reconciliation; snapshot stream origin is unverified."""
         while running():
+            # If Muse credentials are not present (waiting for login / fallback mode),
+            # pause reconciliation quietly instead of spamming reconciliation errors.
+            if not await asyncio.to_thread(self.service.token_manager.has_credentials):
+                self.manager.approvals_ready = False
+                await asyncio.sleep(3)
+                continue
+
             try:
                 pending = await self.reconcile()
                 for item in pending:
@@ -635,6 +643,9 @@ class MuseInteractions:
                         await self.announce(head, notify)
             except asyncio.CancelledError:
                 raise
+            except LoginRequired:
+                self.manager.approvals_ready = False
+                logger.debug("Approval reconciliation paused: Muse login required.")
             except Exception as e:
                 self.manager.approvals_ready = False
                 logger.warning("Approval reconciliation unavailable; pending gates retained. error=%s", safe_error(e))
