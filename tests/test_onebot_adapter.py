@@ -217,6 +217,18 @@ def _sent_texts(adapter):
 
 
 class TestOneBotInbound(unittest.IsolatedAsyncioTestCase):
+    async def test_chinese_gateway_and_interaction_commands(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            adapter, muse = _make_adapter(tmp)
+            for index, (text, native) in enumerate((("/状态", "/status"),
+                    ("/用量 开启", "/usage on"), ("/停止", "/stop")), 950):
+                await adapter.handle_event(_group("G1", 5, text, index))
+                self.assertEqual(muse.post_message.call_args.args[1], native)
+            await adapter.handle_event(_private("A1", "/登录", 960))
+            self.assertIn("请输入登录邮箱", _sent_texts(adapter)[-1])
+            await adapter.handle_event(_private("A1", "/取消", 961))
+            self.assertIn("输入流程已结束", _sent_texts(adapter)[-1])
+
     async def test_group_sender_info_default_and_disabled(self):
         with tempfile.TemporaryDirectory() as tmp:
             adapter, muse = _make_adapter(tmp)
@@ -270,7 +282,7 @@ class TestOneBotInbound(unittest.IsolatedAsyncioTestCase):
             self.assertEqual([c.args[1] for c in muse.post_message.call_args_list],
                              ['【群消息发送者 {"用户ID": "5"}】\ncalled', "dm needs no mention"])
             await adapter.handle_event(_group("G1", 5, "/help", 4))
-            self.assertIn("/sessions", _sent_texts(adapter)[-1])
+            self.assertIn("/会话", _sent_texts(adapter)[-1])
 
     async def test_admin_command_blocked_for_non_admin(self):
         with tempfile.TemporaryDirectory() as tmp:

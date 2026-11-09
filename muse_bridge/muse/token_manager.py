@@ -314,13 +314,13 @@ class MuseTokenManager:
                 return self._token, self._notary_token, self.vm_id
             if not self.has_credentials():
                 self.invalidate()
-                raise LoginRequired("Muse Cookie 缺失或会话已失效，请管理员私聊 /login。")
+                raise LoginRequired("Muse Cookie 缺失或会话已失效，请管理员私聊 /登录。")
             if time.monotonic() < self._retry_after:
                 raise self._refresh_error
             cookie = self.load_cookie_string()
             if not cookie:
                 self.invalidate()
-                raise LoginRequired("Muse Cookie 缺失，请管理员私聊 /login。")
+                raise LoginRequired("Muse Cookie 缺失，请管理员私聊 /登录。")
             try:
                 vm_id = self.vm_id or self.vm_id_from_token(self._token) or self.vm_id_from_cookies(cookie)
                 if not vm_id:
@@ -352,7 +352,7 @@ class MuseTokenManager:
                             raise
                         if exc.status == 401:
                             self.invalidate()
-                            raise LoginRequired("Muse Cookie 会话已失效，请管理员私聊 /login。") from None
+                            raise LoginRequired("Muse Cookie 会话已失效，请管理员私聊 /登录。") from None
                         raise
                 self._write_mint_atomic(token, notary)
             except LoginRequired:
@@ -372,7 +372,7 @@ class MuseTokenManager:
         """Get usable mint; only confirmed cookie failure can require login."""
         with self._lock:
             if not self.has_credentials():
-                raise LoginRequired("Muse Cookie 缺失或会话已失效，请管理员私聊 /login。")
+                raise LoginRequired("Muse Cookie 缺失或会话已失效，请管理员私聊 /登录。")
             if not self.vm_id:
                 self.vm_id = self.vm_id_from_token(self._token)
             if not self.is_fresh():

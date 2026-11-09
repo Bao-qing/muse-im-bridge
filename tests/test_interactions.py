@@ -116,7 +116,7 @@ class TestQQInteractions(unittest.IsolatedAsyncioTestCase):
             await self.send("user@example.com")
             otp.assert_not_called()
         self.service.post_message.assert_not_called()
-        self.assertIn("/login", self.text())
+        self.assertIn("/登录", self.text())
 
     async def test_recovered_cookie_releases_old_login_fallback(self):
         self.adapter.enter_login_mode()
@@ -150,7 +150,7 @@ class TestQQInteractions(unittest.IsolatedAsyncioTestCase):
             await self.send("123456")
         self.assertTrue(item.terminal)
         self.assertTrue(self.adapter._in_login_fallback)
-        self.assertIn("重新 /login", self.text())
+        self.assertIn("重新 /登录", self.text())
         self.assertNotIn("无需重复登录", self.text())
         self.service.post_message.assert_not_called()
 

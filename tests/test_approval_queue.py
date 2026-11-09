@@ -7,6 +7,8 @@ import uuid
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
+from muse_bridge.adapters.onebot.adapter import OneBotAdapter
+from muse_bridge.config.models import OneBotConfig
 from muse_bridge.adapters.qq.adapter import QQAdapter
 from muse_bridge.config.models import AccessRequestsConfig, ConfigLoader, MuseConfig, QQConfig
 from muse_bridge.muse.service import MuseService
@@ -173,6 +175,8 @@ class QueueCase(unittest.IsolatedAsyncioTestCase):
 
     async def test_admin_private_answers_queue_pushed_from_other_session(self):
         self.service.interactions.managed_sessions.add("s2")
+        self.adapter.session_mapper.bind("group", "G", "s2")
+        self.adapter.config.approvals_in_place = False
         self.load(row("remote-a", 1000, session="s2"), row("remote-b", 2000, session="s2"))
         queue = self.protocol.approval_queue("s2")
         self.assertEqual(len(queue), 2)
@@ -223,6 +227,201 @@ class QueueCase(unittest.IsolatedAsyncioTestCase):
         pusher._send_to_qq = AsyncMock(return_value=True)
         self.assertTrue(await pusher.notify_interaction(queue[1], "card"))
         pusher._send_to_qq.assert_not_awaited()
+
+    async def quoted(self, text, message_id="card-1", *, owner=None, session="s1", admin=True):
+        owner = owner or ("private", "ADMIN", "ADMIN")
+        return await self.adapter.interaction_router.handle(
+            owner, text, uuid.uuid4().hex, admin, session,
+            event={"message_reference": {"message_id": message_id}})
+
+    async def show_quoted_card(self, item):
+        self.adapter.client.send_message.return_value = (200, {"id": "card-1"})
+        await self.adapter.interaction_router.display_approval(
+            ("private", "ADMIN", "ADMIN"), item, "incoming")
+
+    async def test_quoted_success_and_replay_do_not_decide_next_card(self):
+        first, second = self.load(row("remote-a", 1), row("remote-b", 2))
+        await self.show_quoted_card(first)
+        # New replies have different receipts; the old quote stays a tombstone.
+        self.adapter.client.send_message.return_value = (200, {"id": "card-2"})
+        self.assertTrue(await self.quoted("1"))
+        self.assertIn("服务端状态：approved", self.texts()[-1])
+        self.assertIn(second.id, self.texts()[-1])
+        await self.quoted("1")
+        self.assertIn("已结束", self.texts()[-1])
+        self.assertEqual(len(self.remote.posts), 1)
+        self.assertFalse(second.terminal)
+        self.service.post_message.assert_not_called()
+
+    async def test_quoted_timed_out_card_has_feedback_without_post(self):
+        item, = self.load(row("remote-a", 1))
+        await self.show_quoted_card(item)
+        self.remote.rows["remote-a"]["status"] = "timed_out"
+        await self.quoted("1")
+        self.assertIn("其他客户端结束", self.texts()[-1])
+        self.assertIn("审批已全部完成", self.texts()[-1])
+        self.assertEqual(self.remote.posts, [])
+
+    async def test_batch_expiry_is_not_reported_as_successful_choice(self):
+        item, = self.load(row("remote-a", 1))
+        await self.show_quoted_card(item)
+        self.remote.rows["remote-a"]["status"] = "timed_out"
+        await self.send("1 all")
+        self.assertIn("已过期", self.texts()[-1])
+        self.assertNotIn(f"{item.id}：已完成", self.texts()[-1])
+        self.assertEqual(self.remote.posts, [])
+
+    async def test_quoted_already_expired_card_has_explicit_feedback(self):
+        item, = self.load(row("remote-a", 1))
+        await self.show_quoted_card(item)
+        self.service.interactions.finish(item, "timed_out")
+        await self.quoted("1")
+        self.assertIn("已过期", self.texts()[-1])
+        self.assertEqual(self.remote.posts, [])
+        self.service.post_message.assert_not_called()
+
+    async def test_quoted_refresh_failure_reports_unconfirmed_without_post(self):
+        item, = self.load(row("remote-a", 1))
+        await self.show_quoted_card(item)
+        self.protocol.request.side_effect = TimeoutError("refresh failed")
+        await self.quoted("1")
+        self.assertIn("结果暂未确认", self.texts()[-1])
+        self.assertEqual(self.remote.posts, [])
+        self.assertFalse(item.terminal)
+
+    def test_receipt_reference_kinds_are_scoped_and_accept_onebot_numeric_ids(self):
+        item, = self.load(row("remote-a", 1))
+        snapshot = self.protocol.display_snapshot(item)
+        self.protocol.remember_approval_message(("group", "7"),
+            {"message_id": 123, "ext_info": {"ref_idx": "ref-1"}}, [item], [snapshot])
+        expected = [(item.id, snapshot)]
+        self.assertEqual(self.protocol.referenced_approvals(("group", "7"), [("id", "123")]), expected)
+        self.assertEqual(self.protocol.referenced_approvals(("group", "7"), [("ref", "ref-1")]), expected)
+        self.assertIsNone(self.protocol.referenced_approvals(("group", "8"), [("id", "123")]))
+        self.assertIsNone(self.protocol.referenced_approvals(("group", "7"), [("id", "123"), ("id", "other")]))
+
+    async def test_quoted_uncertain_failure_never_reposts(self):
+        item, = self.load(row("remote-a", 1))
+        await self.show_quoted_card(item)
+        def uncertain(method, path, body=None, **kwargs):
+            if method == "POST":
+                self.remote.posts.append(("remote-a", body))
+                raise TimeoutError("response lost")
+            return self.remote(method, path, body, **kwargs)
+        self.protocol.request.side_effect = uncertain
+        await self.quoted("1")
+        self.assertIn("结果未确认", self.texts()[-1])
+        await self.quoted("1")
+        self.assertIn("不会重复发送决定", self.texts()[-1])
+        self.assertEqual(len(self.remote.posts), 1)
+        self.assertFalse(item.terminal)
+
+    async def test_quoted_changed_revision_does_not_reinterpret_old_choice(self):
+        item, = self.load(row("remote-a", 1))
+        await self.show_quoted_card(item)
+        self.remote.rows["remote-a"]["decision_options"].reverse()
+        self.adapter.client.send_message.return_value = (200, {"id": "new-card"})
+        await self.quoted("1")
+        self.assertIn("已变化", self.texts()[-1])
+        await self.quoted("1")
+        self.assertIn("已变化", self.texts()[-1])
+        self.assertEqual(self.remote.posts, [])
+
+    async def test_quoted_permissions_and_group_binding_are_preserved(self):
+        item, = self.load(row("remote-a", 1))
+        await self.show_quoted_card(item)
+        await self.quoted("1", admin=False)
+        self.assertIn("仅限", self.texts()[-1])
+        owner = ("group", "G", "ADMIN")
+        self.protocol.remember_approval_message(owner[:2], {"id": "card-1"},
+                                              [item], [self.protocol.display_snapshot(item)])
+        await self.quoted("1", owner=owner, session="different")
+        self.assertIn("不属于当前群", self.texts()[-1])
+        self.assertEqual(self.remote.posts, [])
+
+    async def test_unverified_background_quote_redisplays_without_decision(self):
+        item, = self.load(row("remote-a", 1))
+        await self.adapter.notify_interaction(item, self.protocol.format_approval(item))
+        self.assertTrue(await self.quoted("1", "background-card"))
+        self.assertIn("无法验证", self.texts()[-1])
+        self.assertIn(item.id, self.texts()[-1])
+        self.assertEqual(self.remote.posts, [])
+        self.service.post_message.assert_not_called()
+
+    async def test_onebot_ordinary_approvals_report_results_for_every_group_trigger(self):
+        for trigger in ("all", "at", "prefix"):
+            for mode in ("number", "batch", "command"):
+                with self.subTest(trigger=trigger, mode=mode):
+                    root = Path(self.tmp.name) / f"{trigger}-{mode}"
+                    root.mkdir()
+                    cfg = OneBotConfig(admin_id=["42"], group_trigger=trigger, whitelist={"7": "*"},
+                        session_bindings={"group:7": "s1"},
+                        access_requests=AccessRequestsConfig(state_file=str(root / "access.json")),
+                        session_map_file=str(root / "map.json"), delivered_file=str(root / "delivered.jsonl"),
+                        push_state_file=str(root / "push.json"))
+                    adapter = OneBotAdapter(cfg, self.service)
+                    adapter.client = MagicMock()
+                    adapter.client.send_msg.return_value = {"message_id": 100}
+                    adapter.outbound_pusher.client = adapter.client
+                    item, = self.load(row(f"{trigger}-{mode}", 1))
+                    await adapter.notify_interaction(item, self.protocol.format_approval(item))
+                    text = {"number": "1", "batch": "1 all", "command": f"/审批 {item.id} 1"}[mode]
+                    await adapter.handle_event({"post_type": "message", "message_type": "group", "group_id": 7,
+                        "user_id": 42, "self_id": 99, "message_id": 1,
+                        "message": [{"type": "text", "data": {"text": text}}]})
+                    self.assertEqual(len(self.remote.posts), 1)
+                    self.assertIn("审批已全部完成", str(adapter.client.send_msg.call_args))
+                    self.assertIn("已完成" if mode == "batch" else "服务端状态：approved",
+                                  str(adapter.client.send_msg.call_args))
+                    self.service.post_message.assert_not_called()
+
+    async def test_ordinary_command_and_batch_refresh_failures_report_unconfirmed(self):
+        for mode in ("command", "batch"):
+            with self.subTest(mode=mode):
+                item, = self.load(row(mode, 1))
+                await self.show_quoted_card(item)
+                self.protocol.request.side_effect = TimeoutError("refresh failed")
+                text = f"/审批 {item.id} 1" if mode == "command" else "1 all"
+                await self.send(text)
+                self.assertIn("未确认", self.texts()[-1])
+                self.assertEqual(self.remote.posts, [])
+                self.assertFalse(item.terminal)
+                self.service.interactions.finish(item, "cancelled")
+
+    async def test_onebot_group_quote_bypasses_at_trigger_and_reports_result(self):
+        root = Path(self.tmp.name)
+        cfg = OneBotConfig(admin_id=["42"], group_trigger="at", whitelist={"7": "*"},
+                           session_bindings={"group:7": "s1"},
+                           access_requests=AccessRequestsConfig(state_file=str(root / "ob-access.json")),
+                           session_map_file=str(root / "ob-map.json"),
+                           delivered_file=str(root / "ob-delivered.jsonl"),
+                           push_state_file=str(root / "ob-push.json"))
+        adapter = OneBotAdapter(cfg, self.service)
+        adapter.client = MagicMock()
+        adapter.client.send_msg.return_value = {"message_id": 100}
+        adapter.outbound_pusher.client = adapter.client
+        item, = self.load(row("remote-a", 1))
+        await adapter.notify_interaction(item, self.protocol.format_approval(item))
+        event = {"post_type": "message", "message_type": "group", "group_id": 7,
+                 "user_id": 42, "self_id": 99, "message_id": 1,
+                 "message": [{"type": "reply", "data": {"id": "100"}},
+                             {"type": "text", "data": {"text": "1"}}]}
+        adapter.client.send_msg.return_value = {"message_id": 101}
+        await adapter.handle_event(event)
+        self.assertEqual(len(self.remote.posts), 1)
+        self.assertIn("服务端状态：approved", str(adapter.client.send_msg.call_args))
+        calls = adapter.client.send_msg.call_count
+        await adapter.handle_event(event)  # Same incoming message is deduplicated.
+        self.assertEqual(adapter.client.send_msg.call_count, calls)
+        self.service.post_message.assert_not_called()
+
+    async def test_quoted_all_uses_original_queue_snapshot(self):
+        self.load(row("remote-a", 1), row("remote-b", 2))
+        await self.show_quoted_card(self.protocol.approval_queue("s1")[0])
+        self.remote.rows["remote-c"] = row("remote-c", 3)
+        await self.quoted("1 all")
+        self.assertEqual([key for key, _ in self.remote.posts], ["remote-a", "remote-b"])
+        self.assertIn("批量审批", self.texts()[-1])
 
     def test_approvals_in_place_config(self):
         self.assertTrue(QQConfig().approvals_in_place)

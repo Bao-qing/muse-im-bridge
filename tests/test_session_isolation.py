@@ -373,32 +373,42 @@ class TestOutboundRouting(unittest.IsolatedAsyncioTestCase):
             self.assertEqual((kw["target_type"], kw["target_id"]), ("group", "GA"))
             self.assertEqual(kw["route"].msg_id, "msg_id_123")
 
-    async def test_proactive_for_unbound_session_goes_to_admin(self):
+    async def test_old_route_does_not_follow_chat_after_switch(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            p, mapper = _pusher(tmp)
+            mapper.bind("group", "OLD_CHAT", "SHARED")
+            mapper.bind("group", "REMAINING", "SHARED")
+            p.route_manager.register("u-old", "group", "OLD_CHAT", "old-message")
+            mapper.bind("group", "OLD_CHAT", "NEW")
+            p._send_to_qq = mock.AsyncMock(return_value=True)
+            history = [{"role": "user", "message_id": "u-old", "seq": 1},
+                       self._assistant("late", "旧会话输出")]
+            await p._scan_and_dispatch(history, "SHARED")
+            kw = p._send_to_qq.call_args.kwargs
+            self.assertEqual(kw["target_id"], "REMAINING")
+
+    async def test_unbound_session_never_falls_back_to_admin(self):
         with tempfile.TemporaryDirectory() as tmp:
             p, _ = _pusher(tmp)
             p._send_to_qq = mock.AsyncMock(return_value=True)
             await p._scan_and_dispatch([self._assistant("r3", "提醒")], "UNBOUND")
-            kw = p._send_to_qq.call_args.kwargs
-            self.assertEqual((kw["target_type"], kw["target_id"]), ("private", "ADMIN"))
+            p._send_to_qq.assert_not_called()
+            p.deduplicator.mark_processing.assert_not_called()
 
     async def test_unbound_push_disabled_is_dropped_even_with_admin(self):
         with tempfile.TemporaryDirectory() as tmp:
             p, _ = _pusher(tmp, unbound_push_to_admin=False)
             p._send_to_qq = mock.AsyncMock(return_value=True)
-            with self.assertLogs("muse_bridge", level="WARNING") as logs:
-                await p._scan_and_dispatch([self._assistant("r6", "提醒")], "UNBOUND")
+            await p._scan_and_dispatch([self._assistant("r6", "提醒")], "UNBOUND")
             p._send_to_qq.assert_not_called()
-            self.assertTrue(any("unbound_push_to_admin is disabled" in line for line in logs.output))
 
     async def test_unbound_without_admin_is_dropped_with_warning(self):
         with tempfile.TemporaryDirectory() as tmp:
             p, _ = _pusher(tmp, admin_id=[])
             p._send_to_qq = mock.AsyncMock(return_value=True)
-            with self.assertLogs("muse_bridge", level="WARNING") as logs:
-                await p._scan_and_dispatch([self._assistant("r5", "提醒")], "UNBOUND")
+            await p._scan_and_dispatch([self._assistant("r5", "提醒")], "UNBOUND")
             p._send_to_qq.assert_not_called()
             p.deduplicator.mark_processing.assert_not_called()
-            self.assertTrue(any("no admin" in line for line in logs.output))
 
     async def test_group_rejection_falls_back_to_admin(self):
         with tempfile.TemporaryDirectory() as tmp:

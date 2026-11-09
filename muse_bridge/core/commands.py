@@ -11,31 +11,40 @@ LOCAL_COMMANDS = frozenset([
     "pin", "unpin", "archive", "unarchive", "help", "login"
 ])
 
+CHINESE_COMMANDS = {
+    "会话": "sessions", "切换": "switch", "新建": "new", "当前": "current",
+    "删除": "delete", "重命名": "rename", "置顶": "pin", "取消置顶": "unpin",
+    "归档": "archive", "取消归档": "unarchive", "帮助": "help", "登录": "login",
+    "状态": "status", "压缩": "compact", "清空": "clear", "用量": "usage",
+    "子代理": "subagents", "停止": "stop",
+}
+
 HELP_TEXT = (
     "命令（/ 开头）：\n"
     "/申请 [全员] — 申请使用；全员表示开放当前群\n"
     "/申请审批 [编号 同意|拒绝] — 管理员私聊审批白名单\n"
-    "/sessions [页] — 列出会话\n"
-    "/switch <序号|id> — 切换会话\n"
-    "/new — 新开会话\n"
-    "/current — 当前会话\n"
-    "/login [邮箱] — 显式登录 Muse（管理员私聊专用）\n"
+    "/会话 [页] — 列出会话\n"
+    "/切换 <序号|id> — 切换会话\n"
+    "/新建 — 新开会话\n"
+    "/当前 — 当前会话\n"
+    "/登录 [邮箱] — 显式登录 Muse（管理员私聊专用）\n"
     "/凭证 [编号] [保存|一次] — 填写凭证，也可回复凭证卡\n"
     "账号和密码可分两行发送，保存后自动继续聊天\n"
     "/审批 [编号] [选项数字] — 查看或选择 Muse 原生审批选项；多张审批依次排队\n"
-    "/审批 all <选项数字> — 当前审批队列全部使用该选项（也可回复“数字 all”）\n"
-    "/cancel — 结束本地输入（不会取消远端审批）\n"
-    "/chat — 清除已结束的输入流程（通常无需使用）\n"
-    "/delete <序号|id> — 删除会话（主会话不能删）\n"
-    "/rename <序号|id> <新标题> — 改名\n"
-    "/pin /unpin <序号|id> — 置顶 / 取消置顶\n"
-    "/archive /unarchive <序号|id> — 归档 / 取消归档\n"
-    "/status — 会话状态与用量\n"
-    "/usage on|off — 开关用量显示\n"
-    "/clear — 下一句话起用全新上下文\n"
-    "/compact — 压缩当前会话上下文\n"
-    "/subagents — 列出子代理\n"
-    "/help — 显示本帮助"
+    "/审批 全部 <选项数字> — 当前审批队列全部使用该选项（也可回复“数字 全部”）\n"
+    "/取消 — 结束本地输入（不会取消远端审批）\n"
+    "/聊天 — 清除已结束的输入流程（通常无需使用）\n"
+    "/删除 <序号|id> — 删除会话（主会话不能删）\n"
+    "/重命名 <序号|id> <新标题> — 改名\n"
+    "/置顶 /取消置顶 <序号|id> — 置顶 / 取消置顶\n"
+    "/归档 /取消归档 <序号|id> — 归档 / 取消归档\n"
+    "/状态 — 会话状态与用量\n"
+    "/用量 开启|关闭 — 开关用量显示\n"
+    "/清空 — 下一句话起用全新上下文\n"
+    "/压缩 — 压缩当前会话上下文\n"
+    "/子代理 — 列出子代理\n"
+    "/停止 — 停止当前任务\n"
+    "/帮助 — 显示本帮助"
 )
 
 _PER_PAGE = 20
@@ -56,9 +65,10 @@ class CommandHandler:
             return None
         parts = stripped[1:].split(None, 1) or [""]
         name = (parts[0] or "").lower()
+        name = CHINESE_COMMANDS.get(name, name)
         args = parts[1].strip() if len(parts) > 1 else ""
         if name in GATEWAY_COMMANDS:
-            if name == "usage" and args and args.lower() not in ("on", "off"):
+            if name == "usage" and args and args.lower() not in ("on", "off", "开启", "关闭"):
                 return ("__usage_hint__", "")
             return None  # Pass through to Muse
         if name in LOCAL_COMMANDS:
@@ -112,7 +122,7 @@ class CommandHandler:
         if name in ("help", "__help__"):
             return HELP_TEXT, active_session_id
         if name == "__usage_hint__":
-            return "用法：/usage on 或 /usage off", active_session_id
+            return "用法：/用量 开启 或 /用量 关闭", active_session_id
 
         if name == "new":
             new_id = str(uuid.uuid4())
@@ -181,7 +191,7 @@ class CommandHandler:
         if name == "rename":
             parts = args.split(None, 1)
             if len(parts) < 2 or not parts[1].strip():
-                raise CommandError("用法：/rename <序号|id> <新标题>")
+                raise CommandError("用法：/重命名 <序号|id> <新标题>")
             new_title = parts[1].strip()
             client.rename_session(sid, new_title)
             return f"会话已重命名为：{new_title}", active_session_id

@@ -88,6 +88,9 @@ class MuseInteractions:
         self.service = service
         self.manager = service.interactions
         self._decision_locks = {}
+        # Exact sent-card bindings, including terminal tombstones. Never let a
+        # replayed quote select a new queue head or a newer card revision.
+        self._approval_messages = {}
         self._refresh_lock = asyncio.Lock()
         self._notify_lock = asyncio.Lock()
         self._fetch_lock = threading.RLock()
@@ -504,6 +507,29 @@ class MuseInteractions:
         item.context.setdefault("displayed_to", {})[target] = fingerprint
         item.context.setdefault("queue_shown", {})[target] = queue
 
+    def remember_approval_message(self, target, body, items, snapshots):
+        if not isinstance(body, dict):
+            return
+        info = body.get("ext_info") or {}
+        message_id = body.get("id") or body.get("message_id")
+        if type(message_id) is int:
+            message_id = str(message_id)
+        references = {"id": message_id,
+                      "ref": info.get("ref_idx") if isinstance(info, dict) else None}
+        bindings = [(item.id, snapshot) for item, snapshot in zip(items, snapshots)]
+        for kind, value in references.items():
+            if isinstance(value, str) and value:
+                self._approval_messages[(*target, kind, value)] = bindings
+        while len(self._approval_messages) > 4096:
+            self._approval_messages.pop(next(iter(self._approval_messages)))
+
+    def referenced_approvals(self, target, references):
+        bindings = [self._approval_messages.get((*target, kind, value))
+                    for kind, value in references]
+        if not bindings or any(b is None or b != bindings[0] for b in bindings):
+            return None
+        return bindings[0]
+
     @contextlib.contextmanager
     def deciding(self, session_id):
         """Hold back background pushes while a chat decides and advances this queue."""
@@ -559,7 +585,7 @@ class MuseInteractions:
         lock = self._decision_locks.setdefault(item.remote_id, asyncio.Lock())
         async with lock:
             if item.terminal:
-                return "此审批已结束，请重新发送需要继续的消息。"
+                return f"此审批已结束，服务端状态：{item.state}；不会重复提交决定。"
             if item.context.get("decision_uncertain"):
                 result = await asyncio.to_thread(self.request, "GET", f"/approvals/{quote(item.remote_id, safe='')}")
                 self.upsert_approval(result.get("approval", result))
@@ -580,7 +606,7 @@ class MuseInteractions:
             await asyncio.to_thread(self.fetch_approvals)
             fresh = item.context["approval"]
             if item.terminal:
-                return "审批已在其他客户端结束，请重新发送需要继续的消息。"
+                return f"审批已在其他客户端结束，服务端状态：{item.state}；未提交本次选择。"
             if fresh.get("status") != "pending":
                 raise ValueError("Approval state unconfirmed")
             if not automatic and item.context["fingerprint"] != shown:

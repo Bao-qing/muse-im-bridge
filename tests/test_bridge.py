@@ -211,6 +211,15 @@ class TestDeduplicator(unittest.TestCase):
 
 
 class TestCommandHandler(unittest.TestCase):
+    def test_chinese_commands(self):
+        for command, native in (("帮助", "help"), ("会话", "sessions"),
+                                ("新建", "new"), ("切换", "switch"),
+                                ("删除", "delete"), ("取消置顶", "unpin")):
+            self.assertEqual(CommandHandler.parse_command("/" + command), (native, ""))
+        self.assertIsNone(CommandHandler.parse_command("/用量 开启"))
+        self.assertIsNone(CommandHandler.parse_command("/状态"))
+        self.assertEqual(CommandHandler.parse_command("/用量 错误"), ("__usage_hint__", ""))
+
     def test_parse_command(self):
         self.assertEqual(CommandHandler.parse_command("/help"), ("help", ""))
         self.assertEqual(CommandHandler.parse_command("/sessions 2"), ("sessions", "2"))

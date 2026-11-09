@@ -177,6 +177,38 @@ class TestOutboundEventDriven(unittest.IsolatedAsyncioTestCase):
         )
         return pusher, mapper, muse_service, client
 
+    async def test_switch_closes_old_subscription_and_drops_late_events(self):
+        pusher, mapper, service, qq = self._make_pusher(bind_sid="OLD")
+        first, second = mock.MagicMock(), mock.MagicMock()
+        for client in (first, second):
+            client.credentials_current.return_value = True
+            client.get_history.return_value = []
+        def switch(**kwargs):
+            mapper.bind("private", "ADMIN", "NEW")
+            return [{"event": "delta.message_done", "payload": {"session_id": "OLD", "status": "completed"}}]
+        first.read_any_subscription_events.side_effect = switch
+        def stop(**kwargs):
+            pusher._running = False
+            return []
+        second.read_any_subscription_events.side_effect = stop
+        service.create_client.side_effect = [first, second]
+        pusher._running = True
+        await asyncio.wait_for(pusher._run_loop(), 3)
+        first.close.assert_called_once()
+        first.get_history.assert_called_once()
+        second.subscribe.assert_called_once_with("NEW")
+        qq.send_message.assert_not_called()
+        self.assertEqual(pusher._proactive_target("OLD"), ("private", ""))
+
+    async def test_unbound_history_and_cards_never_dispatch(self):
+        pusher, mapper, service, qq = self._make_pusher(bind_sid="NEW")
+        pusher._scan_and_dispatch = mock.AsyncMock()
+        await pusher._hydrate_and_dispatch("OLD", [{"message_id": "late"}], False)
+        pusher._scan_and_dispatch.assert_not_awaited()
+        item = mock.Mock(session_id="OLD")
+        self.assertFalse(await pusher.notify_interaction(item, "approval"))
+        qq.send_message.assert_not_called()
+
     def test_classify_push_event(self):
         # Sync triggers
         ev_done = {"event": "delta.message_done", "payload": {"session_id": "s1", "status": "completed"}}

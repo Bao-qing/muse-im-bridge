@@ -22,7 +22,7 @@ from typing import Dict, List, Optional, Tuple
 
 from ..adapters.base import BaseAdapter
 from ..config.models import ChatConfig
-from ..core.commands import CommandError, CommandHandler
+from ..core.commands import CHINESE_COMMANDS, GATEWAY_COMMANDS, CommandError, CommandHandler
 from ..core.deduplicator import MessageDeduplicator
 from ..core.message import Attachment, InboundMessage
 from ..core.session_map import SessionMapper
@@ -149,7 +149,7 @@ class ChatGateway(BaseAdapter):
         try:
             await self.send_notice(
                 admin_target,
-                "【系统告警】向 Muse 发送消息时检测到凭据失效（401 Unauthorized）。\n已自动进入登录回落流程，请直接在此私聊发送：\n/login <您的邮箱>\n即可获取验证码重新登录恢复服务 ♪",
+                "【系统告警】向 Muse 发送消息时检测到凭据失效（401 Unauthorized）。\n已自动进入登录回落流程，请直接在此私聊发送：\n/登录 <您的邮箱>\n即可获取验证码重新登录恢复服务 ♪",
             )
         except Exception as e:
             logger.debug('Failed to notify admin for login: %s', safe_error(e))
@@ -198,7 +198,7 @@ class ChatGateway(BaseAdapter):
             self.exit_login_mode()
         needs_login = not available
         if needs_login and not content.startswith("/"):
-            text = "Muse 认证不可用，请管理员私聊发送 /login 或 /login <邮箱>。"
+            text = "Muse 认证不可用，请管理员私聊发送 /登录 或 /登录 <邮箱>。"
             await self.send_reply(target_type, target_id, text, msg_id)
             return
 
@@ -211,6 +211,16 @@ class ChatGateway(BaseAdapter):
             await self._run_command(parsed, target_type, target_id, msg_id, is_admin)
             return
 
+        # Muse understands its native English commands, not their Chinese labels.
+        parts = content.split(None, 1)
+        if parts and parts[0].startswith("/"):
+            native = CHINESE_COMMANDS.get(parts[0][1:])
+            if native in GATEWAY_COMMANDS:
+                args = parts[1] if len(parts) > 1 else ""
+                if native == "usage":
+                    args = {"开启": "on", "关闭": "off"}.get(args, args)
+                content = "/" + native + ((" " + args) if args else "")
+
         trace_event(f"{self.name}.adapter", "message.received", payload={"content": content},
                     session_id=session_id, target_type=target_type, target_id=target_id,
                     msg_id=msg_id, attachment_count=len(attachments))
@@ -219,7 +229,7 @@ class ChatGateway(BaseAdapter):
         chat_lock = self._chat_send_locks.setdefault((target_type, target_id), asyncio.Lock())
         async with chat_lock:
             references = msg.references or self.interaction_router.message_references(event)
-            if kind == "group" and self.config.group_sender_info:
+            if kind == "group" and self.config.group_sender_info and not content.startswith("/"):
                 info = {"用户ID": user}
                 for label, value in (("昵称", msg.source.sender_name), ("群名片", msg.source.sender_card)):
                     if isinstance(value, str) and value.strip():
@@ -275,7 +285,7 @@ class ChatGateway(BaseAdapter):
         except Exception as e:
             if isinstance(e, LoginRequired):
                 self.enter_login_mode()
-                reply = "Muse Cookie 会话已失效，请管理员私聊 /login。"
+                reply = "Muse Cookie 会话已失效，请管理员私聊 /登录。"
             else:
                 if is_runtime_auth_error(e) and client is not None:
                     await asyncio.to_thread(self.muse_service.token_manager.invalidate_mint, client.token, client.notary_token)
@@ -364,7 +374,7 @@ class ChatGateway(BaseAdapter):
                 self.enter_login_mode()
                 admin_target = self.config.admin_target()
                 if target_type == "private" and is_admin:
-                    reply = "【系统提示】发送消息时检测到 Muse 会话凭据已失效，已进入登录回落流程。\n请发送 /login 或 /login <邮箱> 获取验证码。"
+                    reply = "【系统提示】发送消息时检测到 Muse 会话凭据已失效，已进入登录回落流程。\n请发送 /登录 或 /登录 <邮箱> 获取验证码。"
                 else:
                     reply = "【系统提示】Muse 会话凭据已失效，服务已暂停并进入登录维护状态，已通知管理员重新登录。"
                     if admin_target and (target_type != "private" or target_id != admin_target):

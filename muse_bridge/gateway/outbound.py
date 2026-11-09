@@ -1,7 +1,7 @@
 """Platform-neutral outbound dispatcher: the sole exit from Muse to a chat.
 
 Unifies interactive replies and proactive notifications for every adapter:
-1. Listens for completed assistant events from the Muse /chat/subscribe event stream.
+1. Listens for completed assistant events from the Muse /聊天/subscribe event stream.
 2. Extracts text, images (URLs & workspace), files (workspace & attachments), and videos.
 3. Automatically reads file-store bytes via client.read_file().
 4. Resolves the destination via RouteManager (the chat that asked, else the
@@ -194,7 +194,7 @@ class OutboundDispatcher:
         self._last_updated: Dict[str, int] = {}       # sid -> last seen updated_at_ms
         self._hot_until: Dict[str, float] = {}        # sid -> keep active until this monotonic ts
         self._last_sweep: float = 0.0
-        self._pending_subscribe: Set[str] = set()     # sessions that need /chat/subscribe opened
+        self._pending_subscribe: Set[str] = set()     # sessions that need /聊天/subscribe opened
         self._uncreated_sessions: Set[str] = set()    # lazy sessions (404 until first message is posted)
         self._load_state()
 
@@ -203,7 +203,7 @@ class OutboundDispatcher:
 
         ``fresh`` marks a session created just now (nothing to baseline, not on server yet).
         When ``fresh=False`` (called after ``post_message`` succeeds), the session now exists
-        on the Muse server and is queued for immediate ``/chat/subscribe`` registration.
+        on the Muse server and is queued for immediate ``/聊天/subscribe`` registration.
         """
         if not session_id:
             return
@@ -256,8 +256,7 @@ class OutboundDispatcher:
 
     async def start(self) -> None:
         self._running = True
-        logger.info('Started %s outbound dispatcher (unbound sessions fall back to admin: %s)', self.platform,
-                    "yes" if self.config.unbound_push_to_admin and self.config.admin_target() else "no")
+        logger.info('Started %s outbound dispatcher (bound sessions only)', self.platform)
 
         while self._running:
             try:
@@ -368,7 +367,7 @@ class OutboundDispatcher:
         """Mark all existing assistant output of a session as seen.
 
         Used when a chat is (re)bound to an *existing* Muse session at runtime
-        (/switch or a config binding) so old history is never pushed to the chat.
+        (/切换 or a config binding) so old history is never pushed to the chat.
         """
         if not session_id or session_id in self._gated:
             return
@@ -403,7 +402,7 @@ class OutboundDispatcher:
             try:
                 await self._send_notice(
                     admin_target,
-                    "【系统提示】获取 Muse 消息时检测到凭据失效（401 Unauthorized）。\n已自动进入登录回落流程，请直接在此私聊发送：\n/login <您的邮箱>\n即可获取验证码重新登录恢复服务 ♪",
+                    "【系统提示】获取 Muse 消息时检测到凭据失效（401 Unauthorized）。\n已自动进入登录回落流程，请直接在此私聊发送：\n/登录 <您的邮箱>\n即可获取验证码重新登录恢复服务 ♪",
                 )
             except Exception as e:
                 logger.debug('Failed to notify admin for login: %s', safe_error(e))
@@ -418,6 +417,8 @@ class OutboundDispatcher:
 
     async def _hydrate_and_dispatch(self, sid: str, hist: List[dict], is_initial_gate: bool) -> None:
         """Apply startup gate if needed, then dispatch any completed assistant messages."""
+        if not self.session_mapper.owners(sid):
+            return
         if is_initial_gate:
             self._gated.add(sid)
             if not hist:
@@ -450,7 +451,7 @@ class OutboundDispatcher:
 
     @staticmethod
     def _classify_push_event(ev: dict, default_sid: Optional[str] = None) -> Tuple[Optional[str], Optional[str]]:
-        """Extract (session_id, trigger_kind) from a /chat/subscribe event.
+        """Extract (session_id, trigger_kind) from a /聊天/subscribe event.
 
         trigger_kind:
         - "sync": An assistant message or media presentation has finished/arrived and should be synced.
@@ -494,7 +495,7 @@ class OutboundDispatcher:
         return sid, None
 
     async def _run_loop(self) -> None:
-        """Pure event-driven loop powered by /chat/subscribe over persistent Noise WebSocket."""
+        """Pure event-driven loop powered by /聊天/subscribe over persistent Noise WebSocket."""
         loop = asyncio.get_running_loop()
 
         while self._running:
@@ -541,6 +542,10 @@ class OutboundDispatcher:
                         break
 
                     watched = self.session_mapper.session_ids()
+                    if subscribed_sids.difference(watched):
+                        # No per-session unsubscribe RPC: close this multiplexed
+                        # connection and rebuild only the current bindings.
+                        break
                     if not watched:
                         await asyncio.sleep(1.0)
                         continue
@@ -560,6 +565,8 @@ class OutboundDispatcher:
                         def _setup_sessions(sids: List[str]) -> List[Tuple[str, List[dict], bool, bool]]:
                             out: List[Tuple[str, List[dict], bool, bool]] = []
                             for sid in sids:
+                                if not self.session_mapper.owners(sid):
+                                    continue
                                 is_init = sid not in self._gated
                                 self._pending_subscribe.discard(sid)
                                 hist: List[dict] = []
@@ -597,7 +604,7 @@ class OutboundDispatcher:
                         await asyncio.sleep(0.5)
                         continue
 
-                    # 2. Read real-time push events from active /chat/subscribe stream(s)
+                    # 2. Read real-time push events from active /聊天/subscribe stream(s)
                     def _read_And_sync_events() -> List[Tuple[str, List[dict]]]:
                         nonlocal last_ping_mono
                         if hasattr(client, "read_any_subscription_events"):
@@ -625,7 +632,7 @@ class OutboundDispatcher:
 
                         for ev in events:
                             sid, kind = self._classify_push_event(ev, default_sid=default_sid)
-                            if not sid:
+                            if not sid or not self.session_mapper.owners(sid):
                                 continue
                             if (ev.get("event") or ev.get("event_name")) == "reactions.updated":
                                 reaction_events.setdefault(sid, []).append(ev)
@@ -643,6 +650,8 @@ class OutboundDispatcher:
 
                         synced: List[Tuple[str, List[dict]]] = []
                         for sid in dirty_sids:
+                            if not self.session_mapper.owners(sid):
+                                continue
                             try:
                                 synced.append((sid, self._fetch_session(client, sid) + reaction_events.get(sid, [])))
                             except Exception as ex:
@@ -703,19 +712,19 @@ class OutboundDispatcher:
     def _proactive_target(self, session_id: Optional[str]) -> Tuple[str, str]:
         """Destination for events that match no inbound route (reminders etc.).
 
-        The chat bound to the session, else the first admin privately when
-        ``unbound_push_to_admin`` is on; an empty id means there is nowhere to
-        deliver.
+        Only a chat currently bound to the session may receive its output.
+        Unbound sessions never fall back to the administrator.
         """
         if session_id:
             owners = self.session_mapper.owners(session_id)
             if owners:
                 return owners[0]
-        if self.config.unbound_push_to_admin:
-            return "private", self.config.admin_target() or ""
         return "private", ""
 
     async def notify_interaction(self, item, text):
+        # Unbound sessions must not emit cards, including admin copies.
+        if not self.session_mapper.owners(item.session_id):
+            return False
         # Routing is not authorization; only configured admins can decide.
         targets = list(self.session_mapper.owners(item.session_id))
         if not targets:
@@ -734,6 +743,8 @@ class OutboundDispatcher:
         protocol = self.muse_service.interaction_protocol
         delivered = False
         for target_type, target_id in dict.fromkeys(targets):
+            if not self.session_mapper.owners(item.session_id):
+                return delivered
             if not target_id:
                 continue
             if (item.kind == "approval" and item.context.get("displayed_to", {}).get((target_type, target_id))
@@ -742,13 +753,17 @@ class OutboundDispatcher:
                 continue
             route = self.route_manager.get_latest_for_target(target_type, target_id, max_age_s=280.0)
             snapshot = protocol.display_snapshot(item) if item.kind == "approval" else None
-            ok = await self._deliver(target_type, target_id, text, [], [], [], route=route)
+            delivery = (DeliveryReference(item.session_id, "", approval_binding=(item, snapshot))
+                        if snapshot is not None else None)
+            ok = await self._deliver(target_type, target_id, text, [], [], [], route=route, delivery=delivery)
             if ok and snapshot is not None:
                 protocol.mark_displayed(item, (target_type, target_id), snapshot)
             delivered = bool(ok) or delivered
         return delivered
 
     async def _scan_and_dispatch(self, hist: List[dict], session_id: Optional[str] = None) -> None:
+        if session_id and not self.session_mapper.owners(session_id):
+            return
         # Consume state updates before message delivery deduplication.
         for event in hist:
             if event.get("event_name") == "delta.presentation" and session_id:
@@ -862,6 +877,10 @@ class OutboundDispatcher:
             root_exec_id = meta.get("root_message_execution_id")
 
             route = self.route_manager.match_route(last_user_mid, root_exec_id)
+            if route and session_id and (route.target_type, route.target_id) not in self.session_mapper.owners(session_id):
+                route = None
+            if session_id and not self.session_mapper.owners(session_id):
+                return
             if route:
                 target_type = route.target_type
                 target_id = route.target_id
@@ -1051,6 +1070,11 @@ class OutboundDispatcher:
 
     def remember_delivery(self, delivery, target_type, target_id, body):
         if not delivery or not delivery.session_id or not isinstance(body, dict):
+            return
+        if delivery.approval_binding is not None:
+            item, snapshot = delivery.approval_binding
+            self.muse_service.interaction_protocol.remember_approval_message(
+                (target_type, target_id), body, [item], [snapshot])
             return
         info = body.get("ext_info") or {}
         refs = [("id", body.get("id") or body.get("message_id"))]
