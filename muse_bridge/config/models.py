@@ -201,6 +201,36 @@ class QQConfig(ChatConfig):
     poll_quiet_polls: int = constants.DEFAULT_POLL_QUIET_POLLS
 
 
+@dataclasses.dataclass
+class QzoneFeedConfig:
+    """Opt-in Muse feed publishing; independent of chat message delivery."""
+
+    enabled: bool = False
+    poll_interval_s: int = 300
+    max_age_s: int = 3600
+    scan_limit: int = 50
+    max_per_scan: int = 3
+    min_publish_interval_s: int = 60
+    publish_window_s: int = 3600
+    max_per_window: int = 5
+    ugc_right: int = 4
+    state_file: str = "data/onebot_qzone_feed.local.json"
+
+    def __post_init__(self):
+        if type(self.enabled) is not bool:
+            raise ValueError("adapters.onebot.qzone_feed.enabled must be a boolean")
+        for name in ("poll_interval_s", "max_age_s", "scan_limit", "max_per_scan",
+                     "min_publish_interval_s", "publish_window_s", "max_per_window"):
+            if type(getattr(self, name)) is not int or getattr(self, name) <= 0:
+                raise ValueError(f"adapters.onebot.qzone_feed.{name} must be a positive integer")
+        if self.scan_limit > 100 or self.max_per_scan > self.scan_limit:
+            raise ValueError("qzone_feed requires max_per_scan <= scan_limit <= 100")
+        if type(self.ugc_right) is not int or self.ugc_right not in {1, 4, 64}:
+            raise ValueError("qzone_feed.ugc_right must be 1 (public), 4 (friends), or 64 (self)")
+        if not isinstance(self.state_file, str) or not self.state_file.strip():
+            raise ValueError("qzone_feed.state_file must be a nonempty path")
+
+
 def _onebot_access_requests() -> AccessRequestsConfig:
     return AccessRequestsConfig(state_file="data/onebot_access.local.json")
 
@@ -221,11 +251,14 @@ class OneBotConfig(ChatConfig):
     ws_url: str = ""
     # Which group messages reach Muse: "all", "at" (@bot or a / command), "prefix" (/ only).
     group_trigger: str = constants.DEFAULT_ONEBOT_GROUP_TRIGGER
+    qzone_feed: QzoneFeedConfig = dataclasses.field(default_factory=QzoneFeedConfig)
 
     def __post_init__(self):
         super().__post_init__()
         self.whitelist = _normalize_whitelist(self.whitelist)
         self.admin_id = [str(a) for a in self.admin_id if a is not None and str(a).strip()]
+        if not isinstance(self.qzone_feed, QzoneFeedConfig):
+            raise ValueError("adapters.onebot.qzone_feed must be a QzoneFeedConfig")
         if self.group_trigger not in {"all", "at", "prefix"}:
             raise ValueError("adapters.onebot.group_trigger must be all, at, or prefix")
 
@@ -439,7 +472,12 @@ class ConfigLoader:
 
         # 3. OneBot config. The token may come from the environment instead of the file.
         ob_raw = adapters_raw.get("onebot") or raw_data.get("onebot") or {}
+        feed_raw = ob_raw.get("qzone_feed", {})
+        feed_fields = {f.name for f in dataclasses.fields(QzoneFeedConfig)}
+        if not isinstance(feed_raw, dict) or feed_raw.keys() - feed_fields:
+            raise ValueError("adapters.onebot.qzone_feed must be an object with known fields")
         ob_cfg = OneBotConfig(
+            qzone_feed=QzoneFeedConfig(**feed_raw),
             **_chat_fields(ob_raw, OneBotConfig),
             debug=bool(ob_raw.get("debug", False)),
             base_url=str(ob_raw.get("base_url") or os.environ.get("ONEBOT_BASE_URL") or ""),

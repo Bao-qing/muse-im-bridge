@@ -134,6 +134,43 @@ class OneBotClient:
             data = self.call("send_private_msg", timeout=timeout, user_id=int(target_id), message=segments)
         return data if isinstance(data, dict) else {}
 
+    def send_qzone_msg(
+        self, content: str, images: Optional[List[str]] = None,
+        ugc_right: Optional[int] = None, target_uins: Optional[List[int]] = None,
+        timeout: int = 30,
+    ) -> dict:
+        """Publish Qzone text with optional image sources and visibility settings.
+
+        Image sources are nonempty strings (file://, http(s):// or base64://).
+        Visibility: 1 all, 4 friends, 16 allow subset, 64 self, 128 deny subset.
+        Returns validated ``{"tid": str, "time": int}`` response data.
+        """
+        if not isinstance(content, str) or not content.strip():
+            raise ValueError("content must be a nonempty string")
+        params: Dict[str, Any] = {"content": content}
+        if images is not None:
+            if not isinstance(images, list) or any(
+                not isinstance(image, str) or not image.strip() for image in images
+            ):
+                raise ValueError("images must be a list of nonempty strings")
+            params["images"] = images
+        if ugc_right is not None:
+            if type(ugc_right) is not int or ugc_right not in {1, 4, 16, 64, 128}:
+                raise ValueError("ugc_right must be one of 1, 4, 16, 64, 128")
+            params["ugc_right"] = ugc_right
+        if target_uins is not None:
+            if not isinstance(target_uins, list) or any(
+                type(uin) is not int or uin <= 0 for uin in target_uins
+            ):
+                raise ValueError("target_uins must be a list of positive integers")
+            params["target_uins"] = target_uins
+        data = self.call("send_qzone_msg", timeout=timeout, **params)
+        if (not isinstance(data, dict)
+                or not isinstance(data.get("tid"), str) or not data["tid"].strip()
+                or type(data.get("time")) is not int):
+            raise OneBotAPIError("send_qzone_msg", 0, "malformed success response: expected tid and time")
+        return data
+
     def upload_file(self, target_type: str, target_id, data: bytes, name: str, timeout: int = 120) -> None:
         """Upload a file into the group file area / private chat."""
         file = "base64://" + base64.b64encode(data).decode("ascii")

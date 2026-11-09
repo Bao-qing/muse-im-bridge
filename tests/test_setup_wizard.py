@@ -11,7 +11,27 @@ from unittest import mock
 from init_config import FirstRunWizard, _default_ws_url
 
 
+QZONE_DEFAULTS = {
+    "enabled": False,
+    "poll_interval_s": 300,
+    "max_age_s": 3600,
+    "scan_limit": 50,
+    "max_per_scan": 3,
+    "min_publish_interval_s": 60,
+    "publish_window_s": 3600,
+    "max_per_window": 5,
+    "ugc_right": 4,
+    "state_file": "data/onebot_qzone_feed.local.json",
+}
+
+
 class TestFirstRunWizard(unittest.TestCase):
+    def setUp(self):
+        # Config generation must not write session maps into the shared checkout.
+        patcher = mock.patch.object(FirstRunWizard, "_save_session_map")
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
     def test_default_ws_url(self):
         self.assertEqual(_default_ws_url("http://127.0.0.1:3000"), "ws://127.0.0.1:3000")
         self.assertEqual(_default_ws_url("https://onebot.example.com"), "wss://onebot.example.com")
@@ -97,6 +117,7 @@ class TestFirstRunWizard(unittest.TestCase):
 
             ob = data["adapters"]["onebot"]
             self.assertTrue(ob["enabled"])
+            self.assertEqual(ob["qzone_feed"], QZONE_DEFAULTS)
             self.assertEqual(ob["base_url"], "http://127.0.0.1:3000")
             self.assertEqual(ob["access_token"], "my_token")
             self.assertEqual(ob["admin_id"], ["10001"])
@@ -133,6 +154,7 @@ class TestFirstRunWizard(unittest.TestCase):
 
             ob = data["adapters"]["onebot"]
             self.assertTrue(ob["enabled"])
+            self.assertEqual(ob["qzone_feed"], QZONE_DEFAULTS)
             self.assertEqual(ob["target_group_id"], 123456789)
             self.assertEqual(ob["whitelist"]["groups"], [123456789])
 
@@ -228,6 +250,50 @@ class TestFullConfigEditor(unittest.TestCase):
             editor._edit_onebot_category()
 
         self.assertEqual(cfg["adapters"]["onebot"]["group_trigger"], "at")
+
+    def test_editor_qzone_defaults_stay_disabled(self):
+        from init_config import FullConfigEditor
+        editor = FullConfigEditor({})
+        # Enter item 15, accept every default, then return to the parent.
+        with mock.patch("builtins.input", side_effect=["15"] + [""] * 10 + ["0"]):
+            editor._edit_onebot_category()
+        self.assertEqual(editor.data["adapters"]["onebot"]["qzone_feed"], QZONE_DEFAULTS)
+        self.assertTrue(editor._modified)
+
+    def test_editor_qzone_edits_validate_and_preserve_other_settings(self):
+        from init_config import FullConfigEditor
+        original = {**QZONE_DEFAULTS, "poll_interval_s": 900}
+        ob = {"base_url": "http://localhost:3000", "qzone_feed": original}
+        editor = FullConfigEditor({"adapters": {"onebot": ob}})
+        with mock.patch("init_config._prompt_input", side_effect=[
+            "15", "y", "bad", "0", "-1", "600", "7200", "100", "7",
+            "120", "1800", "9", "2", "64", "data/custom.json", "0",
+        ]):
+            editor._edit_onebot_category()
+        self.assertEqual(ob["qzone_feed"], {
+            "enabled": True, "poll_interval_s": 600, "max_age_s": 7200,
+            "scan_limit": 100, "max_per_scan": 7, "min_publish_interval_s": 120,
+            "publish_window_s": 1800, "max_per_window": 9, "ugc_right": 64,
+            "state_file": "data/custom.json",
+        })
+        self.assertEqual(ob["base_url"], "http://localhost:3000")
+
+    def test_editor_qzone_bounds_and_visibility_labels(self):
+        from init_config import FullConfigEditor
+        editor = FullConfigEditor({})
+        with mock.patch("init_config._prompt_input", side_effect=[
+            "15", "n", "300", "3600", "101", "2", "3", "2", "60", "3600", "5", "64", "data/custom.json", "0",
+        ]) as prompted, mock.patch("builtins.print"):
+            editor._edit_onebot_category()
+        feed = editor.data["adapters"]["onebot"]["qzone_feed"]
+        self.assertEqual(feed["scan_limit"], 2)
+        self.assertEqual(feed["max_per_scan"], 2)
+        self.assertEqual(feed["ugc_right"], 64)
+        labels = [call.args[0] for call in prompted.call_args_list if "可见范围" in call.args[0]]
+        self.assertEqual(len(labels), 1)
+        self.assertIn("4 好友可见，64 仅自己可见", labels[0])
+        from muse_bridge.config.models import QzoneFeedConfig
+        QzoneFeedConfig(**feed)
 
     def test_editor_modifies_logging_and_overrides(self):
         cfg = {"logging": {"level": "INFO"}, "overrides": {"chunk_chars": 1200}}

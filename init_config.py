@@ -14,6 +14,7 @@ import os
 import re
 import sys
 import uuid
+from dataclasses import asdict
 from typing import Any, Dict, List, Optional, Tuple
 
 # 确保项目根目录在 sys.path 中
@@ -22,7 +23,7 @@ if ROOT_DIR not in sys.path:
     sys.path.insert(0, ROOT_DIR)
 
 from muse_bridge.config import constants
-from muse_bridge.config.models import LoggingConfig
+from muse_bridge.config.models import LoggingConfig, QzoneFeedConfig
 from muse_bridge.observability import configure_logging, get_logger, safe_error
 
 logger = get_logger("setup_wizard")
@@ -357,11 +358,14 @@ class FullConfigEditor:
             print(f"  [12] whitelist.groups (群白名单 群号):   {wl.get('groups') or []}")
             print(f"  [13] session_bindings (会话预绑定映射):   {ob.get('session_bindings') or {}}")
             print(f"  [14] group_sender_info (群消息附带发送者信息): {ob.get('group_sender_info', True)}")
+            print(f"  [15] qzone_feed (个人动态同步到 QQ空间): {'开启' if ob.get('qzone_feed', {}).get('enabled', False) else '关闭'}")
             print("  [0] 返回上级菜单")
 
-            c = _prompt_input("请选择要修改的项编号 (0-14)", default="0")
+            c = _prompt_input("请选择要修改的项编号 (0-15)", default="0")
             if c == "0":
                 break
+            elif c == "15":
+                self._edit_qzone_feed(ob)
             elif c == "14":
                 ob["group_sender_info"] = _prompt_bool("群消息是否附带发送者信息", ob.get("group_sender_info", True))
                 self._modified = True
@@ -430,6 +434,37 @@ class FullConfigEditor:
                             b_dict[k.strip()] = v.strip()
                     ob["session_bindings"] = b_dict
                     self._modified = True
+
+    def _edit_qzone_feed(self, ob: dict) -> None:
+        defaults = asdict(QzoneFeedConfig())
+        settings = {**defaults, **ob.get("qzone_feed", {})}
+        print("\n--- 个人动态同步到 QQ空间 ---")
+        print("启用后，运行网桥时会将个人 Muse feed 动态的文字和图片发布到 QQ空间。默认关闭。")
+        print("此处仅修改配置，不会立即发送或发布动态。")
+        settings["enabled"] = _prompt_bool("是否启用个人动态发布到 QQ空间", settings["enabled"])
+        for key, title in (
+            ("poll_interval_s", "轮询间隔（秒）"),
+            ("max_age_s", "动态最大年龄（秒）"),
+            ("scan_limit", "每次扫描条数上限"),
+            ("max_per_scan", "每次扫描最多发布条数"),
+            ("min_publish_interval_s", "最小发布间隔（秒）"),
+            ("publish_window_s", "发布限流窗口（秒）"),
+            ("max_per_window", "每个窗口最多发布条数"),
+        ):
+            while True:
+                value = _prompt_int(title, settings[key], defaults[key])
+                upper = 100 if key == "scan_limit" else settings["scan_limit"] if key == "max_per_scan" else None
+                if value > 0 and (upper is None or value <= upper):
+                    settings[key] = value
+                    break
+                print(f"请输入 1–{upper} 之间的整数。" if upper else "请输入大于零的整数。")
+        settings["ugc_right"] = int(_prompt_choice(
+            "QQ空间可见范围：1 所有人可见，4 好友可见，64 仅自己可见",
+            ["1", "4", "64"], str(settings["ugc_right"]),
+        ))
+        settings["state_file"] = _prompt_str("动态同步状态文件路径", settings["state_file"], defaults["state_file"])
+        ob["qzone_feed"] = settings
+        self._modified = True
 
     # ---------------- 5. 日志与追踪分类 ----------------
     def _edit_logging_category(self) -> None:
@@ -865,6 +900,7 @@ class FirstRunWizard:
                 "base_url": ob_raw["base_url"],
                 "access_token": ob_raw["access_token"],
                 "ws_url": ob_raw["ws_url"],
+                "qzone_feed": asdict(QzoneFeedConfig()),
             }
 
             if is_ob_first:

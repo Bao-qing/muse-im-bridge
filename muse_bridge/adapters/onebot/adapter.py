@@ -28,6 +28,7 @@ from ...observability import get_logger, safe_error
 from .client import OneBotClient, text_segment
 from .gateway import OneBotGateway
 from .outbound import OneBotOutboundPusher
+from .qzone import QzoneFeedWorker
 
 logger = get_logger(__name__)
 
@@ -113,6 +114,9 @@ class OneBotAdapter(ChatGateway):
         self.self_id: Optional[str] = None
         # file_id -> group id of a received group file (get_group_file_url needs it).
         self._file_groups: Dict[str, str] = {}
+        self.qzone_feed = QzoneFeedWorker(config.qzone_feed, self.client, muse_service,
+                                           max_image_bytes=config.max_image_bytes)
+        self._qzone_task: Optional[asyncio.Task] = None
 
     def create_outbound(self) -> OneBotOutboundPusher:
         return OneBotOutboundPusher(
@@ -154,12 +158,19 @@ class OneBotAdapter(ChatGateway):
             asyncio.create_task(self.gateway.start()),
             asyncio.create_task(self.outbound_pusher.start()),
         ]
+        if self.config.qzone_feed.enabled:
+            self._qzone_task = asyncio.create_task(self.qzone_feed.run())
+            tasks.append(self._qzone_task)
         await asyncio.gather(*tasks, return_exceptions=True)
 
     async def stop(self) -> None:
         self._running = False
+        await self.qzone_feed.stop()
         await self.gateway.stop()
         await self.outbound_pusher.stop()
+        if self._qzone_task is not None:
+            await self._qzone_task
+            self._qzone_task = None
 
     # ------------------------------------------------------------------
     # Sending

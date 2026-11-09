@@ -102,6 +102,22 @@ class MuseService:
         client.credentials_current = lambda: self.token_manager.credentials_current(client.token, client.notary_token, client.vm_id)
         return client
 
+    def list_feed(self, limit=50):
+        """Read existing personal feed units with the current Muse credentials."""
+        from .feed import fetch_feed
+        with self.create_client() as client:
+            client.connect()
+            return fetch_feed(client, limit)
+
+    def prepare_feed_images(self, post, max_bytes=10 * 1024 * 1024):
+        from .feed import resolve_feed_images, _MEDIA_PATH
+        from urllib.parse import urlsplit
+        if not any(_MEDIA_PATH.fullmatch(urlsplit(source).path) for source in post.images):
+            return list(post.images)
+        with self.create_client() as client:
+            client.connect()
+            return resolve_feed_images(client, post, max_bytes)
+
     def verify_connection(self) -> bool:
         """Verify Muse credentials by attempting a connection.
         Returns False only for missing/rejected cookies; temporary errors propagate.

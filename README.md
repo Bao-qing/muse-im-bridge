@@ -404,6 +404,35 @@ OneBot 与 QQ 走同一个 Gateway 层（`muse_bridge/gateway/`），会话隔�
 - **白名单**：与 QQ 同格式，QQ 号、群号写成字符串或数字均可；为空时拒绝所有聊天（旧版 OneBot 原型为空即放行，已改）。旧写法 `"groups": [群号]` 等价于这些群 `"*"`。
 - **审批卡与登录**：审批卡只推送到拥有该会话的适配器；没有任何聊天绑定的会话（如 `muse.session_id`）才推送到所有适配器的管理员。`gateway.login_through_adapter` 设为 `"onebot"` 时，凭据失效的登录提醒发给 OneBot 管理员。
 
+### Muse 动态同步到 QQ 空间（可选）
+
+需要 OneBot 后端支持 SnowLuma 的扩展动作 [`send_qzone_msg`](https://snowluma.github.io/zh/docs/api/qzone/send_qzone_msg)；**这不是 OneBot v11 标准接口，不保证普通 NapCat 版本支持**。只实现发表，不读取、点赞、评论或删除空间内容。客户端方法 `OneBotClient.send_qzone_msg(content, images=[...])` 支持纯文本及图文，图片源支持 HTTP(S)、`file://`、`base64://`，返回经校验的 `tid` / `time`。
+
+在 `adapters.onebot` 下增加以下配置，或在配置编辑器的 OneBot 分类选择 **15**。自动同步默认关闭；启用后会把当前登录 Muse 账号的个人动态正文、标题和图片发布到当前 OneBot 登录账号的空间，内容可能包含私人信息，请先检查可见范围。
+
+```json
+"qzone_feed": {
+  "enabled": false,
+  "poll_interval_s": 300,
+  "max_age_s": 3600,
+  "scan_limit": 50,
+  "max_per_scan": 3,
+  "min_publish_interval_s": 60,
+  "publish_window_s": 3600,
+  "max_per_window": 5,
+  "ugc_right": 4,
+  "state_file": "data/onebot_qzone_feed.local.json"
+}
+```
+
+- **扫描**：开启时启动立即扫描一次，之后每轮完成后等待 `poll_interval_s` 秒。通过现有 Muse 认证/加密连接读取 `GET /api/feed`，按 `next_cursor` 翻页，最多十页、取最新 `scan_limit` 条（1–100）；不会调用动态生成接口，也不监听聊天会话。
+- **时间和数量窗口**：只考虑最近 `max_age_s` 秒内的动态，未知时间及未来时间跳过；每轮最多取最新 `max_per_scan` 条未处理动态，按时间从旧到新发布。每个滚动 `publish_window_s` 秒内最多尝试 `max_per_window` 条。
+- **发送节奏**：每次发表尝试至少间隔 `min_publish_interval_s` 秒，间隔及滚动计数跨重启保留。默认每 5 分钟扫描、最近 1 小时、每轮最多 3 条、每小时最多 5 条、发送间隔至少 60 秒。这些是防刷屏的保守节奏，不保证平台不会限制账号；遇到拒绝不会绕过平台限制。
+- **图片**：公开 HTTP(S) 图片由后端上传；Muse 受保护的动态图片通过 `GET /api/feed/units/{unit_id}/media/{handle}` 获取后转成 base64，单张大小沿用 OneBot 的 `max_image_bytes`。最多 9 张；视频只取已有封面，不发布视频；不会执行动态内的 widget HTML。
+- **可见范围**：自动同步支持 `ugc_right` 为 `1`（所有人）、`4`（好友，默认）、`64`（仅自己）。底层发送方法另支持文档定义的部分好友权限参数。
+- **持久化与失败**：状态文件按 Muse 来源和 OneBot 账号隔离，发表前原子落盘记录尝试；同一动态跨轮次、跨重启不重复发表。发送失败或结果不明时，该条不会自动重试，可能漏发，但优先避免重复公开发布。图片准备失败不发表残缺内容。状态损坏、账号不匹配或写盘失败时停止该轮发送，不自动清空记录；更换账号请配置新的状态文件。不要随意删除状态文件，否则仍在时间窗口内的动态可能重新发表。
+- **独立生命周期**：不影响 QQ 官方适配器和群聊触发规则；关闭开关不扫描、不发布，退出时中断等待并等待正在进行的操作结束。建议单实例运行，不要让多个进程共用同一发表账号与状态文件。
+
 ## 安全与免责声明
 
 - 本项目为非官方工具，与 Muse、腾讯 QQ 官方无关。Muse 接入依赖对网页端协议的逆向分析，可能随服务端更新而失效，也可能违反其服务条款；请只使用自己的账号与机器人，并自行承担使用风险。
