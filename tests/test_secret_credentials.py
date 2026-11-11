@@ -217,21 +217,23 @@ class SecretReplyCase(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(card.terminal)
         self.service.post_message.assert_not_called()
 
-    async def test_unquoted_multiline_secret_is_not_forwarded_as_chat(self):
+    async def test_unquoted_multiline_requires_explicit_credential_mode(self):
         card = self.card()
-        with patch.object(self.service, "capture_credential", return_value="saved") as capture:
+        with patch.object(self.service, "capture_credential") as capture:
             await self.send(KEY)
-        capture.assert_called_once_with(card, KEY)
-        self.service.post_message.assert_not_called()
+        capture.assert_not_called()
+        self.service.post_message.assert_called_once()
+        self.assertIsNone(self.service.interactions.current(("private", "ADMIN", "ADMIN")))
+        self.assertFalse(card.terminal)
 
-    async def test_multiple_cards_require_selection_for_multiline_input(self):
+    async def test_multiple_pending_cards_do_not_intercept_multiline_chat(self):
         self.card()
         self.service.interactions.add("credential", session_id="s1", ttl=0)
         with patch.object(self.service, "capture_credential") as capture:
             await self.send(KEY)
         capture.assert_not_called()
-        self.assertIn("回复", self.text())
-        self.service.post_message.assert_not_called()
+        self.service.post_message.assert_called_once()
+        self.assertIsNone(self.service.interactions.current(("private", "ADMIN", "ADMIN")))
 
     async def test_legacy_password_card_renders_and_records_real_quote_reference(self):
         event = secret_event("create_password", authorization=None)

@@ -73,11 +73,14 @@ class ChatInteractions:
 
     def is_credential_input(self, owner, content, event):
         """Keep secret whitespace and route replies past ordinary group triggers."""
-        current = self.manager.current(owner)
-        if current and current.kind == "credential":
+        parts = content.split(None, 1)
+        if parts and parts[0].lower() in {"/凭证", "/密码", "/验证码", "/credential", "/password", "/code"}:
             return True
+        current = self.manager.current(owner)
         references = self.message_references(event)
         if self.manager.referenced_credential(owner[0], owner[1], references) is not None:
+            return True
+        if not references and current and current.kind == "credential":
             return True
         session_id = self.adapter.session_mapper.current(owner[0], owner[1]) or ""
         # OneBot calls this before group triggers. Quoted approval choices must
@@ -87,8 +90,7 @@ class ChatInteractions:
                 return True
             if self.approval_targets(owner, session_id) or (references and self.approval_cards(owner, session_id)):
                 return True
-        return bool(self.credential_candidates(owner, session_id)) and (
-            bool(references) or len(content.splitlines()) >= 2)
+        return False
 
     def approval_cards(self, owner, session_id):
         return [item for item in list(self.manager.items.values())
@@ -137,9 +139,10 @@ class ChatInteractions:
                 if not (current and not current.terminal) and await self.quoted_approval(
                         owner, content, references, session_id, msg_id, is_admin):
                     return True
-                if (current and not current.terminal and current.kind == "credential") or self.credential_candidates(owner, session_id):
-                    await self.reply(owner, "未找到对应凭证，请发送 /凭证 编号。", msg_id)
-                    return True
+                # Quoting any other message is chat, even during credential
+                # entry. Explicit slash commands still use the command router.
+                if current and current.kind == "credential" and command not in {"/登录", "/凭证", "/密码", "/验证码"}:
+                    current = None
             if command == "/登录":
                 if owner[0] != "private" or not is_admin:
                     await self.reply(owner, "登录仅限管理员私聊。", msg_id)
@@ -213,16 +216,6 @@ class ChatInteractions:
                     else:
                         await self.credential_input(current, owner, content, msg_id, is_admin)
                 return True
-
-            # A pending credential card is an open flow: multiline input stays local.
-            if len(content.splitlines()) >= 2:
-                candidates = self.credential_candidates(owner, session_id)
-                if candidates:
-                    if len(candidates) == 1:
-                        await self.start_credential(candidates[0], owner, content, msg_id, is_admin, session_id)
-                    else:
-                        await self.reply(owner, "请回复要填写的凭证卡，或先发送 /凭证 编号。", msg_id)
-                    return True
 
             # A bare option number answers the card at the head of the queue.
             reply = APPROVAL_REPLY.fullmatch(content.strip())

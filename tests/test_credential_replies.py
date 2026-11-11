@@ -44,6 +44,7 @@ class TestCredentialReplies(unittest.IsolatedAsyncioTestCase):
 
     async def test_combined_input_saves_and_next_message_is_chat(self):
         card = self.card()
+        await self.send(f"/凭证 {card.id}")
         observed = []
         self.service.capture_credential = lambda item, secret: observed.append((item.context["username"], secret))
         output = io.StringIO()
@@ -140,21 +141,50 @@ class TestCredentialReplies(unittest.IsolatedAsyncioTestCase):
         capture.assert_not_called()
         self.service.post_message.assert_not_called()
 
-    async def test_multiple_cards_do_not_guess_from_two_lines(self):
-        self.card()
-        self.card()
-        with patch.object(self.service, "capture_credential") as capture:
-            await self.send("account\npassword")
-        capture.assert_not_called()
-        self.service.post_message.assert_not_called()
-        self.assertIn("回复", self.text())
+    async def test_pending_cards_do_not_guess_from_two_lines(self):
+        for count in (1, 2):
+            self.card()
+            with self.subTest(cards=count), patch.object(self.service, "capture_credential") as capture:
+                self.service.post_message.reset_mock()
+                await self.send("account\npassword")
+                capture.assert_not_called()
+                self.service.post_message.assert_called_once()
+                self.assertTrue(self.service.post_message.call_args.args[1].endswith("account\npassword"))
+                self.assertIsNone(self.service.interactions.current(("private", "ADMIN", "ADMIN")))
 
-    async def test_unknown_quote_never_becomes_chat(self):
+    async def test_ordinary_quote_with_pending_cards_is_chat(self):
+        for count in (1, 2):
+            self.card()
+            for text in ("点run all吗", "第一行\n第二行"):
+                with self.subTest(cards=count, text=text):
+                    self.service.post_message.reset_mock()
+                    await self.quoted(text, ref="ORDINARY_MESSAGE")
+                    self.service.post_message.assert_called_once()
+                    self.assertTrue(self.service.post_message.call_args.args[1].endswith(text))
+        self.adapter.client.send_message.assert_not_called()
+
+    async def test_other_quote_during_credential_entry_is_chat_and_preserves_focus(self):
+        card = self.card()
+        await self.send(f"/凭证 {card.id}")
+        for text in ("普通回复", "普通回复\n第二行"):
+            with self.subTest(text=text), patch.object(self.service, "capture_credential") as capture:
+                self.service.post_message.reset_mock()
+                await self.quoted(text, ref="ORDINARY_MESSAGE")
+                capture.assert_not_called()
+                self.service.post_message.assert_called_once()
+                self.assertTrue(self.service.post_message.call_args.args[1].endswith(text))
+                self.assertIs(self.service.interactions.current(("private", "ADMIN", "ADMIN")), card)
+        with patch.object(self.service, "capture_credential", return_value="saved") as capture:
+            await self.send("account\npassword")
+        capture.assert_called_once_with(card, "password")
+
+    async def test_unknown_multiline_quote_is_chat(self):
         self.card()
         with patch.object(self.service, "capture_credential") as capture:
             await self.quoted("account\npassword", ref="TMP_unknown")
         capture.assert_not_called()
-        self.service.post_message.assert_not_called()
+        self.service.post_message.assert_called_once()
+        self.assertTrue(self.service.post_message.call_args.args[1].endswith("account\npassword"))
 
     async def test_completed_card_quote_never_becomes_chat(self):
         card = self.card()
@@ -174,6 +204,7 @@ class TestCredentialReplies(unittest.IsolatedAsyncioTestCase):
 
     async def test_failed_capture_keeps_focus_for_same_input_retry(self):
         card = self.card()
+        await self.send(f"/凭证 {card.id}")
         with patch.object(self.service, "capture_credential", side_effect=TimeoutError()):
             await self.send("account\npassword")
         self.assertEqual(card.state, "wait_password")
@@ -228,6 +259,7 @@ class TestCredentialReplies(unittest.IsolatedAsyncioTestCase):
 
     async def test_success_still_respects_pending_approval(self):
         card = self.card()
+        await self.send(f"/凭证 {card.id}")
         self.service.interactions.add("approval", session_id="s1", ttl=0)
         with patch.object(self.service, "capture_credential", return_value="saved"):
             await self.send("account\npassword")

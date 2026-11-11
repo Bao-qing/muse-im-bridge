@@ -355,6 +355,42 @@ class TestOneBotInbound(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(_sent_texts(adapter)[-1], "【凭证已保存】")
             muse.post_message.assert_not_called()
 
+    async def test_ordinary_quote_with_pending_credential_is_chat(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            adapter, muse = _make_adapter(tmp)
+            adapter.session_mapper.bind("group", "G1", "s1")
+            item = muse.interactions.add("credential", session_id="s1", ttl=0)
+            owner = ("group", "G1", "A1")
+            mid = 0
+            for active in (False, True):
+                if active:
+                    await adapter.handle_event(_group("G1", "A1", f"/凭证 {item.id}", 100))
+                    adapter.client.send_msg.reset_mock()
+                for text in ("点run all吗", "第一行\n第二行"):
+                    with self.subTest(active=active, text=text):
+                        mid += 1
+                        muse.post_message.reset_mock()
+                        event = _group("G1", "A1", text, mid)
+                        event["message"].insert(0, {"type": "reply", "data": {"id": "ordinary"}})
+                        self.assertFalse(adapter.interaction_router.is_credential_input(owner, text, event))
+                        await adapter.handle_event(event)
+                        muse.capture_credential.assert_not_called()
+                        muse.post_message.assert_called_once()
+                        self.assertTrue(muse.post_message.call_args.args[1].endswith(text))
+                        adapter.client.send_msg.assert_not_called()
+                self.assertIs(muse.interactions.current(owner), item if active else None)
+
+    async def test_ordinary_quote_does_not_bypass_group_at_trigger(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            adapter, muse = _make_adapter(tmp, group_trigger="at")
+            adapter.session_mapper.bind("group", "G1", "s1")
+            muse.interactions.add("credential", session_id="s1", ttl=0)
+            event = _group("G1", "A1", "点run all吗", 1)
+            event["message"].insert(0, {"type": "reply", "data": {"id": "ordinary"}})
+            await adapter.handle_event(event)
+            muse.post_message.assert_not_called()
+            adapter.client.send_msg.assert_not_called()
+
     async def test_quoted_credential_prompt_is_found_by_reply_segment(self):
         with tempfile.TemporaryDirectory() as tmp:
             adapter, muse = _make_adapter(tmp)
