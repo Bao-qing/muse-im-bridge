@@ -43,8 +43,8 @@ class TestWeChatCLI(unittest.TestCase):
         self.addCleanup(patch.stop)
         self.output = io.StringIO()
 
-    def test_login_saves_and_closes_without_promoting_owner(self):
-        cfg = WeChatConfig(state_dir="test-state", admin_id=["configured"], http_timeout_s=10)
+    def test_login_saves_and_closes_without_role_configuration(self):
+        cfg = WeChatConfig(state_dir="test-state", http_timeout_s=10)
         with contextlib.redirect_stdout(self.output):
             result = cli.run_login(cfg)
         self.state_cls.assert_called_once_with("test-state")
@@ -57,7 +57,8 @@ class TestWeChatCLI(unittest.TestCase):
         self.assertIs(args.kwargs["display"], cli.display_qr)
         self.assertIs(args.kwargs["verify"], cli.verify_code)
         self.assertEqual(result, self.state.status.return_value)
-        self.assertEqual(cfg.admin_id, ["configured"])
+        self.assertFalse(hasattr(cfg, "admin_id"))
+        self.assertNotIn("管理员", self.output.getvalue())
         self.assertNotIn("SECRET", self.output.getvalue())
 
     def test_auth_failure_closes_without_saving(self):
@@ -110,13 +111,13 @@ class TestWeChatCLI(unittest.TestCase):
     def test_wizard_only_wechat_never_listens_for_first_message(self):
         wizard = init_config.FirstRunWizard(str(Path(self.tmp.name) / "generated.json"))
         def configure():
-            wizard.channel_configs["wechat"] = {"enabled": True, "admin_id": [], "session_bindings": {}}
+            wizard.channel_configs["wechat"] = {"enabled": True, "session_bindings": {}}
         with mock.patch.object(init_config, "_prompt_input", return_value="4"), mock.patch.object(wizard, "_configure_wechat", side_effect=configure), mock.patch.object(wizard, "_listen_for_first_message", new_callable=mock.AsyncMock) as listen, contextlib.redirect_stdout(self.output):
             wizard.run_interactive()
         listen.assert_not_called()
         self.assertIsNone(wizard.first_message_event)
         data = json.loads(Path(wizard.output_file).read_text(encoding="utf-8"))
-        self.assertEqual(data["adapters"]["wechat"]["admin_id"], [])
+        self.assertNotIn("admin_id", data["adapters"]["wechat"])
         self.assertEqual(data["adapters"]["wechat"]["session_bindings"], {})
         self.assertEqual(data["gateway"]["login_through_adapter"], "")
         self.assertFalse(data["adapters"]["qq"]["enabled"])
@@ -129,19 +130,74 @@ class TestWeChatCLI(unittest.TestCase):
                 wizard._select_channels()
             self.assertEqual(wizard.selected_channels, expected)
 
-    def test_wizard_scanner_admin_requires_explicit_confirmation(self):
-        for promote in (False, True):
-            editor = init_config.FullConfigEditor({"adapters": {"wechat": {"enabled": True}}})
-            def choose_bool(title, current):
-                if title.startswith("现在显式"):
-                    return True
-                if title.startswith("将本次扫码者"):
-                    self.assertFalse(current)
-                    return promote
-                return current
-            with mock.patch.object(init_config, "_prompt_bool", side_effect=choose_bool), mock.patch.object(init_config, "_prompt_str", side_effect=lambda title, current: current), mock.patch.object(init_config, "_prompt_int", side_effect=lambda title, current, default: current), mock.patch.object(init_config, "_prompt_str_list", return_value=[]), mock.patch.object(init_config, "_prompt_input", return_value=""), mock.patch.object(cli, "run_login", return_value={"user_id": "scanner"}), contextlib.redirect_stdout(self.output):
+    def test_wechat_menu_back_does_not_modify_configuration(self):
+        for settings in (None, {"enabled": True, "chunk_chars": 3000}):
+            data = {"adapters": {} if settings is None else {"wechat": settings.copy()}}
+            editor = init_config.FullConfigEditor(data)
+            before = json.loads(json.dumps(editor.data))
+            with mock.patch.object(init_config, "_prompt_input", return_value="0") as prompt, contextlib.redirect_stdout(self.output):
                 editor._edit_wechat_category()
-            self.assertEqual(editor.data["adapters"]["wechat"]["admin_id"], ["scanner"] if promote else [])
+            prompt.assert_called_once()
+            self.assertEqual(editor.data, before)
+            self.assertFalse(editor._modified)
+        for removed in ("管理员", "白名单", "申请"):
+            self.assertNotIn(removed, self.output.getvalue())
+
+    def test_wechat_menu_can_login_immediately_without_editing_settings(self):
+        settings = {"enabled": True, "state_dir": "chosen-state", "chunk_chars": 3000}
+        editor = init_config.FullConfigEditor({"adapters": {"wechat": settings.copy()}})
+        with mock.patch.object(init_config, "_prompt_input", side_effect=["2", "0"]) as prompt, mock.patch.object(init_config, "_prompt_bool", side_effect=AssertionError("unrelated setting")), mock.patch.object(cli, "run_login", return_value={"user_id": "scanner"}) as login, contextlib.redirect_stdout(self.output):
+            editor._edit_wechat_category()
+        self.assertEqual(prompt.call_count, 2)
+        login.assert_called_once()
+        self.assertEqual(login.call_args.args[0].state_dir, "chosen-state")
+        self.assertEqual(editor.data["adapters"]["wechat"], settings)
+        self.assertFalse(editor._modified)
+
+    def test_wechat_menu_status_is_independent_from_login_and_settings(self):
+        editor = init_config.FullConfigEditor({"adapters": {"wechat": {"enabled": True}}})
+        with mock.patch.object(init_config, "_prompt_input", side_effect=["3", "0"]), mock.patch.object(cli, "run_status") as status, mock.patch.object(cli, "run_login") as login, contextlib.redirect_stdout(self.output):
+            editor._edit_wechat_category()
+        status.assert_called_once()
+        login.assert_not_called()
+        self.assertFalse(editor._modified)
+
+    def test_wechat_menu_changes_only_selected_field(self):
+        original = {"enabled": True, "state_dir": "same", "chunk_chars": 3000, "max_chunks": 4}
+        editor = init_config.FullConfigEditor({"adapters": {"wechat": original.copy()}})
+        with mock.patch.object(init_config, "_prompt_input", side_effect=["5", "0"]), mock.patch.object(init_config, "_prompt_bool", return_value=True) as boolean, contextlib.redirect_stdout(self.output):
+            editor._edit_wechat_category()
+        boolean.assert_called_once_with("输入状态提示", False)
+        self.assertEqual(editor.data["adapters"]["wechat"], {**original, "typing_enabled": True})
+        self.assertTrue(editor._modified)
+
+    def test_wechat_menu_login_failure_can_return_without_changes(self):
+        editor = init_config.FullConfigEditor({"adapters": {"wechat": {"enabled": True}}})
+        with mock.patch.object(init_config, "_prompt_input", side_effect=["2", "0"]), mock.patch.object(cli, "run_login", side_effect=RuntimeError("SECRET")), contextlib.redirect_stdout(self.output):
+            editor._edit_wechat_category()
+        self.assertEqual(editor.data["adapters"]["wechat"], {"enabled": True})
+        self.assertFalse(editor._modified)
+        self.assertNotIn("SECRET", self.output.getvalue())
+
+    def test_wechat_menu_numeric_validation_stays_on_selected_field(self):
+        editor = init_config.FullConfigEditor({"adapters": {"wechat": {"enabled": True}}})
+        with mock.patch.object(init_config, "_prompt_input", side_effect=["7", "0"]), mock.patch.object(init_config, "_prompt_int", side_effect=[4001, 2000]) as number, contextlib.redirect_stdout(self.output):
+            editor._edit_wechat_category()
+        self.assertEqual(number.call_count, 2)
+        self.assertEqual(editor.data["adapters"]["wechat"], {"enabled": True, "chunk_chars": 2000})
+
+    def test_wechat_menu_preserves_fractional_timeout_and_rejects_nonfinite(self):
+        editor = init_config.FullConfigEditor({"adapters": {"wechat": {"enabled": True, "http_timeout_s": 0.5}}})
+        with mock.patch.object(init_config, "_prompt_input", side_effect=["10", "nan", "10", "0.5", "0"]), contextlib.redirect_stdout(self.output):
+            editor._edit_wechat_category()
+        self.assertEqual(editor.data["adapters"]["wechat"], {"enabled": True, "http_timeout_s": 0.5})
+        self.assertFalse(editor._modified)
+
+    def test_wechat_menu_session_bindings_rejects_malformed_input(self):
+        editor = init_config.FullConfigEditor({"adapters": {"wechat": {"enabled": True}}})
+        with mock.patch.object(init_config, "_prompt_input", side_effect=["11", "invalid", "11", "private:owner=session", "0"]), contextlib.redirect_stdout(self.output):
+            editor._edit_wechat_category()
+        self.assertEqual(editor.data["adapters"]["wechat"], {"enabled": True, "session_bindings": {"private:owner": "session"}})
 
     def test_engine_connects_wechat_without_starting_login(self):
         from muse_bridge import engine

@@ -5,7 +5,7 @@ Unifies interactive replies and proactive notifications for every adapter:
 2. Extracts text, images (URLs & workspace), files (workspace & attachments), and videos.
 3. Automatically reads file-store bytes via client.read_file().
 4. Resolves the destination via RouteManager (the chat that asked, else the
-   chat bound to the session, else the first admin privately).
+   chat bound to the session; unbound sessions are never pushed).
 5. Hands the item to the platform's ``_deliver`` (QQ upload API, OneBot segments, ...).
 """
 
@@ -18,7 +18,7 @@ import re
 import time
 from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
-from ..config.models import ChatConfig
+from ..config.models import ChatConfig, ConversationConfig
 from ..core.deduplicator import MessageDeduplicator
 from ..core.message import DeliveryReference, chunk_text
 from ..core.references import MessageReferenceStore
@@ -160,7 +160,7 @@ class OutboundDispatcher:
 
     def __init__(
         self,
-        config: ChatConfig,
+        config: ConversationConfig,
         client: Any,
         muse_service: MuseService,
         deduplicator: MessageDeduplicator,
@@ -207,6 +207,16 @@ class OutboundDispatcher:
         if self.platform == "onebot":
             return str(self._reference_account or getattr(self.config, "base_url", ""))
         return str(getattr(self.config, "app_id", ""))
+
+    def notification_target(self) -> Optional[str]:
+        """Private account notice recipient; personal platforms override this."""
+        return self.config.admin_target() if isinstance(self.config, ChatConfig) else None
+
+    def _interaction_admin_targets(self):
+        """Only access-controlled platforms send extra administrator copies."""
+        if not isinstance(self.config, ChatConfig):
+            return []
+        return [("private", admin) for admin in self.config.admin_id if admin]
 
     def interaction_target(self, kind, target):
         return (kind, target, self.platform, self.account_identity())
@@ -409,7 +419,7 @@ class OutboundDispatcher:
         self._save_state()
 
     async def _notify_login_required(self) -> None:
-        admin_target = self.config.admin_target()
+        admin_target = self.notification_target()
         if admin_target:
             try:
                 await self._send_notice(
@@ -754,13 +764,13 @@ class OutboundDispatcher:
         # Unbound sessions must not emit cards, including admin copies.
         if not self.session_mapper.owners(item.session_id):
             return False
-        # Routing is not authorization; only configured admins can decide.
+        # Routing is not authorization; the inbound channel applies its own policy.
         targets = list(self.session_mapper.owners(item.session_id))
         if not targets:
             target = self._proactive_target(item.session_id)
             if target[1]:
                 targets.append(target)
-        admins = [("private", admin) for admin in self.config.admin_id if admin]
+        admins = self._interaction_admin_targets()
         if self.config.approvals_in_place and item.kind == "approval":
             # In-place push replaces the admin copy; admins are only the
             # fallback when no chat of the session could show the card.
@@ -901,10 +911,8 @@ class OutboundDispatcher:
             route_type = "interactive_reply" if route and purpose != "proactive" else "proactive_push"
 
             if not target_id:
-                reason = ("no admin is configured" if self.config.unbound_push_to_admin
-                          else "unbound_push_to_admin is disabled")
-                logger.warning('Message %s of session %s has no bound chat (%s); dropped.',
-                               mid, (session_id or "")[:8], reason)
+                logger.warning('Message %s of session %s has no bound chat; dropped.',
+                               mid, (session_id or "")[:8])
                 continue
 
             # Mark processing

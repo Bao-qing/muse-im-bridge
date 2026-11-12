@@ -112,24 +112,15 @@ def _normalize_whitelist(raw: Any) -> Dict[str, Union[List[str], str]]:
 
 
 @dataclasses.dataclass
-class ChatConfig:
-    """Settings shared by every chat platform behind the gateway layer."""
+class ConversationConfig:
+    """Shared session, delivery and media runtime settings; no access policy."""
 
     # Validation messages name the config section, e.g. ``adapters.qq``.
     section: ClassVar[str] = "adapters.chat"
 
     enabled: bool = True
-    admin_id: List[str] = dataclasses.field(default_factory=list)
-    admin_only: bool = constants.DEFAULT_ADMIN_ONLY
-    # Send messages of a session with no bound chat to the first admin.
-    unbound_push_to_admin: bool = constants.DEFAULT_UNBOUND_PUSH_TO_ADMIN
     credentials_in_place: bool = constants.DEFAULT_CREDENTIALS_IN_PLACE
     approvals_in_place: bool = constants.DEFAULT_APPROVALS_IN_PLACE
-    allow_all_private: bool = constants.DEFAULT_ALLOW_ALL_PRIVATE
-    allow_all_group: bool = constants.DEFAULT_ALLOW_ALL_GROUP
-    group_sender_info: bool = True
-    access_requests: AccessRequestsConfig = dataclasses.field(default_factory=AccessRequestsConfig)
-    whitelist: Dict[str, Union[List[str], str]] = dataclasses.field(default_factory=dict)
     delivered_file: str = "data/qq_delivered.jsonl"
     debug: bool = False
 
@@ -169,8 +160,27 @@ class ChatConfig:
     download_timeout_s: int = constants.DEFAULT_DOWNLOAD_TIMEOUT_S
 
     def __post_init__(self):
-        for name in ("credentials_in_place", "approvals_in_place", "unbound_push_to_admin",
-                     "allow_all_private", "allow_all_group", "group_sender_info"):
+        for name in ("credentials_in_place", "approvals_in_place"):
+            if type(getattr(self, name)) is not bool:
+                raise ValueError(f"{self.section}.{name} must be a boolean")
+
+
+@dataclasses.dataclass
+class ChatConfig(ConversationConfig):
+    """QQ/OneBot access policy, separate from conversation runtime settings."""
+
+    admin_id: List[str] = dataclasses.field(default_factory=list)
+    admin_only: bool = constants.DEFAULT_ADMIN_ONLY
+    unbound_push_to_admin: bool = constants.DEFAULT_UNBOUND_PUSH_TO_ADMIN
+    allow_all_private: bool = constants.DEFAULT_ALLOW_ALL_PRIVATE
+    allow_all_group: bool = constants.DEFAULT_ALLOW_ALL_GROUP
+    group_sender_info: bool = True
+    access_requests: AccessRequestsConfig = dataclasses.field(default_factory=AccessRequestsConfig)
+    whitelist: Dict[str, Union[List[str], str]] = dataclasses.field(default_factory=dict)
+
+    def __post_init__(self):
+        super().__post_init__()
+        for name in ("unbound_push_to_admin", "allow_all_private", "allow_all_group", "group_sender_info"):
             if type(getattr(self, name)) is not bool:
                 raise ValueError(f"{self.section}.{name} must be a boolean")
 
@@ -268,15 +278,11 @@ class OneBotConfig(ChatConfig):
 
 
 @dataclasses.dataclass
-class WeChatConfig(ChatConfig):
+class WeChatConfig(ConversationConfig):
     """Private-only iLink channel; runtime state is isolated by bot identity."""
 
     section: ClassVar[str] = "adapters.wechat"
     enabled: bool = False
-    admin_only: bool = False
-    allow_all_private: bool = False
-    allow_all_group: bool = False
-    unbound_push_to_admin: bool = False
     chunk_chars: int = 4000
     state_dir: str = "data/wechat"
     channel_version: str = "2.4.6"
@@ -284,25 +290,20 @@ class WeChatConfig(ChatConfig):
     http_timeout_s: float = 35
     polling_timeout_ms: int = 35000
     typing_enabled: bool = False
-    access_requests: AccessRequestsConfig = dataclasses.field(
-        default_factory=lambda: AccessRequestsConfig(state_file="data/wechat/access.local.json"))
     delivered_file: str = "data/wechat/delivered.jsonl"
     session_map_file: str = "data/wechat/session_map.json"
     push_state_file: str = "data/wechat/push_state.json"
     routes_file: str = "data/wechat/routes.json"
 
     def __post_init__(self):
-        super().__post_init__()
-        defaults = ChatConfig()
-        for field in dataclasses.fields(defaults):
+        # WeChat preserves raw types instead of the legacy adapters' coercion.
+        for field in dataclasses.fields(self):
             value = getattr(self, field.name)
-            default = getattr(defaults, field.name)
-            if type(default) is bool and type(value) is not bool:
+            if type(field.default) is bool and type(value) is not bool:
                 raise ValueError(f"{self.section}.{field.name} must be a boolean")
-            if type(default) is int and (type(value) is not int or value <= 0):
+            if (type(field.default) is int and field.name != "http_timeout_s"
+                    and (type(value) is not int or value <= 0)):
                 raise ValueError(f"{self.section}.{field.name} must be a positive integer")
-        if type(self.typing_enabled) is not bool:
-            raise ValueError(f"{self.section}.typing_enabled must be a boolean")
         if not 1 <= self.chunk_chars <= 4000:
             raise ValueError(f"{self.section}.chunk_chars must be in 1..4000")
         try:
@@ -312,8 +313,6 @@ class WeChatConfig(ChatConfig):
             valid_timeout = False
         if not valid_timeout:
             raise ValueError(f"{self.section}.http_timeout_s must be finite and positive")
-        if type(self.polling_timeout_ms) is not int or self.polling_timeout_ms <= 0:
-            raise ValueError(f"{self.section}.polling_timeout_ms must be a positive integer")
         for name in ("state_dir", "channel_version", "delivered_file", "session_map_file",
                      "push_state_file", "routes_file"):
             value = getattr(self, name)
@@ -321,21 +320,6 @@ class WeChatConfig(ChatConfig):
                 raise ValueError(f"{self.section}.{name} must be a nonempty string")
         if not isinstance(self.route_tag, str):
             raise ValueError(f"{self.section}.route_tag must be a string")
-        if not isinstance(self.access_requests, AccessRequestsConfig):
-            raise ValueError(f"{self.section}.access_requests must be an AccessRequestsConfig")
-        if self.allow_all_group:
-            raise ValueError(f"{self.section} does not support groups")
-        if not isinstance(self.whitelist, dict) or self.whitelist.keys() - {"private"}:
-            raise ValueError(f"{self.section}.whitelist only supports private users")
-        private = self.whitelist.get("private", [])
-        if (not isinstance(private, list)
-                or any(type(v) not in (str, int) or not str(v).strip() for v in private)):
-            raise ValueError(f"{self.section}.whitelist.private must be a user list; use allow_all_private to open access")
-        self.whitelist = {"private": [str(v) for v in private]}
-        if not isinstance(self.admin_id, list) or any(
-                type(v) not in (str, int) or not str(v).strip() for v in self.admin_id):
-            raise ValueError(f"{self.section}.admin_id must be a user list")
-        self.admin_id = [str(v) for v in self.admin_id]
         if not isinstance(self.session_bindings, dict) or any(
                 not isinstance(k, str) or not k.startswith("private:") or not k[8:]
                 or not isinstance(v, str) or not v.strip()
@@ -352,7 +336,6 @@ class WeChatConfig(ChatConfig):
                                 ("push_state_file", "push_state.json"),
                                 ("routes_file", "routes.json")):
             setattr(config, field, str(account_dir / filename))
-        config.access_requests.state_file = str(account_dir / "access.local.json")
         return config
 
 
@@ -463,26 +446,22 @@ class ConfigLoader:
         raw = adapters["wechat"]
         if not isinstance(raw, dict):
             raise ValueError("adapters.wechat must be an object")
+        # Old asdict output included inherited QQ/OneBot policy. Discard only
+        # these removed keys; neither their values nor files become new policy.
+        removed_policy = {"admin_id", "admin_only", "whitelist", "allow_all_private",
+                          "allow_all_group", "allow_all_groups", "access_requests",
+                          "unbound_push_to_admin", "group_sender_info"}
+        values = {key: value for key, value in raw.items() if key not in removed_policy}
         fields = {f.name for f in dataclasses.fields(WeChatConfig)}
-        if raw.keys() - fields - {"allow_all_groups"}:
+        if values.keys() - fields:
             raise ValueError("adapters.wechat contains unknown configuration fields")
-        values = dict(raw)
-        if "allow_all_groups" in values:
-            legacy = values.pop("allow_all_groups")
-            if type(legacy) is not bool or legacy:
-                raise ValueError("adapters.wechat does not support groups")
         overrides = raw_data.get("overrides", {})
         if not isinstance(overrides, dict):
             raise ValueError("overrides must be an object")
         # Preserve raw types: unlike legacy adapters no bool()/int() coercion.
-        for key in fields - {"enabled", "admin_id", "whitelist", "session_bindings", "access_requests"}:
+        for key in fields - {"enabled", "session_bindings"}:
             if key in overrides and overrides[key] is not None:
                 values[key] = overrides[key]
-        access = values.get("access_requests", {})
-        if not isinstance(access, dict):
-            raise ValueError("adapters.wechat.access_requests must be an object")
-        values["access_requests"] = AccessRequestsConfig(
-            **{"state_file": "data/wechat/access.local.json", **access})
         return WeChatConfig(**values)
 
     @classmethod

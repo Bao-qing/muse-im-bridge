@@ -9,9 +9,8 @@ from ...gateway.outbound import OutboundDispatcher
 class WeChatOutboundPusher(OutboundDispatcher):
     platform = "wechat"
 
-    def __init__(self, *args, state, sender, authorized=None, **kwargs):
+    def __init__(self, *args, state, sender, **kwargs):
         self.state, self.sender = state, sender
-        self.authorized = authorized
         super().__init__(*args, **kwargs)
 
     def account_identity(self):
@@ -20,19 +19,20 @@ class WeChatOutboundPusher(OutboundDispatcher):
     def reference_identity(self):
         return "wechat:" + self.state.bot_id
 
+    def notification_target(self):
+        return self.state.credentials["user_id"]
+
     def resolve_delivery_target(self, session_id, last_user_mid, root_exec_id):
         # Never use last_user_mid/root_exec_id to claim a causal iLink reply.
         for kind, target in self.session_mapper.owners(session_id) if session_id else []:
-            if kind == "private" and (not self.authorized or self.authorized(target)):
+            if kind == "private":
                 return kind, target, None, "proactive"
         return "private", "", None, "proactive"
 
     def render_credential_hint(self, item):
         if item.context.get("auth_providers") or item.context.get("grant_request_type"):
             return "请在 Muse 网页完成此登录。"
-        if not self.config.credentials_in_place:
-            return "请管理员私聊填写。"
-        return f"管理员发送 /凭证 {item.id} [保存|一次] [凭证]；微信不支持引用卡片选择凭证。"
+        return f"发送 /凭证 {item.id} [保存|一次] [凭证]；微信不支持引用卡片选择凭证。"
 
     async def _send_notice(self, target_id, text):
         if not await self.sender.send(target_id, text, purpose="notification"):
@@ -40,7 +40,7 @@ class WeChatOutboundPusher(OutboundDispatcher):
 
     async def _deliver(self, target_type, target_id, text, images, files, videos,
                        route=None, credential=None, delivery=None):
-        if target_type != "private" or (self.authorized and not self.authorized(target_id)):
+        if target_type != "private":
             return False
         purpose = getattr(delivery, "purpose", None) or "proactive"
         # A route on an approval notification is not permission to use its old token.

@@ -1,5 +1,7 @@
 """Offline sender, parsing and shared-gateway integration."""
 import asyncio
+import copy
+from pathlib import Path
 import tempfile
 import unittest
 from types import SimpleNamespace
@@ -43,6 +45,18 @@ class TestWeChatSender(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(all(len(m["item_list"]) == 1 for m in messages))
             self.assertFalse(await sender.send("stranger", "no context"))
             self.assertEqual(client.send_message.await_count, 3)
+
+    async def test_immediate_reply_never_falls_back_to_latest_context(self):
+        from muse_bridge.adapters.wechat.sender import WeChatSender
+        with tempfile.TemporaryDirectory() as root:
+            state = saved_state(root)
+            state.remember_message("owner", "A", "TA")
+            state.remember_message("owner", "B", "")
+            client = mock.Mock(send_message=mock.AsyncMock(return_value={"ret": 0}))
+            sender = WeChatSender(client, state, config(), mock.Mock())
+            self.assertFalse(await sender.send("owner", "reply", purpose="reply", msg_id="B"))
+            client.send_message.assert_not_awaited()
+            self.assertEqual(state.context("owner"), "TA")
 
     async def test_chunks_success_and_repeat_suppression(self):
         from muse_bridge.adapters.wechat.sender import WeChatSender
@@ -123,18 +137,19 @@ class TestWeChatParsing(unittest.TestCase):
         self.assertFalse(message.attachments)
 
 
-def make_adapter(root, state=None):
+def make_adapter(root, state=None, *, muse=None):
     from muse_bridge.adapters.wechat.adapter import WeChatAdapter
     from muse_bridge.config.models import MuseConfig, WeChatConfig
     from muse_bridge.core.interactions import InteractionManager
     state = state or saved_state(root)
-    muse = mock.Mock()
-    muse.config = MuseConfig(session_id="")
-    muse.interactions = InteractionManager()
-    muse.interaction_protocol.approval_queue.return_value = []
-    muse.interaction_protocol.queue_heads.return_value = []
-    muse.token_manager.has_credentials.return_value = True
-    muse.post_message.side_effect = lambda sid, text, *a, **kw: "mid-" + text
+    if muse is None:
+        muse = mock.Mock()
+        muse.config = MuseConfig(session_id="", cookies_file=str(Path(root) / "cookies.json"))
+        muse.interactions = InteractionManager()
+        muse.interaction_protocol.approval_queue.return_value = []
+        muse.interaction_protocol.queue_heads.return_value = []
+        muse.token_manager.has_credentials.return_value = True
+        muse.post_message.side_effect = lambda sid, text, *a, **kw: "mid-" + text
     client = mock.Mock(send_message=mock.AsyncMock(return_value={"ret": 0}), aclose=mock.AsyncMock())
     adapter = WeChatAdapter(WeChatConfig(enabled=True, state_dir=root), muse, state=state, client=client)
     adapter.outbound_pusher.ensure_baseline = mock.AsyncMock()
@@ -147,7 +162,7 @@ class TestWeChatIntake(unittest.IsolatedAsyncioTestCase):
             adapter, muse, client = make_adapter(root)
             contexts = []
             async def handle(message):
-                contexts.append((adapter._context("owner", message.id), adapter._context("owner")))
+                contexts.append((adapter.state.context("owner", message.id), adapter.state.context("owner")))
                 return "handled"
             adapter.handle_inbound = handle
             batch = [event("A", token="TA"), event("B", token="TB")]
@@ -156,20 +171,19 @@ class TestWeChatIntake(unittest.IsolatedAsyncioTestCase):
             await adapter.handle_batch(batch)
             self.assertEqual(len(contexts), 2)
 
-    async def test_stranger_only_access_request_gets_transient_context(self):
+    async def test_any_personal_sender_can_chat_without_access_state(self):
         with tempfile.TemporaryDirectory() as root:
-            adapter, muse, client = make_adapter(root)
-            seen = []
-            async def handle(message):
-                seen.append((message.text, adapter._context("stranger", message.id)))
-                return "handled"
-            adapter.handle_inbound = handle
-            await adapter.handle_batch([event("A", "stranger", "no access"),
-                                        event("B", "stranger", "/申请", "temporary")])
-            self.assertEqual(seen, [("/申请", "temporary")])
-            self.assertIsNone(adapter.state.context("stranger"))
-            self.assertFalse(adapter._transient_contexts)
-            muse.post_message.assert_not_called()
+            with mock.patch("muse_bridge.gateway.chat.ChatAccessRequests", side_effect=AssertionError("No access policy")):
+                adapter, muse, client = make_adapter(root)
+            self.assertIsNone(adapter.access_requests)
+            await adapter.handle_batch([event("A", "stranger", "first", "TA"),
+                                        event("B", "other", "second", "TB")])
+            self.assertEqual([c.args[1] for c in muse.post_message.call_args_list], ["first", "second"])
+            self.assertNotEqual(muse.post_message.call_args_list[0].args[0], muse.post_message.call_args_list[1].args[0])
+            self.assertEqual(adapter.state.context("stranger"), "TA")
+            self.assertEqual(adapter.state.context("other"), "TB")
+            self.assertFalse(list(Path(root).rglob("*access*")))
+            self.assertFalse(hasattr(adapter, "_transient_contexts"))
 
     async def test_typing_ticket_cache_and_failure_backoff(self):
         with tempfile.TemporaryDirectory() as root:
@@ -201,10 +215,13 @@ class TestWeChatIntake(unittest.IsolatedAsyncioTestCase):
             await asyncio.gather(task, return_exceptions=True)
             self.assertEqual([call.args[2] for call in client.send_typing.await_args_list], [1, 2])
 
-    async def test_wildcard_whitelist_requires_explicit_open_switch(self):
-        from muse_bridge.config.models import WeChatConfig
-        with self.assertRaises(ValueError):
-            WeChatConfig(whitelist={"private": "*"})
+    async def test_group_events_never_reach_shared_gateway(self):
+        with tempfile.TemporaryDirectory() as root:
+            adapter, muse, client = make_adapter(root)
+            await adapter.handle_batch([event("A", group_id="unexpected-group")])
+            muse.post_message.assert_not_called()
+            client.send_message.assert_not_awaited()
+            self.assertIsNone(adapter.state.context("owner"))
 
     async def test_local_help_and_two_turn_muse_chat(self):
         with tempfile.TemporaryDirectory() as root:
@@ -212,7 +229,13 @@ class TestWeChatIntake(unittest.IsolatedAsyncioTestCase):
             await adapter.handle_batch([event("help", text="/帮助")])
             self.assertTrue(client.send_message.await_count)
             self.assertEqual(client.send_message.call_args.args[0]["context_token"], "TA")
-            self.assertNotIn("全员表示开放当前群", client.send_message.call_args.args[0]["item_list"][0]["text_item"]["text"])
+            help_text = client.send_message.call_args.args[0]["item_list"][0]["text_item"]["text"]
+            for obsolete in ("管理员", "申请", "白名单", "鉴权", "群", "回复凭证卡"):
+                self.assertNotIn(obsolete, help_text)
+            for retained in ("/登录", "/凭证", "/审批", "/新建"):
+                self.assertIn(retained, help_text)
+            arbitrary = "用户原文：管理员申请群聊；如需在群聊中使用"
+            self.assertEqual(adapter.render_command_output(arbitrary), arbitrary)
             await adapter.handle_batch([event("A", text="first", token="TA")])
             await adapter.handle_batch([event("B", text="second", token="TB")])
             self.assertEqual(muse.post_message.call_count, 2)
@@ -224,42 +247,38 @@ class TestWeChatIntake(unittest.IsolatedAsyncioTestCase):
             route.assert_not_called()
             self.assertEqual(adapter.state.message_status("owner", "A"), "handled")
 
-    async def test_auto_approval_then_chat_in_same_poll_batch(self):
+    async def test_poll_batch_personal_messages_keep_order_and_cursor(self):
         with tempfile.TemporaryDirectory() as root:
             adapter, muse, client = make_adapter(root)
-            adapter.config.access_requests.auto_approve = True
-            from muse_bridge.adapters.wechat.gateway import WeChatGateway
             client.get_updates = mock.AsyncMock(return_value={"ret": 0, "get_updates_buf": "next",
-                "msgs": [event("apply", "stranger", "/申请", "TR"),
-                         event("chat", "stranger", "new chat", "TC")]})
+                "msgs": [event("first", "stranger", "first chat", "TA"),
+                         event("second", "stranger", "second chat", "TB")]})
             async def intake(messages):
                 await adapter.handle_batch(messages)
-                self.assertEqual(muse.post_message.call_count, 1)
+                self.assertEqual(muse.post_message.call_count, 2)
                 adapter.gateway._stop.set()
             adapter.gateway.on_batch = intake
             await adapter.gateway.start()
             self.assertEqual(adapter.state.cursor, "next")
-            self.assertEqual(muse.post_message.call_args.args[1], "new chat")
-            self.assertEqual(adapter.state.context("stranger"), "TC")
+            self.assertEqual([c.args[1] for c in muse.post_message.call_args_list], ["first chat", "second chat"])
+            self.assertEqual(adapter.state.context("stranger"), "TB")
 
-    async def test_pending_request_can_notify_after_restart_and_approval(self):
+    async def test_notifications_only_bound_chat_without_scanner_copy(self):
         with tempfile.TemporaryDirectory() as root:
             adapter, muse, client = make_adapter(root)
-            adapter.config.admin_id = ["owner"]
-            adapter.state.remember_message("owner", "seed", "TO")
-            await adapter.handle_batch([event("request", "stranger", "/申请", "TR")])
-            self.assertIsNone(adapter.state.context("stranger"))
-            rows = adapter.access_requests.store.pending()
-            self.assertEqual(len(rows), 1)
-            restarted, muse, client = make_adapter(root, WeChatState(root))
-            restarted.config.admin_id = ["owner"]
-            await restarted.handle_batch([event("approve", text=f"/申请审批 {rows[0]['id']} 同意", token="TO2")])
-            self.assertTrue(restarted.access_requests.allows("private", "stranger", "stranger"))
-            recipient_messages = [call.args[0] for call in client.send_message.await_args_list
-                                  if call.args[0]["to_user_id"] == "stranger"]
-            self.assertEqual(len(recipient_messages), 1)
-            self.assertEqual(recipient_messages[0]["context_token"], "TR")
-            self.assertEqual(restarted.state.context("stranger"), "TR")
+            await adapter.handle_batch([event("A", "stranger", "chat", "TA")])
+            adapter.state.remember_message("owner", "B", "TB")
+            sid = adapter.session_mapper.current("private", "stranger")
+            for kind in ("credential", "approval"):
+                item = muse.interactions.add(kind, session_id=sid, context={"fingerprint": "current"})
+                self.assertTrue(await adapter.notify_interaction(item, "card-" + kind))
+            self.assertEqual([c.args[0]["to_user_id"] for c in client.send_message.await_args_list],
+                             ["stranger", "stranger"])
+            self.assertFalse(await adapter.notify_interaction(
+                muse.interactions.add("credential", session_id="unbound"), "unbound"))
+            self.assertEqual(client.send_message.await_count, 2)
+            self.assertEqual(adapter.notification_target(), "owner")
+            self.assertEqual(adapter.outbound_pusher.notification_target(), "owner")
 
     async def test_complete_dispatcher_to_sender_and_reaction_revisions(self):
         with tempfile.TemporaryDirectory() as root:
@@ -303,6 +322,25 @@ class TestWeChatIntake(unittest.IsolatedAsyncioTestCase):
             await restarted.handle_batch([event("B")])
             restarted.handle_inbound.assert_not_called()
 
+    async def test_retryable_intake_keeps_cursor_and_unknown_post_never_replays(self):
+        from muse_bridge.adapters.wechat.adapter import IntakeRetryable
+        with tempfile.TemporaryDirectory() as root:
+            adapter, muse, client = make_adapter(root)
+            adapter.handle_inbound = mock.AsyncMock(side_effect=["retryable", "handled"])
+            with self.assertRaises(IntakeRetryable):
+                await adapter.handle_batch([event("A")])
+            self.assertEqual(adapter.state.message_status("owner", "A"), "accepted")
+            await adapter.handle_batch([event("A")])
+            self.assertEqual(adapter.state.message_status("owner", "A"), "handled")
+        for error in (TimeoutError("unconfirmed"), RuntimeError("status 404: session not found")):
+            with self.subTest(error=error), tempfile.TemporaryDirectory() as root:
+                adapter, muse, client = make_adapter(root)
+                muse.post_message.side_effect = error
+                await adapter.handle_batch([event("B")])
+                self.assertEqual(adapter.state.message_status("owner", "B"), "unknown")
+                await adapter.handle_batch([event("B")])
+                muse.post_message.assert_called_once()
+
     async def test_notification_ignores_old_route_and_receipt_has_no_id(self):
         from muse_bridge.core.message import DeliveryReference
         with tempfile.TemporaryDirectory() as root:
@@ -316,6 +354,152 @@ class TestWeChatIntake(unittest.IsolatedAsyncioTestCase):
             body = await adapter.send_reply("private", "owner", "immediate", "A")
             self.assertEqual(body, {})
             self.assertEqual(client.send_message.call_args.args[0]["context_token"], "TA")
+
+
+class TestWeChatMuseInteractions(unittest.IsolatedAsyncioTestCase):
+    def make(self, root, main_session=""):
+        from muse_bridge.config.models import MuseConfig
+        from muse_bridge.muse.service import MuseService
+        token = mock.MagicMock()
+        token.has_credentials.return_value = True
+        service = MuseService(MuseConfig(session_id=main_session,
+            cookies_file=str(Path(root) / "cookies.json"), mint_file=str(Path(root) / "mint.json")), token)
+        self.addCleanup(service.interactions.close)
+        service.post_message = mock.Mock(return_value="posted")
+        return make_adapter(root, muse=service)
+
+    def texts(self, client):
+        return [c.args[0]["item_list"][0]["text_item"]["text"] for c in client.send_message.await_args_list]
+
+    def assert_no_access_copy(self, client):
+        for text in self.texts(client):
+            for obsolete in ("管理员", "白名单", "申请", "鉴权", "群聊"):
+                self.assertNotIn(obsolete, text)
+
+    async def test_personal_commands_and_main_session_isolation(self):
+        with tempfile.TemporaryDirectory() as root:
+            adapter, service, client = self.make(root, "main-session")
+            self.assertEqual(adapter.session_mapper.current("private", "owner"), "main-session")
+            await adapter.handle_batch([event("chat", "stranger", "hello")])
+            self.assertNotEqual(service.post_message.call_args.args[0], "main-session")
+            await adapter.handle_batch([event("new", "stranger", "/新建")])
+            sid = adapter.session_mapper.current("private", "stranger")
+            self.assertNotEqual(sid, "main-session")
+            remote = mock.Mock()
+            remote.list_sessions.return_value = [{"session_id": "chosen-session"}]
+            with mock.patch.object(service, "create_client", return_value=remote):
+                await adapter.handle_batch([event("switch", "stranger", "/切换 chosen-session"),
+                                            event("delete", "stranger", "/删除 chosen-session")])
+            self.assertEqual(adapter.session_mapper.current("private", "stranger"), "chosen-session")
+            remote.delete_session.assert_called_once_with("chosen-session")
+            self.assert_no_access_copy(client)
+
+    async def test_muse_login_email_and_otp_need_no_platform_role(self):
+        with tempfile.TemporaryDirectory() as root:
+            adapter, service, client = self.make(root)
+            service.token_manager.has_credentials.return_value = False
+            await adapter.handle_batch([event("no-login", "stranger", "hello")])
+            self.assertIn("请发送 /登录", self.texts(client)[-1])
+            with mock.patch("muse_bridge.gateway.interactions.MuseProtocolLogin") as login:
+                auth = login.return_value
+                auth.extract_cookies.return_value = {"cookie": "hatch_sess=synthetic-session"}
+                await adapter.handle_batch([event("login", "stranger", "/登录 person@example.invalid")])
+                owner = adapter.interaction_owner("private", "stranger", "stranger")
+                self.assertEqual(service.interactions.current(owner).state, "wait_otp")
+                await adapter.handle_batch([event("otp", "stranger", "123456")])
+                auth.send_otp.assert_called_once_with("person@example.invalid")
+                auth.confirm_otp.assert_called_once_with("123456")
+            service.token_manager.refresh_from_cookies.assert_called_once_with(False)
+            self.assertIsNone(service.interactions.current(owner))
+            self.assertTrue(Path(service.config.cookies_file).is_file())
+            service.post_message.assert_not_called()
+            self.assert_no_access_copy(client)
+
+    async def test_credential_selection_and_multiline_input_without_admin(self):
+        with tempfile.TemporaryDirectory() as root:
+            adapter, service, client = self.make(root)
+            adapter.session_mapper.bind("private", "stranger", "s1")
+            service.interactions.managed_sessions.add("s1")
+            card = service.interactions.add("credential", session_id="s1",
+                context={"page_url": "https://example.invalid/login"})
+            adapter.config.credentials_in_place = False  # Group-only restriction is irrelevant here.
+            hint = adapter.outbound_pusher.render_credential_hint(card)
+            self.assertIn("/凭证 " + card.id, hint)
+            self.assertNotIn("管理员", hint)
+            usernames = []
+            with mock.patch.object(service, "capture_credential",
+                                   side_effect=lambda item, secret: usernames.append(item.context["username"])) as capture:
+                await adapter.handle_batch([event("select", "stranger", f"/凭证 {card.id} 一次"),
+                                            event("secret", "stranger", "synthetic-user\nsynthetic-secret")])
+            capture.assert_called_once_with(card, "synthetic-secret")
+            self.assertEqual(usernames, ["synthetic-user"])
+            self.assertTrue(card.terminal)
+            service.post_message.assert_not_called()
+            self.assert_no_access_copy(client)
+
+    async def test_muse_approval_card_gate_and_numeric_decision_without_admin(self):
+        with tempfile.TemporaryDirectory() as root:
+            adapter, service, client = self.make(root)
+            adapter.session_mapper.bind("private", "stranger", "s1")
+            service.interactions.managed_sessions.add("s1")
+            row = {"approval_id": "remote-approval", "status": "pending", "scope": {"thread_id": "s1"},
+                   "requested_at_ms": 1, "display": {"summary_title": "Continue operation"},
+                   "decision_options": [{"kind": "allow_once", "label": {"kind": "allow_once"},
+                                         "label_text": "允许一次"}]}
+            decisions = []
+            def request(method, path, body=None, **kwargs):
+                if path == "/approvals":
+                    return {"pending": [copy.deepcopy(row)] if row["status"] == "pending" else [], "recent": []}
+                if method == "POST":
+                    decisions.append(body)
+                    row["status"] = "approved"
+                return copy.deepcopy(row)
+            service.interaction_protocol.request = mock.Mock(side_effect=request)
+            service.interaction_protocol.fetch_approvals()
+            await adapter.handle_batch([event("gate", "stranger", "please continue")])
+            service.post_message.assert_not_called()
+            self.assertIn("【审批", self.texts(client)[-1])
+            await adapter.handle_batch([event("decision", "stranger", "1")])
+            self.assertEqual(decisions, [{"decision": "allow_once", "notification_channel": "ui"}])
+            self.assertIn("审批已全部完成", self.texts(client)[-1])
+            await adapter.handle_batch([event("chat", "stranger", "continue")])
+            service.post_message.assert_called_once()
+            self.assert_no_access_copy(client)
+
+    async def test_login_required_runtime_hints_and_notice_target(self):
+        from muse_bridge.muse.client.errors import LoginRequired
+        with tempfile.TemporaryDirectory() as root:
+            adapter, service, client = self.make(root)
+            service.post_message.side_effect = LoginRequired("synthetic-expiry")
+            await adapter.handle_batch([event("chat", "stranger", "hello")])
+            self.assertIn("请发送 /登录", self.texts(client)[-1])
+            self.assertTrue(adapter._in_login_fallback)
+            remote = mock.Mock()
+            remote.connect.side_effect = LoginRequired("synthetic-expiry")
+            with mock.patch.object(service, "create_client", return_value=remote):
+                await adapter.handle_batch([event("command", "stranger", "/会话")])
+            self.assertIn("请发送 /登录", self.texts(client)[-1])
+            adapter.state.remember_message("owner", "seed", "TO")
+            await adapter.outbound_pusher._notify_login_required()
+            self.assertEqual(client.send_message.call_args.args[0]["to_user_id"], "owner")
+            self.assertEqual(client.send_message.call_args.args[0]["context_token"], "TO")
+            self.assert_no_access_copy(client)
+
+    async def test_engine_start_uses_notification_target_without_admin_config(self):
+        from muse_bridge.engine import BridgeEngine
+        with tempfile.TemporaryDirectory() as root:
+            adapter, service, client = self.make(root)
+            adapter.start = mock.AsyncMock()
+            service.verify_connection = mock.Mock(return_value=False)
+            service.interaction_protocol.run = mock.AsyncMock()
+            engine = object.__new__(BridgeEngine)
+            engine.config = SimpleNamespace(gateway=SimpleNamespace(login_through_adapter="wechat"))
+            engine.adapters = [adapter]
+            engine.muse_service = service
+            with mock.patch.object(engine, "_notify_admin_login", new_callable=mock.AsyncMock) as notice:
+                await engine.start()
+                await asyncio.sleep(0)
+                notice.assert_awaited_once_with(adapter, "owner")
 
 
 if __name__ == "__main__":

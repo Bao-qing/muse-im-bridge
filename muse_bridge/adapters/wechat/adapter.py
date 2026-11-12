@@ -8,6 +8,7 @@ import os
 import random
 import time
 
+from ...core.commands import HELP_TEXT
 from ...core.message import Attachment, InboundMessage, MessageSource
 from ...gateway.chat import ChatGateway
 from ...observability import get_logger, safe_error
@@ -89,12 +90,6 @@ class WeChatAdapter(ChatGateway):
             raise WeChatStateError("WeChat is not logged in; run python main.py --wechat-login")
         self.state.recover_inputs()
         config = config.for_account(self.state.bot_id)
-        # Local QR confirmation grants chat access only, not administrator rights.
-        config.whitelist = copy.deepcopy(config.whitelist)
-        owner = self.state.credentials["user_id"]
-        private = config.whitelist.setdefault("private", [])
-        if owner not in private:
-            private.append(owner)
         credentials = self.state.credentials
         self.client = client or WeChatClient(
             credentials["bot_token"], credentials["baseurl"],
@@ -102,9 +97,8 @@ class WeChatAdapter(ChatGateway):
             timeout=config.http_timeout_s, cooling_until=lambda: self.state.cooldown_until,
             on_session_invalid=self.state.pause)
         self.media = WeChatMedia(self.client)
-        self._transient_contexts = {}
         self._media_descriptors = {}
-        self.sender = WeChatSender(self.client, self.state, config, self.media, self._context)
+        self.sender = WeChatSender(self.client, self.state, config, self.media)
         super().__init__(config, muse_service, deduplicator)
         self.gateway = WeChatGateway(self.client, self.state, self.handle_batch, config.polling_timeout_ms)
         self._tasks = []
@@ -119,27 +113,32 @@ class WeChatAdapter(ChatGateway):
     def account_identity(self):
         return self.state.bot_id
 
-    def access_identity(self):
-        return "wechat:" + self.state.bot_id
+    def notification_target(self):
+        return self.state.credentials["user_id"]
+
+    def can_recreate_session(self, error):
+        # No recovery POST: even an error response may follow an accepted input.
+        return False
 
     def create_outbound(self):
         return WeChatOutboundPusher(self.config, self.client, self.muse_service, self.deduplicator,
                                    self.route_manager, self.session_mapper,
-                                   on_login_required=self.enter_login_mode, state=self.state, sender=self.sender,
-                                   authorized=lambda user: (self.config.is_admin(user)
-                                       or self.access_requests.allows("private", user, user)))
-
-    def _context(self, user, msg_id=None):
-        if msg_id is not None and (user, msg_id) in self._transient_contexts:
-            return self._transient_contexts[(user, msg_id)]
-        if msg_id is None and self.access_requests.allows("private", user, user):
-            self.state.promote_request(user)
-        return self.state.context(user, msg_id)
+                                   on_login_required=self.enter_login_mode, state=self.state, sender=self.sender)
 
     def render_command_output(self, text):
-        return (text.replace("/申请 [全员] — 申请使用；全员表示开放当前群", "/申请 — 申请私聊访问")
-                .replace("，也可回复凭证卡", "")
-                .replace("如需在群聊中使用", "如需开放管理命令"))
+        if text != HELP_TEXT:
+            return text
+        # Adapt only the shared help, never arbitrary Muse output or user text.
+        lines = []
+        for line in text.splitlines():
+            if line.startswith("/申请"):
+                continue
+            if line.startswith("/登录 "):
+                line = "/登录 [邮箱] — 显式登录 Muse"
+            elif line.startswith("/凭证 "):
+                line = "/凭证 [编号] [保存|一次] — 填写凭证"
+            lines.append(line)
+        return "\n".join(lines)
 
     async def send_reply(self, target_type, target_id, text, msg_id=None):
         if target_type != "private":
@@ -167,44 +166,25 @@ class WeChatAdapter(ChatGateway):
                 continue
             message, media, token = parsed
             user = message.source.sender_id
-            authorized = self.access_requests.allows("private", user, user)
-            # Authorization may change after a preceding /申请 in this batch.
-            if authorized:
-                if self.state.message_status(user, message.id) in {"handled", "unknown", "ignored"}:
-                    continue
-                self.state.remember_message(user, message.id, token)
-            ready.append((message, media, token, authorized))
-        # Latest now reflects the complete accepted batch, before slow media/Muse calls.
-        for message, media, token, was_authorized in ready:
-            user = message.source.sender_id
-            authorized = self.access_requests.allows("private", user, user)
-            access_command = self.access_requests.is_command(message.text)
-            if not authorized and not access_command:
+            if self.state.message_status(user, message.id) in {"handled", "unknown", "ignored"}:
                 continue
-            if authorized and not was_authorized:
-                if self.state.message_status(user, message.id) in {"handled", "unknown", "ignored"}:
-                    continue
-                self.state.remember_message(user, message.id, token)
-            if authorized and self.state.message_status(user, message.id) != "accepted":
+            self.state.remember_message(user, message.id, token)
+            ready.append((message, media))
+        # Latest reflects the whole accepted batch; immediate replies use snapshots.
+        for message, media in ready:
+            user = message.source.sender_id
+            if self.state.message_status(user, message.id) != "accepted":
                 continue
             self._media_descriptors.update(media)
-            if not authorized and token:
-                self._transient_contexts[(user, message.id)] = token
-                # Pending approval must be able to notify this user after restart.
-                if message.text.split()[0] == "/申请":
-                    self.state.remember_request(user, token)
             try:
-                if authorized:
-                    # Persist a conservative marker before any non-idempotent business call.
-                    self.state.finish_message(user, message.id, "unknown")
+                # Persist before any non-idempotent call; unknown results never replay.
+                self.state.finish_message(user, message.id, "unknown")
                 result = await self._with_typing(message)
-                if authorized:
-                    if result == "retryable":
-                        self.state.retry_message(user, message.id)
-                        raise IntakeRetryable("WeChat intake not accepted; cursor retained")
-                    self.state.finish_message(user, message.id, "unknown" if result == "unknown" else "handled")
+                if result == "retryable":
+                    self.state.retry_message(user, message.id)
+                    raise IntakeRetryable("WeChat intake not accepted; cursor retained")
+                self.state.finish_message(user, message.id, "unknown" if result == "unknown" else "handled")
             finally:
-                self._transient_contexts.pop((user, message.id), None)
                 for key in media:
                     self._media_descriptors.pop(key, None)
 
@@ -231,7 +211,7 @@ class WeChatAdapter(ChatGateway):
         if retry_at > now:
             return None
         try:
-            response = await self.client.get_config(user, self._context(user, msg_id))
+            response = await self.client.get_config(user, self.state.context(user, msg_id))
             ticket = response.get("typing_ticket")
             if not isinstance(ticket, str) or not ticket:
                 raise ValueError("No WeChat typing ticket")

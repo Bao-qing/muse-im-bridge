@@ -78,14 +78,7 @@
       "typing_enabled": false,
       "chunk_chars": 4000,
       "max_chunks": 8,
-      "admin_id": [],
-      "admin_only": false,
-      "allow_all_private": false,
-      "allow_all_group": false,
-      "unbound_push_to_admin": false,
-      "whitelist": {"private": []},
-      "session_bindings": {},
-      "access_requests": {"enabled": true, "auto_approve": false}
+      "session_bindings": {}
     }
   },
   "gateway": {

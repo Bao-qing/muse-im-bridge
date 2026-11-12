@@ -43,7 +43,7 @@ async def _login(config: WeChatConfig) -> dict:
         state.save_account(credentials)
     finally:
         await client.aclose()
-    print("微信账号已保存并激活。扫码者不会自动成为管理员；请在本地显式配置 admin_id。")
+    print("微信账号已保存并激活，可以开始个人私信对话。")
     # Only return the state-owned redacted summary, not auth credentials.
     return state.status()
 

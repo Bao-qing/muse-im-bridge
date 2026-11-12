@@ -70,7 +70,7 @@ class BridgeEngine:
                     adapter.enter_login_mode()
             login_adapter = self._login_adapter()
             if login_adapter:
-                admin_target = login_adapter.config.admin_target()
+                admin_target = login_adapter.notification_target()
                 if admin_target:
                     asyncio.create_task(self._notify_admin_login(login_adapter, admin_target))
         elif cred_ok:
@@ -92,11 +92,7 @@ class BridgeEngine:
             pass
 
     async def _notify_interaction(self, item, text):
-        """Push a card through the adapters whose chats own its session.
-
-        A session no chat owns (e.g. the configured main session) goes to every
-        adapter, which then falls back to its own admin.
-        """
+        """Push a card only through adapters with chats bound to its session."""
         chats = [a for a in self.adapters if isinstance(a, ChatGateway) and a.is_enabled]
         owners = [a for a in chats if a.owns_session(item.session_id)]
         delivered = False
@@ -105,7 +101,7 @@ class BridgeEngine:
         return delivered
 
     def _login_adapter(self):
-        """Adapter whose admin is asked to log in (``gateway.login_through_adapter``)."""
+        """Account notice channel selected by ``gateway.login_through_adapter``."""
         name = self.config.gateway.login_through_adapter
         return next((a for a in self.adapters if isinstance(a, ChatGateway) and a.name == name), None)
 

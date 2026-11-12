@@ -99,7 +99,7 @@ class WeChatState:
                     "latest": {}, "snapshots": {}, "messages": {}, "parts": {}}
         if not isinstance(data, dict):
             raise WeChatStateError("Invalid WeChat protocol state")
-        data.setdefault("requests", {})  # Backward-compatible private request contexts.
+        data.pop("requests", None)  # Obsolete access requests never become chat contexts.
         self._validate(data, bot_id)
         self.credentials, self.bot_id, self.account_dir, self._data = credentials, bot_id, directory, data
 
@@ -119,12 +119,6 @@ class WeChatState:
                                   for k, v in data["messages"].items())
             valid = valid and all(isinstance(k, str) and v in {"sending", "confirmed", "unknown"}
                                   for k, v in data["parts"].items())
-            requests = data.get("requests", {})
-            valid = valid and isinstance(requests, dict) and len(requests) <= 1000
-            valid = valid and all(_id(user) and isinstance(row, dict) and _text(row.get("context"))
-                                  and type(row.get("created_at")) in (int, float)
-                                  and 0 <= row["created_at"] <= 2**53
-                                  for user, row in requests.items())
             if not valid:
                 raise ValueError
         except (KeyError, TypeError, ValueError):
@@ -219,34 +213,6 @@ class WeChatState:
         if status not in {"handled", "ignored", "unknown"}:
             raise WeChatStateError("Invalid WeChat processing result")
         self._commit(lambda d: d["messages"].update({_key(user, msg_id): status}))
-
-    def remember_request(self, user, token):
-        """Retain only explicit access-request contexts, not arbitrary strangers."""
-        if not _id(user) or not _text(token):
-            return
-        def change(d):
-            rows = d.setdefault("requests", {})
-            cutoff = time.time() - 7 * 86400
-            for key in list(rows):
-                if rows[key]["created_at"] < cutoff:
-                    del rows[key]
-            if user not in rows and len(rows) >= 1000:
-                del rows[next(iter(rows))]
-            rows[user] = {"context": token, "created_at": time.time()}
-        self._commit(change)
-
-    def promote_request(self, user):
-        """Call only after authorization; a newer accepted context always wins."""
-        row = self._data.get("requests", {}).get(user)
-        if not row or row["created_at"] < time.time() - 7 * 86400:
-            return
-        def change(d):
-            if user not in d["latest"]:
-                if len(d["latest"]) >= self.MAX_USERS:
-                    raise WeChatStateError("Too many WeChat context owners")
-                d["latest"][user] = row["context"]
-            d["requests"].pop(user, None)
-        self._commit(change)
 
     def recover_inputs(self):
         """Do not replay an input which might have been POSTed before a crash."""
