@@ -1,6 +1,6 @@
 # Muse im Bridge
 
-Muse im Bridge 是一 Muse 助理消息桥接系统。支持将 Muse 虚拟助理接入到 **QQ 官方机器人**、**OneBot (推荐 NapCat )**，并将在未来接入 **微信 OpenClaw** 。
+Muse im Bridge 是一 Muse 助理消息桥接系统。支持将 Muse 虚拟助理接入到 **QQ 官方机器人**、**OneBot (推荐 NapCat)** 和 **微信 iLink（OpenClaw 渠道，仅私聊）**。微信直接使用 HTTP 长轮询，无需第三方网关。
 
 > **非官方项目**：本项目与 Muse、腾讯 QQ 无隶属关系，接入方式依赖对网页端协议的逆向分析，可能违反目标平台的服务条款，也可能随服务端更新而失效，使用风险自负。
 
@@ -73,7 +73,8 @@ pip install -e .
 
 支持首次配置生成与全量配置分类修改：
 - **首次配置**：未配置时自动引导输入基础凭据（QQ / OneBot），随后在任一渠道发送消息即可自动捕获管理员身份、将该私聊绑定到主会话，并生成 `config.json`；
-- **全量修改**：已有配置时，提供按清晰分类（Muse 核心参数、登录通道、QQ 适配器、OneBot 适配器、日志与追踪、高级性能）查看、逐项修改和保存配置。
+- **微信首次配置**：渠道菜单追加 **4（仅微信）**、**5（三渠道）**，旧 1/2/3 的含义不变。微信复用本地扫码 CLI，不捕获首条消息认领管理员；管理员和会话预绑定必须显式配置。
+- **全量修改**：已有配置时，提供按清晰分类（Muse 核心参数、登录通道、QQ 适配器、OneBot 适配器、日志与追踪、高级性能）查看、逐项修改和保存配置；追加 **9（微信）**，可设置本地登录、私聊权限、分块和超时。Muse 登录通知通道也可选择 `wechat`（须显式配置管理员）。
 
 ```bash
 python init_config.py
@@ -432,6 +433,57 @@ OneBot 与 QQ 走同一个 Gateway 层（`muse_bridge/gateway/`），会话隔�
 - **可见范围**：自动同步支持 `ugc_right` 为 `1`（所有人）、`4`（好友，默认）、`64`（仅自己）。底层发送方法另支持文档定义的部分好友权限参数。
 - **持久化与失败**：状态文件按 Muse 来源和 OneBot 账号隔离，发表前原子落盘记录尝试；同一动态跨轮次、跨重启不重复发表。发送失败或结果不明时，该条不会自动重试，可能漏发，但优先避免重复公开发布。图片准备失败不发表残缺内容。状态损坏、账号不匹配或写盘失败时停止该轮发送，不自动清空记录；更换账号请配置新的状态文件。不要随意删除状态文件，否则仍在时间窗口内的动态可能重新发表。
 - **独立生命周期**：不影响 QQ 官方适配器和群聊触发规则；关闭开关不扫描、不发布，退出时中断等待并等待正在进行的操作结束。建议单实例运行，不要让多个进程共用同一发表账号与状态文件。
+
+## 微信 iLink 适配器
+
+微信通道默认关闭。先在 `adapters.wechat` 配置启用开关，再**显式**执行本地扫码登录；启动网桥不会自动发起扫码。仅使用微信时还需设置 `adapters.qq.enabled=false`（旧 QQ 默认开启）；微信首次向导会代为设置。
+
+```json
+"wechat": {
+  "enabled": true,
+  "state_dir": "data/wechat",
+  "channel_version": "2.4.6",
+  "route_tag": "",
+  "http_timeout_s": 35,
+  "polling_timeout_ms": 35000,
+  "typing_enabled": false,
+  "chunk_chars": 4000,
+  "max_chunks": 8,
+  "admin_id": [],
+  "admin_only": false,
+  "allow_all_private": false,
+  "unbound_push_to_admin": false,
+  "whitelist": {"private": []},
+  "session_bindings": {}
+}
+```
+
+```bash
+python main.py --config config.json --wechat-login
+```
+
+```bash
+python main.py --config config.json --wechat-status
+```
+
+```bash
+python main.py --config config.json --check
+```
+
+```bash
+python main.py --config config.json
+```
+
+- `--wechat-login` 在终端使用 `qrcode>=8.0` 的 ASCII 二维码（不依赖 Pillow），验证信息隐藏输入。`--wechat-status` **仅显示脱敏本地状态**，不连接微信，也不代表远端登录有效；这两个命令不加载 Muse 配置或探测公网 IP。`--login` 仍是 Muse 登录，与两个微信开关互斥。`--check` 包含微信本地状态，但完整配置加载仍保留原有 IP 探测行为。
+- 默认 `admin_only=false`、`allow_all_private=false`、`unbound_push_to_admin=false`。扫码 owner 由适配器动态允许聊天，**不自动加入管理员**；只有本地 `admin_id` 显式指定的用户可执行管理员操作。预绑定仅支持 `private:<user_id>`；群放开、群白名单或群绑定均拒绝。
+- 文本按 `chunk_chars`（严格整数 1–4000，默认 4000）和 `max_chunks`（正整数）分段。开关必须是 JSON 布尔值；限额和超时拒绝布尔值、数字字符串和非有限数；整数参数也拒绝小数。顶层 `overrides` 仍优先于通道参数（示例的全局 `chunk_chars:1200` 会覆盖微信默认值）。
+- 账号切换后，网关运行文件全部派生到 `state_dir/accounts/<sha256(bot_id)[:24]>/`，包括会话映射、路由及其引用附属文件、推送水位、已投递记录、白名单申请文件。全局配置不被修改；显式 `admin_id` 和 `session_bindings` 预设仍按本地配置应用。不要让多个进程共用同一账号状态。
+- 即时命令回复使用当前消息的 **reply 上下文快照**；Muse 异步回复和 proactive 消息使用 **bot + user 的 latest 上下文**。这些上下文不是精确的原生引用保证，不要把 QQ/OneBot 的引用行为直接套用到微信。无群聊、按钮、消息编辑或语音发送；凭证和审批请使用文本命令。
+- 收到 `-14` 后冷却一小时，保留 token，不自动重新扫码。cursor 是 best-effort 持久化；发送结果未知时不盲目重试，优先避免重复消息，因此崩溃或超时可能漏发。
+- 凭据为 **JSON 明文运行文件**，含 bot token；上下文与状态也属于敏感数据。限制 `data/wechat/` 的文件权限、备份访问和分享范围，不提交或公开这些文件，不把二维码、验证信息或完整状态贴到 Issue。
+- 当前仅允许已核实的 iLink API/CDN 主机；未知区域跳转或新域名会安全拒绝，不自动放宽白名单。已有离线协议和桥接测试，但真实账号扫码、区域节点和 CDN 传输尚未验证。
+
+协议与边界说明见 [微信 iLink 协议说明](docs/wechat-ilink-protocol.md)。
 
 ## 安全与免责声明
 

@@ -334,7 +334,19 @@ class TestOneBotInbound(unittest.IsolatedAsyncioTestCase):
             event = _private(100, "", 1)
             event["message"] = [{"type": "file", "data": {"file": "d.txt", "file_id": "/fid"}}]
             await adapter.handle_event(event)
-            self.assertIn("[file下载失败：NapCat 未提供可下载地址]", muse.post_message.call_args.args[1])
+            self.assertIn("[file下载失败]", muse.post_message.call_args.args[1])
+
+    async def test_attachment_failure_does_not_forward_secret_exception(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            adapter, muse = _make_adapter(tmp)
+            adapter.download_attachment = mock.AsyncMock(side_effect=RuntimeError("aes_key=private-key"))
+            event = _private(100, "", 1)
+            event["message"] = [{"type": "file", "data": {"file": "d.txt", "file_id": "/fid"}}]
+            await adapter.handle_event(event)
+            text = muse.post_message.call_args.args[1]
+            self.assertIn("[file下载失败]", text)
+            self.assertNotIn("private-key", text)
+            self.assertNotIn("aes_key", text)
 
     async def test_admin_fills_group_credential_card_in_place_by_default(self):
         with tempfile.TemporaryDirectory() as tmp:

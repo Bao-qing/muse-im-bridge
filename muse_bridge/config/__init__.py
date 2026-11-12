@@ -7,6 +7,7 @@ from .models import (
     MuseConfig,
     OneBotConfig,
     QQConfig,
+    WeChatConfig,
 )
 
 __all__ = [
@@ -17,4 +18,5 @@ __all__ = [
     "MuseConfig",
     "QQConfig",
     "OneBotConfig",
+    "WeChatConfig",
 ]

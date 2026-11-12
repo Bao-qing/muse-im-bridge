@@ -934,7 +934,8 @@ class OutboundDispatcher:
                     self._save_state()
                     logger.info('Dispatched %s -> %s:%s [%s] (imgs=%s, files=%s, vids=%s)', mid, target_type, target_id, route_type, len(images), len(files), len(videos))
                     trace_event(f"{self.platform}.outbound", "message.dispatched", session_id=session_id,
-                                message_id=mid, sent_mid=last_user_mid, msg_id=reply_msg_id, target_type=target_type,
+                                message_id=mid, sent_mid=last_user_mid if purpose != "proactive" else None,
+                                msg_id=reply_msg_id, target_type=target_type,
                                 target_id=target_id, route_type=route_type,
                                 image_count=len(images), file_count=len(files), video_count=len(videos))
                 else:
@@ -1043,7 +1044,7 @@ class OutboundDispatcher:
         try:
             success = await self._deliver(
                 target_type, target_id, text, [], [], [],
-                delivery=DeliveryReference(session_id, mid, "", mid, plain_text=True, purpose="notification"))
+                delivery=DeliveryReference(session_id, mid, "", mid, plain_text=True, purpose="notification", revision=seq))
             if success:
                 self.reference_store.set_reaction_state(session_id, mid, max(seq, prev_seq), emojis)
         except Exception as exc:

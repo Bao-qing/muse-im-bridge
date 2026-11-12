@@ -38,6 +38,10 @@ class BridgeEngine:
         if self.config.onebot.enabled:
             self.adapters.append(OneBotAdapter(config=self.config.onebot, muse_service=self.muse_service))
 
+        if self.config.wechat.enabled:
+            from .adapters.wechat.adapter import WeChatAdapter
+            self.adapters.append(WeChatAdapter(config=self.config.wechat, muse_service=self.muse_service))
+
         self._running = False
 
     async def start(self) -> None:

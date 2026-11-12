@@ -84,6 +84,24 @@ class TestWeChatState(unittest.TestCase):
             path.write_text('{"version": 1, "bot_id": "foreign"}', encoding="utf-8")
             with self.assertRaises(WeChatStateError):
                 WeChatState(root)
+            path.write_text('[]', encoding="utf-8")
+            with self.assertRaises(WeChatStateError):
+                WeChatState(root)
+
+    def test_request_context_not_proactive_until_authorized_promotion(self):
+        with tempfile.TemporaryDirectory() as root:
+            state = WeChatState(root)
+            state.save_account(credentials())
+            state.remember_request("new-user", "TR")
+            self.assertIsNone(state.context("new-user"))
+            state = WeChatState(root)
+            state.promote_request("new-user")
+            self.assertEqual(state.context("new-user"), "TR")
+            state.remember_request("new-user", "old-request")
+            state.remember_message("new-user", "new-message", "new-context")
+            state.promote_request("new-user")
+            self.assertEqual(state.context("new-user"), "new-context")
+            self.assertNotIn("old-request", json.dumps(state.status()))
 
     def test_recover_inputs_and_sending_reservation_not_replayed(self):
         with tempfile.TemporaryDirectory() as root:
