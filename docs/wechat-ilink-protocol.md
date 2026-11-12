@@ -20,11 +20,11 @@ python main.py --config config.json --wechat-status
 
 ## 配置与账号隔离
 
-`WeChatConfig(ChatConfig)` 默认关闭，`state_dir=data/wechat`、`channel_version=2.4.6`、`route_tag=""`、`http_timeout_s=35`、`polling_timeout_ms=35000`、`typing_enabled=false`。`chunk_chars=4000` 且必须是 1–4000 的整数，`max_chunks` 必须是正整数。超时、限额不能用 bool 或字符串冒充数字，不能使用 NaN/Infinity；整数参数不接受浮点数。开关必须是真正 JSON 布尔值。
+`WeChatConfig(ConversationConfig)` 默认关闭，只复用会话、消息和媒体设置，不继承 QQ / OneBot 的管理员、白名单、访问申请和群聊策略。`state_dir=data/wechat`、`channel_version=2.4.6`、`route_tag=""`、`http_timeout_s=35`、`polling_timeout_ms=35000`、`typing_enabled=false`。`chunk_chars=4000` 且必须是 1–4000 的整数，`max_chunks` 必须是正整数。超时、限额不能用 bool 或字符串冒充数字，不能使用 NaN/Infinity；整数参数不接受浮点数。开关必须是真正 JSON 布尔值。
 
-默认 `admin_only=false`、`allow_all_private=false`、`unbound_push_to_admin=false`。当前扫码 owner 由适配器动态允许聊天，不自动成为管理员，也不改写配置。只有本地 `admin_id` 显式授予管理员身份。向导通过本地字段确认授权，不使用微信首条消息自动认领身份。群配置（`allow_all_group=true`、群白名单、`group:` 绑定）拒绝；会话预设仅允许 `private:<user_id>`。
+微信仅做个人私信，收到的有效个人消息直接进入对话，没有另设的管理员、白名单或访问申请。Muse 登录、会话管理、审批与凭证仍走共享文本交互；这些是 Muse 的交互功能，不再附加微信管理员检查。协议必需的扫码登录、bot token 和上下文仍保留。会话预设仅允许 `private:<user_id>`。
 
-陌生用户的普通消息不建立主动发送上下文、不下载媒体。明确的 `/申请` 会保存有界、账号隔离、最长七天的申请上下文，以便重启后批准时发送开通通知；批准前它不是普通 proactive 上下文，批准后也不会覆盖该用户更新的已授权 token。同一批轮询中先申请通过、再发送聊天，后续消息会重新检查授权。
+交互配置菜单按项修改：进入后直接选择扫码登录或查看本地状态，也可单独修改某个参数。返回不改配置，登录不要求重新填写参数；Muse 登录通知发给当前扫码用户。旧版微信权限配置键读取时忽略，编辑保存后不再写回；QQ / OneBot 策略保持原样。
 
 `config.for_account(bot_id)` 深复制配置，不修改全局。账号目录使用：
 
@@ -32,14 +32,14 @@ python main.py --config config.json --wechat-status
 state_dir/accounts/<sha256(bot_id 的 UTF-8 字节)[:24]>/
 ```
 
-网关运行文件强制派生到该目录：`delivered.jsonl`、`session_map.json`、`push_state.json`、`routes.json`、`access.local.json`；引用索引等通过对应运行路径派生，同样隔离。配置中的旧路径不能使这些文件逃逸到其他账号目录。显式配置的管理员及 `session_bindings` 不随账号切换自动清空或推断；如不希望多个账号共享预设，请使用不同配置文件。
+网关运行文件强制派生到该目录：`delivered.jsonl`、`session_map.json`、`push_state.json`、`routes.json`；引用索引等通过对应运行路径派生，同样隔离。不再创建 `access.local.json` 或保存待批准申请上下文。配置中的旧路径不能使这些文件逃逸到其他账号目录。`session_bindings` 不随账号切换自动清空或推断；如不希望多个账号共享预设，请使用不同配置文件。
 
 ## 上下文、回复与能力
 
 - **即时 reply**：接收到一条消息时固定当前上下文快照，命令等即时回复不应因随后收到的新消息而被覆盖。
 - **Muse 异步回复 / proactive**：按 bot + user 查找 latest 上下文，不把异步内容绑定到早先入站的旧 context token。切换账号或用户不得复用别人的上下文。
 - reply/latest 是发送上下文，不等价于原生消息引用。微信通道不保证精确原生引用某条用户消息；不能声称与 QQ message_reference 或 OneBot reply 段完全相同。
-- 不支持群、按钮、编辑或语音发送。审批、凭证等走共享网关文本交互与管理员权限检查，不凭多行内容自动认领凭证。
+- 不支持群、按钮、编辑或语音发送。审批、凭证等走共享网关文本交互，不凭多行内容自动认领凭证，不要求微信管理员身份。
 
 ## 失效、游标与不确定结果
 
@@ -57,6 +57,28 @@ state_dir/accounts/<sha256(bot_id 的 UTF-8 字节)[:24]>/
 图片、文件、视频按文档使用 AES-128-ECB/PKCS7 上传；下载兼容两种 base64 密钥编码，图片无密钥时可按明文下载。媒体有本地资源限额，不代表腾讯承诺的服务端额度。`typing_enabled` 默认关闭；启用时仅覆盖可确定的本地处理期，缓存 ticket、失败退避并在取消时停止，不猜测 Muse 整轮任务终态。
 
 本实现没有在真实微信服务验证扫码、区域跳转、CDN 或 TLS 握手；自动测试使用离线替身。网络策略失败不会关闭 TLS 校验或扩大域名白名单来绕过。
+
+## 手动协议测试终端
+
+仓库根目录运行，不启动 Muse、不读取 Muse Cookie：
+
+```bash
+python tests/wechat_cli.py --config config.json
+```
+
+默认先选择复用已保存登录或扫码登录；显式重新扫码可直接运行：
+
+```bash
+python tests/wechat_cli.py --config config.json --login
+```
+
+控制台复用微信 client/auth/state/gateway/media/sender，直接长轮询并打印收到的个人消息。普通文字发送到当前目标；默认扫码用户，`/to <用户ID>` 和 `--to` 可更换目标，`/peers` 查看最近收到消息的联系人。发送前需已有该用户的 context，缺失时提示对方先发来一条消息。
+
+`/image <路径>`、`/file <路径>`、`/video <路径>` 发送媒体，路径可带空格和引号，保留 Windows 反斜杠；`/status` 只显示脱敏状态，`/help` 查看命令，`/quit`、EOF 或 Ctrl+C 停止轮询、关闭连接并退出。`/login` 只提示退出后用 `--login` 重新启动，不在运行中切换账号或创建第二个长轮询。
+
+接收图片、文件、视频和原始语音自动下载至 `data/wechat_cli/downloads/`，有转写的语音也保留音频。`--download-dir` 可指定保存目录。文件名安全化并使用唯一名称、防止路径穿越和覆盖；下载受资源限额约束，失败仅输出安全摘要并记录为不确定结果，推进游标，避免反复下载。需要重新获取的失败附件应由对方重发。
+
+**不可与同账号网桥同时运行。** 控制台使用同一份账号状态和游标，消费后的消息不再转给 Muse；已确认收到的消息不因重启重复下载。发送未知结果继续保守记录，不自动重发；手动重复输入是一次新的发送。自动测试只用合成事件、替身、临时目录，未进行真实扫码或远端传输验证。
 
 ## 凭据与数据保护
 
