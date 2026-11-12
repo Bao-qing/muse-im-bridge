@@ -66,6 +66,7 @@ class DeliveryReference:
     reply_target: Optional[dict] = None
     plain_text: bool = False
     approval_binding: Optional[Any] = None
+    purpose: Optional[str] = None
 
 
 def _fence_open(line: str) -> Optional[dict]:

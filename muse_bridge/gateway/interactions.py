@@ -3,12 +3,11 @@
 from __future__ import annotations
 
 import asyncio
-import json
-import os
 import re
-import tempfile
 import time
 
+from ..core.interactions import interaction_target
+from ..core.state_file import atomic_json_write
 from ..muse.client.errors import LoginRequired
 from ..muse.login import MuseProtocolLogin
 from ..muse.interactions import credential_input_kind, credential_secret_label
@@ -31,10 +30,13 @@ class ChatInteractions:
         self.adapter = adapter
         self.manager = adapter.muse_service.interactions
 
+    def target(self, owner):
+        return interaction_target(self.adapter.interaction_owner(*owner[:3]))
+
     async def reply(self, owner, text, msg_id, *, item=None):
         body = await self.adapter.send_reply(owner[0], owner[1], text, msg_id)
         if item is not None:
-            self.manager.remember_credential_message(owner[0], owner[1], body, item)
+            self.manager.remember_credential_message(owner[0], owner[1], body, item, target=self.target(owner))
 
     def message_references(self, event):
         """``[(kind, value)]`` the platform event quotes; matched against sent bodies."""
@@ -59,7 +61,7 @@ class ChatInteractions:
             return []
         # Admin private chat also answers queues whose current card it was shown.
         return [head.session_id for head in self.protocol.queue_heads()
-                if owner[:2] in head.context.get("displayed_to", {})]
+                if self.target(owner) in head.context.get("displayed_to", {})]
 
     async def display_approval(self, owner, item, msg_id, *, prefix="", items=None):
         """Send one message holding the given cards and bind later choices to it."""
@@ -67,18 +69,19 @@ class ChatInteractions:
         snapshots = [self.protocol.display_snapshot(i) for i in items]
         text = "\n\n".join(self.adapter.muse_service.format_approval(i) for i in items)
         body = await self.adapter.send_reply(owner[0], owner[1], prefix + text, msg_id)
-        self.protocol.remember_approval_message(owner[:2], body, items, snapshots)
+        self.protocol.remember_approval_message(self.target(owner), body, items, snapshots)
         for shown, snapshot in zip(items, snapshots):
-            self.protocol.mark_displayed(shown, owner[:2], snapshot)
+            self.protocol.mark_displayed(shown, self.target(owner), snapshot)
 
     def is_credential_input(self, owner, content, event):
         """Keep secret whitespace and route replies past ordinary group triggers."""
+        owner = self.adapter.interaction_owner(*owner[:3])
         parts = content.split(None, 1)
         if parts and parts[0].lower() in {"/凭证", "/密码", "/验证码", "/credential", "/password", "/code"}:
             return True
         current = self.manager.current(owner)
         references = self.message_references(event)
-        if self.manager.referenced_credential(owner[0], owner[1], references) is not None:
+        if self.manager.referenced_credential(owner[0], owner[1], references, target=self.target(owner)) is not None:
             return True
         if not references and current and current.kind == "credential":
             return True
@@ -86,7 +89,7 @@ class ChatInteractions:
         # OneBot calls this before group triggers. Quoted approval choices must
         # reach the local router too; this does not grant approval permission.
         if APPROVAL_REPLY.fullmatch(content.strip()):
-            if references and self.protocol.referenced_approvals(owner[:2], references) is not None:
+            if references and self.protocol.referenced_approvals(self.target(owner), references) is not None:
                 return True
             if self.approval_targets(owner, session_id) or (references and self.approval_cards(owner, session_id)):
                 return True
@@ -95,12 +98,12 @@ class ChatInteractions:
     def approval_cards(self, owner, session_id):
         return [item for item in list(self.manager.items.values())
                 if item.kind == "approval"
-                and owner[:2] in item.context.get("displayed_to", {})
+                and self.target(owner) in item.context.get("displayed_to", {})
                 and (owner[0] == "private" or item.session_id == session_id)]
 
     async def quoted_approval(self, owner, content, references, session_id, msg_id, is_admin):
         choice = APPROVAL_REPLY.fullmatch(content.strip())
-        bindings = self.protocol.referenced_approvals(owner[:2], references)
+        bindings = self.protocol.referenced_approvals(self.target(owner), references)
         if not choice or (bindings is None and not self.approval_cards(owner, session_id)):
             return False
         if not is_admin:
@@ -120,6 +123,7 @@ class ChatInteractions:
         return True
 
     async def handle(self, owner, content, msg_id, is_admin, session_id, event=None):
+        owner = self.adapter.interaction_owner(*owner[:3])
         async with self.manager.owner_lock(owner):
             parts = content.split(None, 1)
             command = parts[0].lower() if parts else ""
@@ -131,7 +135,7 @@ class ChatInteractions:
                 args = args.strip()
             current = self.manager.current(owner)
             references = self.message_references(event or {})
-            referenced = self.manager.referenced_credential(owner[0], owner[1], references)
+            referenced = self.manager.referenced_credential(owner[0], owner[1], references, target=self.target(owner))
             if references and command not in {"/取消", "/聊天"}:
                 if referenced is not None:
                     await self.start_credential(referenced, owner, content, msg_id, is_admin, session_id)
@@ -273,16 +277,7 @@ class ChatInteractions:
             if "hatch_sess=" not in cookies.get("cookie", ""):
                 raise ValueError("missing session cookie")
             path = self.adapter.muse_service.config.cookies_file or "cookies.json"
-            directory = os.path.dirname(os.path.abspath(path))
-            fd, temporary = tempfile.mkstemp(prefix=".cookies-", dir=directory)
-            try:
-                with os.fdopen(fd, "w", encoding="utf-8") as f:
-                    json.dump(cookies, f, ensure_ascii=False)
-                    f.write(chr(10))
-                os.replace(temporary, path)
-            finally:
-                if os.path.exists(temporary):
-                    os.unlink(temporary)
+            atomic_json_write(path, cookies)
         except Exception as exc:
             logger.warning('confirm_otp unavailable: %s', safe_error(exc))
             item.state = "wait_otp"
@@ -329,7 +324,7 @@ class ChatInteractions:
         queue = self.approval_queue(session_id)
         head = queue[0] if queue else None
         shown = (snapshot[1] if snapshot is not None else
-                 head.context.get("queue_shown", {}).get(owner[:2]) if head else None)
+                 head.context.get("queue_shown", {}).get(self.target(owner)) if head else None)
         if head and snapshot is not None and snapshot[0] != head.context.get("fingerprint"):
             await self.display_approval(owner, head, msg_id, prefix="审批内容或选项已变化，请按新卡重新选择。\n\n")
             return
@@ -409,7 +404,7 @@ class ChatInteractions:
             choice = "allow_once"
         elif command == "/拒绝":
             choice = "deny"
-        fingerprint = snapshot[0] if snapshot is not None else item.context.get("displayed_to", {}).get(owner[:2])
+        fingerprint = snapshot[0] if snapshot is not None else item.context.get("displayed_to", {}).get(self.target(owner))
         if choice is None or not fingerprint:
             await self.display_approval(owner, item, msg_id)
             return
@@ -430,6 +425,7 @@ class ChatInteractions:
                 await self.display_approval(owner, item, msg_id, prefix=text.splitlines()[0] + "\n\n")
 
     def credential_candidates(self, owner, session_id):
+        owner = self.adapter.interaction_owner(*owner[:3])
         return [item for item in list(self.manager.items.values())
                 if item.kind == "credential" and not item.terminal
                 and item.owner in (None, owner)
@@ -440,6 +436,7 @@ class ChatInteractions:
         return is_admin and (owner[0] == "private" or self.adapter.config.credentials_in_place)
 
     async def start_credential(self, item, owner, content, msg_id, is_admin, session_id, lifetime=None):
+        owner = self.adapter.interaction_owner(*owner[:3])
         if not self.can_fill_credential(owner, is_admin):
             text = "仅管理员可以填写凭证。" if not is_admin else "请私聊填写此凭证。"
             await self.reply(owner, text, msg_id)
@@ -473,6 +470,7 @@ class ChatInteractions:
             await self.reply(owner, self.credential_prompt(item), msg_id, item=item)
 
     async def handle_credential(self, owner, command, args, current, session_id, msg_id, is_admin):
+        owner = self.adapter.interaction_owner(*owner[:3])
         if not self.can_fill_credential(owner, is_admin):
             await self.reply(owner, "仅管理员可以填写凭证。" if not is_admin else "请私聊填写此凭证。", msg_id)
             return

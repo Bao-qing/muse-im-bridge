@@ -23,7 +23,7 @@ from ..core.deduplicator import MessageDeduplicator
 from ..core.message import DeliveryReference, chunk_text
 from ..core.references import MessageReferenceStore
 from ..core.session_map import SessionMapper
-from ..core.state_file import ensure_parent
+from ..core.state_file import atomic_json_write
 from ..muse.client.errors import ConnectionLost, HandshakeError, MuseError, RPCError, SubscribeError, LoginRequired, is_runtime_auth_error
 from ..muse.client.push import PushTurnTracker
 from ..muse.client.render import (
@@ -175,13 +175,13 @@ class OutboundDispatcher:
         self.route_manager = route_manager
         self._on_login_required = on_login_required
         self.session_mapper = session_mapper or SessionMapper()
-        identity = getattr(config, "app_id", None) or getattr(config, "base_url", "")
         self._reference_state_file = str(config.routes_file) + ".references.local.json" if config.routes_file else None
-        self._reference_identity = f"{self.platform}:{identity}"
+        self._reference_identity = self.reference_identity()
         self.reference_store = MessageReferenceStore(
             state_file=None if self.platform == "onebot" else self._reference_state_file,
             identity=self._reference_identity)
         self._reference_account = None
+        self.muse_service.interactions.register_namespace(self.platform, self.account_identity(), owner=self)
 
         self._running = False
         self._login_alerted: bool = False
@@ -197,6 +197,31 @@ class OutboundDispatcher:
         self._pending_subscribe: Set[str] = set()     # sessions that need /聊天/subscribe opened
         self._uncreated_sessions: Set[str] = set()    # lazy sessions (404 until first message is posted)
         self._load_state()
+
+    def reference_identity(self) -> str:
+        """Persistent reference identity; retain legacy QQ/OneBot format."""
+        identity = getattr(self.config, "app_id", None) or getattr(self.config, "base_url", "")
+        return f"{self.platform}:{identity}"
+
+    def account_identity(self) -> str:
+        if self.platform == "onebot":
+            return str(self._reference_account or getattr(self.config, "base_url", ""))
+        return str(getattr(self.config, "app_id", ""))
+
+    def interaction_target(self, kind, target):
+        return (kind, target, self.platform, self.account_identity())
+
+    def render_credential_hint(self, credential):
+        if credential.context.get("auth_providers") or credential.context.get("grant_request_type"):
+            return "请在 Muse 网页完成此登录。"
+        if not self.config.credentials_in_place:
+            return "请管理员私聊填写。"
+        kind = credential_input_kind(credential.context)
+        if kind == "code":
+            return "管理员可引用此消息，发送验证码。"
+        if kind == "secret":
+            return f"管理员可引用此消息，发送{credential_secret_label(credential.context)}（支持整段多行内容，无需填写账号）。"
+        return "管理员可引用此消息，第一行发送账号，后续内容发送密码或密钥（支持多行）。"
 
     def track_session(self, session_id: str, fresh: bool = False) -> None:
         """Called by the adapter right after creating or posting into ``session_id``.
@@ -232,27 +257,14 @@ class OutboundDispatcher:
         state_file = self.config.push_state_file
         if not state_file:
             return
-        tmp = f"{state_file}.tmp.{os.getpid()}"
         try:
-            ensure_parent(state_file)
-            with open(tmp, "w", encoding="utf-8") as f:
-                json.dump(
-                    {
-                        "last_seq": self._last_seq,
-                        "seen_ids": list(self._seen_ids)[-2000:],
-                        "updated_ts": time.time(),
-                    },
-                    f,
-                    ensure_ascii=False,
-                    indent=2,
-                )
-            os.replace(tmp, state_file)
-        except Exception:
-            if os.path.exists(tmp):
-                try:
-                    os.unlink(tmp)
-                except Exception:
-                    pass
+            atomic_json_write(state_file, {
+                "last_seq": self._last_seq,
+                "seen_ids": list(self._seen_ids)[-2000:],
+                "updated_ts": time.time(),
+            })
+        except Exception as exc:
+            logger.warning("Outbound state write failed: %s", safe_error(exc))
 
     async def start(self) -> None:
         self._running = True
@@ -721,6 +733,23 @@ class OutboundDispatcher:
                 return owners[0]
         return "private", ""
 
+    def resolve_delivery_target(self, session_id, last_user_mid, root_exec_id):
+        """Return (kind, real target ID, passive route, delivery purpose)."""
+        owners = self.session_mapper.owners(session_id) if session_id else []
+        route = self.route_manager.match_route(last_user_mid, root_exec_id)
+        if route and session_id and (route.target_type, route.target_id) not in owners:
+            route = None
+        if session_id and not owners:
+            return "private", "", None, None
+        if route:
+            return route.target_type, route.target_id, route, None
+        target_type, target_id = self._proactive_target(session_id)
+        if target_type == "group":
+            fallback = self.route_manager.get_latest_for_target("group", target_id, max_age_s=280.0)
+            if fallback and fallback.msg_id:
+                route = fallback
+        return target_type, target_id, route, None
+
     async def notify_interaction(self, item, text):
         # Unbound sessions must not emit cards, including admin copies.
         if not self.session_mapper.owners(item.session_id):
@@ -747,17 +776,18 @@ class OutboundDispatcher:
                 return delivered
             if not target_id:
                 continue
-            if (item.kind == "approval" and item.context.get("displayed_to", {}).get((target_type, target_id))
+            if (item.kind == "approval" and item.context.get("displayed_to", {}).get(self.interaction_target(target_type, target_id))
                     == item.context.get("fingerprint")):
                 delivered = True  # This chat already shows the current card.
                 continue
             route = self.route_manager.get_latest_for_target(target_type, target_id, max_age_s=280.0)
             snapshot = protocol.display_snapshot(item) if item.kind == "approval" else None
-            delivery = (DeliveryReference(item.session_id, "", approval_binding=(item, snapshot))
-                        if snapshot is not None else None)
+            delivery = DeliveryReference(item.session_id, "",
+                approval_binding=(item, snapshot) if snapshot is not None else None,
+                purpose="notification")
             ok = await self._deliver(target_type, target_id, text, [], [], [], route=route, delivery=delivery)
             if ok and snapshot is not None:
-                protocol.mark_displayed(item, (target_type, target_id), snapshot)
+                protocol.mark_displayed(item, self.interaction_target(target_type, target_id), snapshot)
             delivered = bool(ok) or delivered
         return delivered
 
@@ -839,16 +869,7 @@ class OutboundDispatcher:
                 # Non-media presentation cards (browser tasks, credentials vaults, image options, etc.)
                 credential = self.muse_service.interaction_protocol.register_credential(event, session_id) if session_id else None
                 if credential and not credential.terminal:
-                    if credential.context.get("auth_providers") or credential.context.get("grant_request_type"):
-                        hint = "请在 Muse 网页完成此登录。"
-                    elif not self.config.credentials_in_place:
-                        hint = "请管理员私聊填写。"
-                    elif credential_input_kind(credential.context) == "code":
-                        hint = "管理员可引用此消息，发送验证码。"
-                    elif credential_input_kind(credential.context) == "secret":
-                        hint = f"管理员可引用此消息，发送{credential_secret_label(credential.context)}（支持整段多行内容，无需填写账号）。"
-                    else:
-                        hint = "管理员可引用此消息，第一行发送账号，后续内容发送密码或密钥（支持多行）。"
+                    hint = self.render_credential_hint(credential)
                     clean_text = chr(10).join((
                         f"【凭证 {credential.id}】{credential.context['page_url']}",
                         hint, f"也可发送 \n/凭证 {credential.id} [保存/一次] [凭证]"))
@@ -872,31 +893,12 @@ class OutboundDispatcher:
             if not clean_text and not images and not files and not videos:
                 continue
 
-            # Route resolution: "回给谁？"
             meta = payload.get("metadata") or {}
             root_exec_id = meta.get("root_message_execution_id")
-
-            route = self.route_manager.match_route(last_user_mid, root_exec_id)
-            if route and session_id and (route.target_type, route.target_id) not in self.session_mapper.owners(session_id):
-                route = None
-            if session_id and not self.session_mapper.owners(session_id):
-                return
-            if route:
-                target_type = route.target_type
-                target_id = route.target_id
-                reply_msg_id = route.msg_id
-                route_type = "interactive_reply"
-            else:
-                # Proactive push: the chat bound to the session, else the admin
-                target_type, target_id = self._proactive_target(session_id)
-                route_type = "proactive_push"
-                reply_msg_id = None
-                # If target is a group, try to use a recent passive route within 5-min TTL
-                if target_type == "group":
-                    fallback_route = self.route_manager.get_latest_for_target("group", target_id, max_age_s=280.0)
-                    if fallback_route and fallback_route.msg_id:
-                        route = fallback_route
-                        reply_msg_id = route.msg_id
+            target_type, target_id, route, purpose = self.resolve_delivery_target(
+                session_id, last_user_mid, root_exec_id)
+            reply_msg_id = route.msg_id if route else None
+            route_type = "interactive_reply" if route and purpose != "proactive" else "proactive_push"
 
             if not target_id:
                 reason = ("no admin is configured" if self.config.unbound_push_to_admin
@@ -922,7 +924,7 @@ class OutboundDispatcher:
                         session_id or "", mid, clean_text[:240],
                         self._event_reply_id(event),
                         {"type": "presentation", "presentation_event_id": payload.get("presentation_id") or mid}
-                        if event_name == "delta.presentation" else None),
+                        if event_name == "delta.presentation" else None, purpose=purpose),
                 )
                 if success:
                     self.deduplicator.mark_delivered([mid])
@@ -1041,7 +1043,7 @@ class OutboundDispatcher:
         try:
             success = await self._deliver(
                 target_type, target_id, text, [], [], [],
-                delivery=DeliveryReference(session_id, mid, "", mid, plain_text=True))
+                delivery=DeliveryReference(session_id, mid, "", mid, plain_text=True, purpose="notification"))
             if success:
                 self.reference_store.set_reaction_state(session_id, mid, max(seq, prev_seq), emojis)
         except Exception as exc:
@@ -1052,6 +1054,7 @@ class OutboundDispatcher:
         if self.platform != "onebot" or not account_id or self._reference_account == str(account_id):
             return
         self._reference_account = str(account_id)
+        self.muse_service.interactions.register_namespace(self.platform, self.account_identity(), owner=self)
         self.reference_store = MessageReferenceStore(
             self._reference_state_file, self._reference_identity + ":" + self._reference_account)
 
@@ -1074,7 +1077,9 @@ class OutboundDispatcher:
         if delivery.approval_binding is not None:
             item, snapshot = delivery.approval_binding
             self.muse_service.interaction_protocol.remember_approval_message(
-                (target_type, target_id), body, [item], [snapshot])
+                self.interaction_target(target_type, target_id), body, [item], [snapshot])
+            return
+        if not delivery.muse_id:
             return
         info = body.get("ext_info") or {}
         refs = [("id", body.get("id") or body.get("message_id"))]

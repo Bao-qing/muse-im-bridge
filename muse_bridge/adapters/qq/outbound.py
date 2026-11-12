@@ -117,7 +117,8 @@ class QQOutboundPusher(OutboundDispatcher):
             self.remember_delivery(delivery, delivered_type, delivered_id, body)
             if credential is not None:
                 self.muse_service.interactions.remember_credential_message(
-                    delivered_type, delivered_id, body, credential)
+                    delivered_type, delivered_id, body, credential,
+                    target=self.interaction_target(delivered_type, delivered_id))
             return True
 
         # Reaction notifications use text; ordinary replies retain Markdown.

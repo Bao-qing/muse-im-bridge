@@ -10,12 +10,22 @@ import time
 from typing import Any, Optional
 
 
+def interaction_owner(kind, target, user, platform="", account=""):
+    """Keep legacy chat/user positions; append a platform/account namespace."""
+    return (kind, target, user, str(platform), str(account)) if platform else (kind, target, user)
+
+
+def interaction_target(owner):
+    """Extract a target from either a legacy or namespaced owner tuple."""
+    return (*owner[:2], *owner[3:])
+
+
 @dataclasses.dataclass
 class Interaction:
     id: str
     kind: str
     state: str
-    owner: Optional[tuple[str, str, str]] = None
+    owner: Optional[tuple[str, ...]] = None
     session_id: str = ""
     remote_id: str = ""
     expires_at: float = 0
@@ -36,38 +46,62 @@ class InteractionManager:
 
     def __init__(self):
         self.items: dict[str, Interaction] = {}
-        self.focus: dict[tuple[str, str, str], str] = {}
+        self.focus: dict[tuple[str, ...], str] = {}
         self._remote: dict[tuple[str, str], str] = {}
-        self._locks: dict[tuple[str, str, str], asyncio.Lock] = {}
+        self._locks: dict[tuple[str, ...], asyncio.Lock] = {}
         self._guard = threading.RLock()
         self.managed_sessions: set[str] = set()
         self.approvals_ready = False
-        self.credential_messages: dict[tuple[str, str, str, str], str] = {}
+        self.credential_messages: dict[tuple, str] = {}
+        self._namespaces: dict[object, tuple[str, str]] = {}
 
-    def remember_credential_message(self, target_type, target_id, body, item):
+    def register_namespace(self, platform, account, *, owner=None):
+        namespace = (str(platform), str(account))
+        self._namespaces[owner if owner is not None else namespace] = namespace
+
+    def target_key(self, target):
+        if len(target) > 2:
+            return tuple(target)
+        namespace = ()
+        # Legacy callers remain usable with one gateway, but never guess an
+        # account in a shared service. Explicit keys always stay isolated.
+        namespaces = set(self._namespaces.values())
+        if not namespace and len(namespaces) == 1:
+            namespace = next(iter(namespaces))
+        return (*target, *namespace)
+
+    def owner_key(self, owner):
+        target = self.target_key(interaction_target(owner))
+        return (*owner[:3], *target[2:])
+
+    def remember_credential_message(self, target_type, target_id, body, item, *, target=None):
         if not isinstance(body, dict) or item.kind != "credential":
             return
         info = body.get("ext_info") or {}
         references = {"id": body.get("id"),
                       "ref": info.get("ref_idx") if isinstance(info, dict) else None}
+        target = self.target_key(target or (target_type, target_id))
         with self._guard:
             for kind, value in references.items():
                 if isinstance(value, str) and value:
-                    self.credential_messages[(target_type, target_id, kind, value)] = item.id
+                    self.credential_messages[(*target, kind, value)] = item.id
             while len(self.credential_messages) > 4096:
                 self.credential_messages.pop(next(iter(self.credential_messages)))
 
-    def referenced_credential(self, target_type, target_id, references):
+    def referenced_credential(self, target_type, target_id, references, *, target=None):
+        target = self.target_key(target or (target_type, target_id))
         with self._guard:
-            keys = {self.credential_messages.get((target_type, target_id, kind, value))
+            keys = {self.credential_messages.get((*target, kind, value))
                     for kind, value in references}
             return self.items.get(next(iter(keys))) if len(keys) == 1 and None not in keys else None
 
-    def owner_lock(self, owner: tuple[str, str, str]) -> asyncio.Lock:
-        return self._locks.setdefault(owner, asyncio.Lock())
+    def owner_lock(self, owner: tuple[str, ...]) -> asyncio.Lock:
+        return self._locks.setdefault(self.owner_key(owner), asyncio.Lock())
 
     def add(self, kind: str, *, owner=None, session_id="", remote_id="",
             state="available", ttl=300, context=None) -> Interaction:
+        if owner is not None:
+            owner = self.owner_key(owner)
         with self._guard:
             if remote_id:
                 existing = self.by_remote(kind, remote_id)
@@ -91,7 +125,8 @@ class InteractionManager:
         key = self._remote.get((kind, remote_id))
         return self.items.get(key) if key else None
 
-    def activate(self, item: Interaction, owner: tuple[str, str, str]) -> None:
+    def activate(self, item: Interaction, owner: tuple[str, ...]) -> None:
+        owner = self.owner_key(owner)
         with self._guard:
             current = self.current(owner)
             if current and not current.terminal and current.id != item.id:
@@ -101,9 +136,9 @@ class InteractionManager:
             item.owner = owner
             self.focus[owner] = item.id
 
-    def current(self, owner: tuple[str, str, str]) -> Optional[Interaction]:
+    def current(self, owner: tuple[str, ...]) -> Optional[Interaction]:
         with self._guard:
-            key = self.focus.get(owner)
+            key = self.focus.get(self.owner_key(owner))
             item = self.items.get(key) if key else None
             if item and not item.terminal and item.expires_at and time.time() >= item.expires_at:
                 self.finish(item, "expired")
@@ -123,9 +158,9 @@ class InteractionManager:
             item.context.pop("capture_authorization", None)
             item.state = state
 
-    def release(self, owner: tuple[str, str, str]) -> None:
+    def release(self, owner: tuple[str, ...]) -> None:
         with self._guard:
-            self.focus.pop(owner, None)
+            self.focus.pop(self.owner_key(owner), None)
 
     def pending_approvals(self, session_id: str = "") -> list[Interaction]:
         with self._guard:

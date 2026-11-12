@@ -26,15 +26,15 @@ _REDACTED = "[REDACTED]"
 _LEVELS = {"TRACE": TRACE, "DEBUG": logging.DEBUG, "INFO": logging.INFO,
            "WARNING": logging.WARNING, "ERROR": logging.ERROR,
            "CRITICAL": logging.CRITICAL, "OFF": 100}
-_SECRET = re.compile(r"token|secret|password|passwd|authorization|cookie|csrf|otp|credential|capture_authorization|signature|clientsecret|private_key|file_info", re.I)
+_SECRET = re.compile(r"token|secret|password|passwd|authorization|cookie|csrf|otp|credential|capture_authorization|signature|clientsecret|private_key|file_info|aes_key|aeskey|encrypt_query_param|encrypted_query_param|qrcode|qrcode_img_content|verify_code|upload_param", re.I)
 _BINARY = {"file_data", "data_base64", "base64", "image_base64"}
 _MESSAGE = {"content", "text", "message", "raw_message", "display_text", "markdown", "items"}
-_AUTH_PATH = re.compile(r"/api/auth/|/api/hatch/(?:token|noise-notary-token)|getAppAccessToken|credential|capture|/aymh", re.I)
+_AUTH_PATH = re.compile(r"/api/auth/|/api/hatch/(?:token|noise-notary-token)|getAppAccessToken|credential|capture|/aymh|get_bot_qrcode|get_qrcode_status", re.I)
 _URL = re.compile(r"(?:https?|wss?)://[^\s<>\"']+", re.I)
 _KEY_VALUE = re.compile(
     r"(?i)(?<![A-Za-z0-9_-])"
-    r"([A-Za-z0-9_-]{0,80}(?:token|secret|password|passwd|cookie|authorization|csrf|otp)[A-Za-z0-9_-]{0,80})"
-    r"[\"']?\s*[:=]\s*(?:\"[^\"]*\"|'[^']*'|[^\s,;}]{1,4096})"
+    r"([A-Za-z0-9_-]{0,80}(?:token|secret|password|passwd|cookie|authorization|csrf|otp|aes_key|aeskey|encrypt_query_param|encrypted_query_param|qrcode|qrcode_img_content|verify_code|upload_param)[A-Za-z0-9_-]{0,80})"
+    r"[\"']?\s*[:=]\s*(?:\"[^\"]*\"|'[^']*'|[^\s,;}]+)"
 )
 _context = contextvars.ContextVar("bridge_log_context", default={})
 _run_id = uuid.uuid4().hex
