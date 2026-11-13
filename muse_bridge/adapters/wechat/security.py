@@ -1,16 +1,12 @@
-"""Strict URL policy and DNS-pinned HTTPS transport for iLink.
+"""URL validation and HTTPS transport for iLink.
 
-Authenticated API and CDN requests accept only the pinned 2.4.6 host baseline.
-New regional hosts require independent verification. Unauthenticated external
-media fetches may opt into public HTTPS hosts, still with DNS pinning.
-MockTransport is the sole DNS-free path, for explicitly injected offline tests.
+Authenticated API and CDN requests accept only the pinned 2.4.6 host baseline
+and use normal HTTPS/DNS/proxy resolution.
+MockTransport is the sole URL/transport stub, for explicitly injected offline tests.
 """
 from __future__ import annotations
 
-import asyncio
 import hashlib
-import ipaddress
-import socket
 from urllib.parse import urlsplit
 
 import httpx
@@ -46,13 +42,6 @@ def validate_url(url: str, *, cdn: bool = False, base: bool = False, public: boo
                     parts.hostname, parts.hostname + ":443"
                 }):
             raise ValueError
-        if public:
-            try:
-                literal = ipaddress.ip_address(parts.hostname)
-            except ValueError:
-                literal = None
-            if literal is not None and not _is_public(literal):
-                raise ValueError
         if base and (parts.path not in ("", "/") or parts.query):
             raise ValueError
         # Let HTTPX reject any authority syntax its own parser cannot safely
@@ -77,64 +66,23 @@ def redirect_base(host: str) -> str:
     return validate_url("https://" + host, base=True)
 
 
-def _is_public(address) -> bool:
-    return address.is_global and not address.is_multicast and not address.is_reserved
-
-
-async def resolve_public(host: str) -> str:
-    """Reject the entire DNS answer if any address is not globally routable."""
-    try:
-        records = await asyncio.get_running_loop().getaddrinfo(
-            host, 443, type=socket.SOCK_STREAM, proto=socket.IPPROTO_TCP
-        )
-        addresses = [record[4][0] for record in records]
-        if not addresses or any(not _is_public(ipaddress.ip_address(ip)) for ip in addresses):
-            raise WeChatSecurityError("WeChat DNS returned a non-public address")
-        return addresses[0]
-    except WeChatSecurityError:
-        raise
-    except (OSError, ValueError):
-        raise WeChatSecurityError("WeChat DNS resolution failed") from None
-
-
 class PinnedTransport(httpx.AsyncBaseTransport):
-    """Connect to the checked IP, retaining the real Host and TLS SNI.
-
-    Separate pools per (hostname, IP) prevent connection reuse across TLS names.
-    No proxy, environment override, redirects, TLS downgrade, or HTTP retries.
-    The sni_hostname extension is supported by HTTPX's httpcore 1.x transport.
-    """
+    """Validated HTTPS transport without redirects or HTTP retries."""
 
     def __init__(self, *, public: bool = False) -> None:
         self._public = public
-        self._pools: dict[tuple[str, str], httpx.AsyncHTTPTransport] = {}
+        self._pool: httpx.AsyncHTTPTransport | None = None
 
     async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
-        url = str(request.url)
-        validate_url(url, cdn=request.url.host in CDN_HOSTS, public=self._public)
-        host = request.url.host
-        try:
-            ip = await asyncio.wait_for(
-                resolve_public(host), request.extensions.get("timeout", {}).get("connect", 35)
-            )
-        except TimeoutError:
-            raise httpx.ConnectTimeout("WeChat DNS resolution timed out") from None
-        key = (host, ip)
-        if key not in self._pools:
-            self._pools[key] = httpx.AsyncHTTPTransport(
-                verify=True, trust_env=False, retries=0,
+        validate_url(str(request.url), cdn=request.url.host in CDN_HOSTS, public=self._public)
+        if self._pool is None:
+            self._pool = httpx.AsyncHTTPTransport(
+                verify=True, trust_env=True, retries=0,
                 limits=httpx.Limits(max_connections=8, max_keepalive_connections=2),
             )
-        headers = request.headers.copy()
-        headers["Host"] = host
-        pinned = httpx.Request(
-            request.method, request.url.copy_with(host=ip),
-            headers=headers, stream=request.stream,
-            extensions={**request.extensions, "sni_hostname": host},
-        )
-        return await self._pools[key].handle_async_request(pinned)
+        return await self._pool.handle_async_request(request)
 
     async def aclose(self) -> None:
-        for pool in self._pools.values():
-            await pool.aclose()
-        self._pools.clear()
+        if self._pool is not None:
+            await self._pool.aclose()
+            self._pool = None

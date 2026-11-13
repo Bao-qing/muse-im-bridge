@@ -235,8 +235,8 @@ class ConsoleFixture(unittest.IsolatedAsyncioTestCase):
         self.sender.send.assert_not_awaited()
 
     async def test_failed_download_is_visible_terminal_no_repeat_and_batch_advances(self):
-        self.media.download.side_effect = [RuntimeError("AES-SECRET https://fake.invalid/?token=SECRET"), b"success"]
-        first = event(items=[{"type": 2, "image_item": {}}])
+        self.media.download.side_effect = [RuntimeError("AES-SECRET download failed https://fake.invalid/?token=SECRET"), b"success"]
+        first = event(items=[{"type": 2, "image_item": {"media": {"aes_key": "AES-SECRET"}}}])
         second = event("m2", items=[{"type": 4, "file_item": {"file_name": "ok.txt"}}])
         await self.cli.handle_batch([first, second, first])
         self.assertEqual(self.state.message_status("test-owner", "m1"), "unknown")
@@ -244,6 +244,7 @@ class ConsoleFixture(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.media.download.await_count, 2)
         self.assertIn("附件下载/保存失败", self.text())
         self.assertIn("RuntimeError", self.text())
+        self.assertIn("download failed", self.text())
         self.assertNotIn("AES-SECRET", self.text())
         self.assertNotIn("?token=SECRET", self.text())
         # Same failed message through the gateway is skipped, but the cursor can advance.
@@ -319,11 +320,11 @@ class ConsoleFixture(unittest.IsolatedAsyncioTestCase):
             await asyncio.gather(run, return_exceptions=True)
 
     async def test_save_failure_is_terminal_and_other_media_still_saved(self):
-        with mock.patch.object(console, "save_attachment", side_effect=[PermissionError("SECRET"), self.root / "ok"]):
+        with mock.patch.object(console, "save_attachment", side_effect=[PermissionError("disk write denied SYNTHETIC-BOT-SECRET"), self.root / "ok"]):
             await self.cli.handle_batch([event(items=[{"type": 2, "image_item": {}}, {"type": 4, "file_item": {}}])])
         self.assertEqual(self.media.download.await_count, 2)
-        self.assertIn("PermissionError", self.text())
-        self.assertNotIn("SECRET", self.text())
+        self.assertIn("PermissionError: disk write denied", self.text())
+        self.assertNotIn("SYNTHETIC-BOT-SECRET", self.text())
         self.assertEqual(self.state.message_status("test-owner", "m1"), "unknown")
 
     async def test_crash_marker_and_reloaded_state_skip_download(self):
@@ -351,12 +352,14 @@ class ConsoleFixture(unittest.IsolatedAsyncioTestCase):
             await asyncio.wait_for(started.wait(), 1)
             self.assertEqual(self.state.cursor, "")
             self.assertEqual(self.state.message_status("test-owner", "m1"), "accepted")
-            with mock.patch.object(self.state, "finish_message", side_effect=OSError("SECRET")):
+            with mock.patch.object(self.state, "finish_message", side_effect=OSError("disk full SYNTHETIC-BOT-SECRET")):
                 release.set()
                 await self.wait_for(lambda: self.cli.gateway.phase == "backoff")
             self.assertEqual(self.state.cursor, "")
             self.assertIn("保留游标", self.text())
-            self.assertNotIn("SECRET", self.text())
+            self.assertIn("OSError: disk full", self.text())
+            self.assertIn("Traceback", self.text())
+            self.assertNotIn("SYNTHETIC-BOT-SECRET", self.text())
         finally:
             self.reader.feed("/quit")
             await asyncio.wait_for(run, 1)
@@ -462,7 +465,7 @@ class ConsoleFixture(unittest.IsolatedAsyncioTestCase):
             factory.assert_not_called()
 
     async def test_login_failure_preserves_saved_account_and_closes(self):
-        auth = mock.Mock(login=mock.AsyncMock(side_effect=RuntimeError("SYNTHETIC-BOT-SECRET")))
+        auth = mock.Mock(login=mock.AsyncMock(side_effect=RuntimeError("qr endpoint unreachable SYNTHETIC-BOT-SECRET")))
         reader = QueueInput()
         result = await console.async_main(self.args("--login"), reader=reader, output=self.lines.append,
                                          config_loader=lambda _: self.cfg, client_factory=lambda **_: self.client,
@@ -471,7 +474,31 @@ class ConsoleFixture(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.client.closed, 1)
         self.assertEqual(self.state.credentials, ACCOUNT)
         self.assertTrue(reader.closed)
+        self.assertIn("RuntimeError: qr endpoint unreachable", self.text())
+        self.assertIn("Traceback", self.text())
         self.assertNotIn("SYNTHETIC-BOT-SECRET", self.text())
+
+    async def test_poll_and_protocol_debug_errors_surface_real_details(self):
+        debug_client = console.WeChatClient(
+            ACCOUNT["bot_token"], ACCOUNT["baseurl"],
+            transport=httpx.MockTransport(lambda r: httpx.Response(502, json={"ret": 1001, "errmsg": "bad gateway"})),
+            on_debug=lambda msg: self.lines.append(console.display_text(f"[协议调试] {console.safe_text(msg)}", [ACCOUNT["bot_token"]])),
+        )
+        self.addAsyncCleanup(debug_client.aclose)
+        cli = console.WeChatConsole(self.cfg, self.state, debug_client, self.media, self.sender,
+                                    self.root / "downloads", output=self.lines.append)
+        run = asyncio.create_task(cli.run(self.reader))
+        try:
+            await self.wait_for(lambda: cli.gateway.phase == "backoff")
+        finally:
+            self.reader.feed("/quit")
+            await asyncio.wait_for(run, 1)
+        output = self.text()
+        self.assertIn("[协议调试] API getupdates error: ret=1001, errcode=None, errmsg='bad gateway'", output)
+        self.assertIn("[轮询/处理错误 #1]", output)
+        self.assertIn("WeChatAPIError(code=1001)", output)
+        self.assertIn("Traceback", output)
+        self.assertNotIn("SYNTHETIC-BOT-SECRET", output)
 
     async def test_real_sender_client_and_media_with_mock_transport(self):
         requests = []

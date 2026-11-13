@@ -28,6 +28,7 @@ import stat
 import sys
 import threading
 import time
+import traceback
 import unicodedata
 
 # Support the requested direct-script invocation without tests/__init__.py.
@@ -35,6 +36,7 @@ if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from muse_bridge.config import ConfigLoader
+from muse_bridge.observability import safe_text
 from muse_bridge.adapters.wechat.adapter import parse_event
 from muse_bridge.adapters.wechat.auth import WeChatAuth
 from muse_bridge.adapters.wechat.cli import display_qr, verify_code
@@ -77,13 +79,23 @@ def display_text(value, private=()):
 
 
 def error_summary(exc):
-    # str(exc), repr(exc) and traceback locals can contain tokens/keys/URLs.
-    parts = [type(exc).__name__]
-    for key in ("code", "errno"):
-        value = getattr(exc, key, None)
-        if type(value) is int:
-            parts.append(f"{key}={value}")
-    return ", ".join(parts)
+    chain = []
+    seen = set()
+    current = exc
+    while current is not None and id(current) not in seen and len(chain) < 5:
+        seen.add(id(current))
+        meta = []
+        for key in ("code", "errno"):
+            value = getattr(current, key, None)
+            if type(value) is int:
+                meta.append(f"{key}={value}")
+        header = f"{type(current).__name__}({', '.join(meta)})" if meta else type(current).__name__
+        message = safe_text(str(current)).strip()
+        chain.append(f"{header}: {message}" if message else header)
+        current = current.__cause__ if current.__cause__ is not None else (
+            None if current.__suppress_context__ else current.__context__
+        )
+    return " <- ".join(chain)
 
 
 def valid_id(value):
@@ -269,13 +281,16 @@ class ConsoleInput:
 
 
 class PollWarnings(logging.Handler):
-    def __init__(self, emit):
+    def __init__(self, emit, *, skip_gateway_poll_warning=True):
         super().__init__(logging.WARNING)
         self.emit_line = emit
+        self.skip_gateway_poll_warning = skip_gateway_poll_warning
 
     def emit(self, record):
-        # Do not render arbitrary LogRecord args, exceptions or remote payloads.
-        self.emit_line("[轮询/处理错误] 保留游标并退避重试；敏感错误详情已隐藏。可用 /status 检查。")
+        message = safe_text(record.getMessage())
+        if self.skip_gateway_poll_warning and message.startswith("WeChat polling/intake failed:"):
+            return
+        self.emit_line(f"[微信日志:{record.levelname}] {record.name}: {message}")
 
 
 class WeChatConsole:
@@ -289,7 +304,15 @@ class WeChatConsole:
         self.output = output
         self._private = [(state.credentials or {}).get("bot_token"), config.route_tag]
         self.peers = {}
-        self.gateway = WeChatGateway(client, state, self.handle_batch, config.polling_timeout_ms)
+        self.gateway = WeChatGateway(client, state, self.handle_batch, config.polling_timeout_ms,
+                                     on_error=self._on_poll_error)
+
+    def _on_poll_error(self, exc, failures):
+        delay = 30 if failures >= 3 else 2
+        self.emit(f"[轮询/处理错误 #{failures}] 保留游标，{delay}s 后重试: {error_summary(exc)}")
+        tb = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__)).rstrip()
+        if tb:
+            self.emit(safe_text(tb))
 
     def emit(self, text, private=()):
         self.output(display_text(text, (*self._private, *private)))
@@ -303,7 +326,14 @@ class WeChatConsole:
         for event in events:
             incoming = parse_incoming(event, self.state.bot_id)
             if incoming is None:
-                self.emit("[忽略] 非私聊、无效消息或其他账号事件（不显示原始内容）。")
+                if isinstance(event, dict):
+                    self.emit(
+                        f"[忽略] 非私聊/无效/非本号事件: message_type={event.get('message_type')!r} "
+                        f"from={event.get('from_user_id')!r} to={event.get('to_user_id')!r} "
+                        f"group_id={event.get('group_id')!r} message_id={event.get('message_id')!r}"
+                    )
+                else:
+                    self.emit(f"[忽略] 非字典事件: type={type(event).__name__}")
                 continue
             user, mid = incoming.sender, incoming.message_id
             if self.state.message_status(user, mid) is not None:
@@ -422,7 +452,7 @@ class WeChatConsole:
         self.emit(f"[控制台] bot_id={self.state.bot_id} user_id={self.target or '[等待收到消息]'}")
         self.emit(HELP)
         warnings = PollWarnings(self.emit)
-        logger = logging.getLogger("muse_bridge.adapters.wechat.gateway")
+        logger = logging.getLogger("muse_bridge.adapters.wechat")
         logger.addHandler(warnings)
         poll = asyncio.create_task(self.gateway.start(), name="wechat-cli-poll")
         inputs = asyncio.create_task(commands(), name="wechat-cli-commands")
@@ -454,12 +484,16 @@ async def select_account(config, state, reader, *, login=False, output=output_li
                 break
             else:
                 output("请选择 1、2 或 0。")
-    client = (client_factory or WeChatClient)(channel_version=config.channel_version,
-                                            route_tag=config.route_tag, timeout=config.http_timeout_s)
+    client = (client_factory or WeChatClient)(
+        channel_version=config.channel_version, route_tag=config.route_tag,
+        timeout=config.http_timeout_s,
+        on_debug=lambda msg: output(display_text(f"[协议调试] {safe_text(msg)}", [config.route_tag])))
     try:
         credentials = await (auth_factory or WeChatAuth)(client).login(
             state.accounts(), display=display or display_qr, verify=reader.verify,
-            on_status=lambda *_: output("微信登录状态已更新，请按微信提示继续（不显示凭据）。"))
+            on_status=lambda status, *_: output(display_text(
+                f"[登录状态] {status if isinstance(status, str) else '(非文本状态)'}",
+                [config.route_tag])))
         state.save_account(credentials)
     finally:
         await client.aclose()
@@ -481,11 +515,15 @@ async def async_main(args, *, reader=None, output=output_line, config_loader=Non
                      state_factory=None, client_factory=None, auth_factory=None):
     reader = reader if reader is not None else ConsoleInput(output)
     client = None
+    private = []
     try:
         output("警告：不要和真实桥接进程或另一控制台同时运行同一微信账号，否则会争抢长轮询/游标。")
         output("这里只测试微信协议，不连接 Muse；共享账号state/游标，已消费消息不会再进入 Muse。")
         config = (config_loader or ConfigLoader.load_wechat)(args.config)
+        private.append(config.route_tag)
         state = (state_factory or WeChatState)(config.state_dir)
+        if state.credentials:
+            private.append(state.credentials.get("bot_token"))
         if args.to and not valid_id(args.to):
             raise ValueError("Invalid recipient")
         if not await select_account(config, state, reader, login=args.login, output=output,
@@ -493,10 +531,12 @@ async def async_main(args, *, reader=None, output=output_line, config_loader=Non
             return 0
         state.recover_inputs()
         credentials = state.credentials
+        private.append(credentials.get("bot_token"))
         client = (client_factory or WeChatClient)(
             credentials["bot_token"], credentials["baseurl"], channel_version=config.channel_version,
             route_tag=config.route_tag, timeout=config.http_timeout_s,
-            cooling_until=lambda: state.cooldown_until, on_session_invalid=state.pause)
+            cooling_until=lambda: state.cooldown_until, on_session_invalid=state.pause,
+            on_debug=lambda msg: output(display_text(f"[协议调试] {safe_text(msg)}", private)))
         media = WeChatMedia(client)
         sender = WeChatSender(client, state, config, media)
         console = WeChatConsole(config, state, client, media, sender, args.download_dir,
@@ -504,7 +544,8 @@ async def async_main(args, *, reader=None, output=output_line, config_loader=Non
         await console.run(reader)
         return 0
     except Exception as exc:
-        output(f"[控制台错误] {error_summary(exc)}（敏感详情不显示；请检查配置、状态文件和本地路径）")
+        output(display_text(f"[控制台错误] {error_summary(exc)}", private))
+        output(display_text(safe_text(traceback.format_exc().rstrip()), private))
         return 1
     finally:
         reader.close()
@@ -512,7 +553,7 @@ async def async_main(args, *, reader=None, output=output_line, config_loader=Non
             try:
                 await client.aclose()
             except Exception as exc:
-                output(f"[关闭连接错误] {error_summary(exc)}")
+                output(display_text(f"[关闭连接错误] {error_summary(exc)}", private))
 
 
 def main(argv=None):

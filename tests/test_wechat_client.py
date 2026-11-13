@@ -1,8 +1,6 @@
-"""Offline HTTP, URL-policy and DNS-pinning contracts for iLink."""
-import asyncio
+"""Offline HTTP and URL-policy contracts for iLink."""
 import base64
 import json
-import socket
 import time
 import unittest
 from unittest import mock
@@ -15,7 +13,7 @@ from muse_bridge.adapters.wechat.client import (
 )
 from muse_bridge.adapters.wechat.security import (
     DEFAULT_CDN, PinnedTransport, WeChatSecurityError, redirect_base,
-    resolve_public, validate_url,
+    validate_url,
 )
 
 
@@ -93,6 +91,7 @@ class TestWeChatClient(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("x-wechat-uin", requests[1].headers)
 
     async def test_error_codes_and_secret_free_errors(self):
+        debug_lines = []
         for body, expected in [({"ret": 8}, 8), ({"errcode": 9}, 9),
                                ({"ret": 0, "errcode": 3}, 3),
                                ({"ret": "remote-secret"}, None), ({"ret": False}, None)]:
@@ -102,6 +101,11 @@ class TestWeChatClient(unittest.IsolatedAsyncioTestCase):
                     await client.get_config("user")
                 self.assertEqual(caught.exception.code, expected)
                 self.assertNotIn("remote-secret", repr(caught.exception))
+        debug_client = self.client(lambda r: httpx.Response(503, json={"ret": 8, "errmsg": "gateway busy"}),
+                                   on_debug=debug_lines.append)
+        with self.assertRaises(WeChatAPIError):
+            await debug_client.get_config("user")
+        self.assertTrue(any("errmsg='gateway busy'" in line for line in debug_lines))
 
     async def test_invalid_session_priority_callback_and_cooling(self):
         for body in ({"ret": -14}, {"ret": 7, "errcode": -14}):
@@ -255,39 +259,24 @@ class TestWeChatURLPolicy(unittest.IsolatedAsyncioTestCase):
                 redirect_base(host)
 
     def test_public_url_negative_cases(self):
-        for url in ("http://example.com", "file:///tmp/x", "https://127.0.0.1/x",
-                    "https://192.168.1.2", "https://169.254.169.254", "https://224.0.0.1",
+        for url in ("http://example.com", "file:///tmp/x",
                     "https://user:secret@example.com", "https://example.com:8443/x"):
             with self.subTest(url=url), self.assertRaises(WeChatSecurityError):
                 validate_url(url, public=True)
 
-    async def test_dns_rejects_any_nonpublic_result(self):
-        loop = asyncio.get_running_loop()
-        def records(addresses):
-            return [(socket.AF_INET, socket.SOCK_STREAM, socket.IPPROTO_TCP, "", (ip, 443)) for ip in addresses]
-        for ips in (["127.0.0.1"], ["10.0.0.1"], ["169.254.169.254"], ["::1"],
-                    ["8.8.8.8", "192.168.1.1"], ["224.0.0.1"], []):
-            with mock.patch.object(loop, "getaddrinfo", new=mock.AsyncMock(return_value=records(ips))):
-                with self.assertRaises(WeChatSecurityError):
-                    await resolve_public("ilinkai.weixin.qq.com")
-        with mock.patch.object(loop, "getaddrinfo", new=mock.AsyncMock(return_value=records(["8.8.8.8"]))):
-            self.assertEqual(await resolve_public("ilinkai.weixin.qq.com"), "8.8.8.8")
-
-    async def test_transport_pins_checked_ip_and_preserves_tls_name(self):
+    async def test_transport_validates_url_and_uses_standard_https(self):
         transport = PinnedTransport()
         pool = mock.Mock()
         pool.handle_async_request = mock.AsyncMock(return_value=httpx.Response(200))
         pool.aclose = mock.AsyncMock()
-        with mock.patch("muse_bridge.adapters.wechat.security.resolve_public", new=mock.AsyncMock(return_value="8.8.8.8")), \
-             mock.patch("muse_bridge.adapters.wechat.security.httpx.AsyncHTTPTransport", return_value=pool) as factory:
-            await transport.handle_async_request(httpx.Request("GET", DEFAULT_API + "/path?q=secret"))
-            pinned = pool.handle_async_request.call_args.args[0]
-            self.assertEqual(pinned.url.host, "8.8.8.8")
-            self.assertEqual(pinned.headers["host"], "ilinkai.weixin.qq.com")
-            self.assertEqual(pinned.extensions["sni_hostname"], "ilinkai.weixin.qq.com")
-            self.assertEqual(pinned.url.params["q"], "secret")
+        with mock.patch("muse_bridge.adapters.wechat.security.httpx.AsyncHTTPTransport", return_value=pool) as factory:
+            req = httpx.Request("GET", DEFAULT_API + "/path?q=secret")
+            await transport.handle_async_request(req)
+            sent = pool.handle_async_request.call_args.args[0]
+            self.assertEqual(sent.url.host, "ilinkai.weixin.qq.com")
+            self.assertEqual(sent.url.params["q"], "secret")
             self.assertTrue(factory.call_args.kwargs["verify"])
-            self.assertFalse(factory.call_args.kwargs["trust_env"])
+            self.assertTrue(factory.call_args.kwargs["trust_env"])
             await transport.aclose()
         pool.aclose.assert_awaited_once()
 

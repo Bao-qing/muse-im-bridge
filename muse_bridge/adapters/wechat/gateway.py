@@ -11,9 +11,10 @@ logger = get_logger(__name__)
 
 
 class WeChatGateway:
-    def __init__(self, client, state, on_batch, timeout_ms=35000):
+    def __init__(self, client, state, on_batch, timeout_ms=35000, on_error=None):
         self.client, self.state, self.on_batch = client, state, on_batch
         self.timeout_ms = timeout_ms
+        self.on_error = on_error
         self._stop = asyncio.Event()
         self._task = None
         self._running = False
@@ -70,6 +71,11 @@ class WeChatGateway:
                     failures += 1
                     self.phase = "backoff"
                     logger.warning("WeChat polling/intake failed: %s", safe_error(exc))
+                    if self.on_error is not None:
+                        try:
+                            self.on_error(exc, failures)
+                        except Exception:
+                            pass
                     await self._wait(30 if failures >= 3 else 2)
         finally:
             self._running = False

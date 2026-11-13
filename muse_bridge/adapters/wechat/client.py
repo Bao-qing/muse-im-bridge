@@ -51,6 +51,7 @@ class WeChatClient:
         channel_version: str = "2.4.6", route_tag: str = "", transport=None,
         cooling_until: Callable[[], float] | None = None,
         on_session_invalid: Callable[[], None] | None = None, timeout: float = 35,
+        on_debug: Callable[[str], None] | None = None,
     ) -> None:
         self.base_url = validate_url(base_url, base=True)
         try:
@@ -71,6 +72,7 @@ class WeChatClient:
         self._route_tag = route_tag
         self._cooling_until = cooling_until
         self._on_session_invalid = on_session_invalid
+        self._on_debug = on_debug
         self._invalid_until = 0.0
         self._timeout = timeout
         # MockTransport skips real DNS only; the URL policy still applies.
@@ -102,9 +104,20 @@ class WeChatClient:
         ):
             raise SessionCoolingError()
 
-    def _check_result(self, result: dict, *, sending: bool = False) -> None:
+    def _debug(self, message: str) -> None:
+        if self._on_debug is not None:
+            try:
+                self._on_debug(message)
+            except Exception:
+                pass
+
+    def _check_result(self, result: dict, *, sending: bool = False, endpoint: str = "") -> None:
         codes = [result[k] for k in ("ret", "errcode") if k in result]
         if any(type(code) is int and code == -14 for code in codes):
+            self._debug(
+                f"API {endpoint} session invalid: ret={result.get('ret')!r}, "
+                f"errcode={result.get('errcode')!r}, errmsg={result.get('errmsg')!r}"
+            )
             # Establish an account-wide in-process guard BEFORE persistence.
             # Even if state.pause cannot write, this client stays quiet an hour.
             self._invalid_until = max(self._invalid_until, time.time() + 3600)
@@ -118,8 +131,13 @@ class WeChatClient:
             raise SessionCoolingError()
         for code in codes:
             if type(code) is not int or code != 0:
+                self._debug(
+                    f"API {endpoint} error: ret={result.get('ret')!r}, "
+                    f"errcode={result.get('errcode')!r}, errmsg={result.get('errmsg')!r}"
+                )
                 raise WeChatAPIError(code)
         if sending and (type(result.get("ret")) is not int or result["ret"] != 0):
+            self._debug(f"API {endpoint} unexpected send response: keys={list(result.keys())!r}")
             raise DeliveryUnknownError()
 
     @staticmethod
@@ -181,20 +199,23 @@ class WeChatClient:
             try:
                 result = json.loads(data)
             except (ValueError, UnicodeError):
+                self._debug(f"HTTP {method} {endpoint} invalid JSON: status={response.status_code}, bytes={len(data)}")
                 if sending:
                     raise DeliveryUnknownError() from None
                 raise WeChatError("Invalid WeChat JSON response") from None
             if not isinstance(result, dict):
+                self._debug(f"HTTP {method} {endpoint} non-object JSON: status={response.status_code}, type={type(result).__name__}")
                 if sending:
                     raise DeliveryUnknownError()
                 raise WeChatError("Invalid WeChat response shape")
             # Some gateways return structured API errors with non-2xx status.
             # A -14 still invalidates the session and must reach the callback.
-            self._check_result(result, sending=sending and 200 <= response.status_code < 300)
+            self._check_result(result, sending=sending and 200 <= response.status_code < 300, endpoint=endpoint)
             if not 200 <= response.status_code < 300:
+                self._debug(f"HTTP {method} {endpoint} status={response.status_code}")
                 if sending:
                     raise DeliveryUnknownError()
-                raise WeChatError("WeChat HTTP request failed")
+                raise WeChatError(f"WeChat HTTP request failed (status={response.status_code})")
             return result
         except httpx.ReadTimeout:
             if sending:
@@ -204,10 +225,17 @@ class WeChatClient:
             if endpoint == "get_qrcode_status":
                 return {"status": "wait"}
             raise WeChatError("WeChat request timed out") from None
-        except httpx.TransportError:
+        except httpx.TransportError as exc:
+            cause = exc.__cause__
+            detail = type(exc).__name__
+            if cause is not None:
+                detail += f" -> {type(cause).__name__}"
+                if getattr(cause, "errno", None) is not None:
+                    detail += f"(errno={cause.errno})"
+            self._debug(f"HTTP {method} {endpoint} transport error: {detail}: {exc}")
             if sending:
                 raise DeliveryUnknownError() from None
-            raise WeChatError("WeChat transport request failed") from None
+            raise WeChatError(f"WeChat transport request failed ({detail})") from None
         finally:
             if response is not None:
                 await self._close_response(response)
@@ -274,10 +302,18 @@ class WeChatClient:
             transport = self._public_transport if public else self._cdn_transport
             response = await transport.handle_async_request(request)
             if not 200 <= response.status_code < 300:
-                raise WeChatError("WeChat media download failed")
+                self._debug(f"CDN download failed: host={request.url.host} status={response.status_code}")
+                raise WeChatError(f"WeChat media download failed (status={response.status_code})")
             return await self._read_limited(response, max_bytes)
-        except httpx.TransportError:
-            raise WeChatError("WeChat CDN download transport failed") from None
+        except httpx.TransportError as exc:
+            cause = exc.__cause__
+            detail = type(exc).__name__
+            if cause is not None:
+                detail += f" -> {type(cause).__name__}"
+                if getattr(cause, "errno", None) is not None:
+                    detail += f"(errno={cause.errno})"
+            self._debug(f"CDN download transport error: host={request.url.host} {detail}: {exc}")
+            raise WeChatError(f"WeChat CDN download transport failed ({detail})") from None
         finally:
             if response is not None:
                 await self._close_response(response)
@@ -293,12 +329,21 @@ class WeChatClient:
             }, extensions={"timeout": httpx.Timeout(self._timeout).as_dict()})
             response = await self._cdn_transport.handle_async_request(request)
             if not 200 <= response.status_code < 300:
-                raise WeChatError("WeChat CDN upload failed")
+                self._debug(f"CDN upload failed: host={request.url.host} status={response.status_code}")
+                raise WeChatError(f"WeChat CDN upload failed (status={response.status_code})")
             param = response.headers.get("x-encrypted-param")
             if not param:
+                self._debug(f"CDN upload omitted x-encrypted-param: host={request.url.host} status={response.status_code}")
                 raise WeChatError("WeChat CDN upload omitted encrypted parameter")
             return param
-        except httpx.TransportError:
+        except httpx.TransportError as exc:
+            cause = exc.__cause__
+            detail = type(exc).__name__
+            if cause is not None:
+                detail += f" -> {type(cause).__name__}"
+                if getattr(cause, "errno", None) is not None:
+                    detail += f"(errno={cause.errno})"
+            self._debug(f"CDN upload transport error: host={request.url.host} {detail}: {exc}")
             raise DeliveryUnknownError() from None
         finally:
             if response is not None:
