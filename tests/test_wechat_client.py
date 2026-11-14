@@ -166,7 +166,10 @@ class TestWeChatClient(unittest.IsolatedAsyncioTestCase):
             await client.get_config("user")
         self.assertNotIn("secret", repr(caught.exception))
 
-    async def test_send_unknown_never_retries(self):
+    async def test_send_accepts_empty_ok_and_unknown_never_retries(self):
+        for body in ({}, {"ret": 0}, {"errmsg": ""}):
+            client = self.client(lambda r, b=body: httpx.Response(200, json=b))
+            self.assertEqual(await client.send_message({}), body)
         for exception in (httpx.ReadTimeout, httpx.WriteTimeout, httpx.ConnectTimeout, httpx.ReadError):
             calls = []
             def handler(request):
@@ -176,9 +179,9 @@ class TestWeChatClient(unittest.IsolatedAsyncioTestCase):
             with self.assertRaises(DeliveryUnknownError):
                 await client.send_message({})
             self.assertEqual(len(calls), 1)
-        for response in (httpx.Response(200, json={}), httpx.Response(200, content=b"secret"),
+        for response in (httpx.Response(502, json={}), httpx.Response(200, content=b"secret"),
                          httpx.Response(502, content=b"secret"), httpx.Response(200, json=[])):
-            client = self.client(lambda r: response)
+            client = self.client(lambda r, resp=response: resp)
             with self.assertRaises(DeliveryUnknownError):
                 await client.send_message({})
 

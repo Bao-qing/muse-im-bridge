@@ -111,7 +111,7 @@ class WeChatClient:
             except Exception:
                 pass
 
-    def _check_result(self, result: dict, *, sending: bool = False, endpoint: str = "") -> None:
+    def _check_result(self, result: dict, *, endpoint: str = "") -> None:
         codes = [result[k] for k in ("ret", "errcode") if k in result]
         if any(type(code) is int and code == -14 for code in codes):
             self._debug(
@@ -136,9 +136,6 @@ class WeChatClient:
                     f"errcode={result.get('errcode')!r}, errmsg={result.get('errmsg')!r}"
                 )
                 raise WeChatAPIError(code)
-        if sending and (type(result.get("ret")) is not int or result["ret"] != 0):
-            self._debug(f"API {endpoint} unexpected send response: keys={list(result.keys())!r}")
-            raise DeliveryUnknownError()
 
     @staticmethod
     async def _read_limited(response: httpx.Response, max_bytes: int) -> bytes:
@@ -210,7 +207,7 @@ class WeChatClient:
                 raise WeChatError("Invalid WeChat response shape")
             # Some gateways return structured API errors with non-2xx status.
             # A -14 still invalidates the session and must reach the callback.
-            self._check_result(result, sending=sending and 200 <= response.status_code < 300, endpoint=endpoint)
+            self._check_result(result, endpoint=endpoint)
             if not 200 <= response.status_code < 300:
                 self._debug(f"HTTP {method} {endpoint} status={response.status_code}")
                 if sending:
