@@ -75,6 +75,7 @@
       "route_tag": "",
       "http_timeout_s": 35,
       "polling_timeout_ms": 35000,
+      "reconnect_max_retries": 30,
       "typing_enabled": false,
       "chunk_chars": 4000,
       "max_chunks": 8,

@@ -141,6 +141,7 @@ class ConversationConfig:
     catch_up_window_s: int = constants.DEFAULT_CATCH_UP_WINDOW_S
     catch_up_max_messages: int = constants.DEFAULT_CATCH_UP_MAX_MESSAGES
     recheck_sleep_s: int = constants.DEFAULT_RECHECK_SLEEP_S
+    reconnect_max_retries: int = constants.DEFAULT_RECONNECT_MAX_RETRIES
     in_flight_ttl_s: int = constants.DEFAULT_IN_FLIGHT_TTL_S
     processing_ttl_s: int = constants.DEFAULT_PROCESSING_TTL_S
 
@@ -163,6 +164,8 @@ class ConversationConfig:
         for name in ("credentials_in_place", "approvals_in_place"):
             if type(getattr(self, name)) is not bool:
                 raise ValueError(f"{self.section}.{name} must be a boolean")
+        if type(self.reconnect_max_retries) is not int or self.reconnect_max_retries < 0:
+            raise ValueError(f"{self.section}.reconnect_max_retries must be a non-negative integer")
 
 
 @dataclasses.dataclass
@@ -565,7 +568,8 @@ class ConfigLoader:
                 routes_file=raw.get("routes_file", defaults["routes_file"]),
                 catch_up_enabled=bool(_get_val(raw, "catch_up_enabled", constants.DEFAULT_CATCH_UP_ENABLED)),
                 **{key: _int(key) for key in (
-                    "catch_up_window_s", "catch_up_max_messages", "recheck_sleep_s", "in_flight_ttl_s",
+                    "catch_up_window_s", "catch_up_max_messages", "recheck_sleep_s",
+                    "reconnect_max_retries", "in_flight_ttl_s",
                     "processing_ttl_s", "chunk_chars", "max_chunks", "max_image_bytes", "max_file_bytes",
                     "max_video_bytes", "max_video_upload_bytes", "file_ref_threshold_bytes",
                     "gateway_dedup_s", "download_timeout_s")},

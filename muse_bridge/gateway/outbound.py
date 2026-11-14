@@ -519,9 +519,11 @@ class OutboundDispatcher:
     async def _run_loop(self) -> None:
         """Pure event-driven loop powered by /聊天/subscribe over persistent Noise WebSocket."""
         loop = asyncio.get_running_loop()
+        reconnect_failures = 0
 
         while self._running:
             if not await asyncio.to_thread(self.muse_service.token_manager.has_credentials):
+                reconnect_failures = 0
                 if not self._login_alerted:
                     self._login_alerted = True
                     logger.warning('Muse 尚未登录或凭据失效，暂停出站监听，触发回落登录...')
@@ -546,6 +548,7 @@ class OutboundDispatcher:
                 # Compatibility fallback if a test mock does not implement `subscribe`
                 if not hasattr(client, "subscribe"):
                     await self._run_legacy_poll_once(client)
+                    reconnect_failures = 0
                     now = time.monotonic()
                     is_hot = any(now < self._hot_until.get(s, 0.0) for s in self.session_mapper.session_ids())
                     sleep_s = 1.0 if is_hot else max(1.0, float(self.config.recheck_sleep_s))
@@ -569,6 +572,7 @@ class OutboundDispatcher:
                         # connection and rebuild only the current bindings.
                         break
                     if not watched:
+                        reconnect_failures = 0
                         await asyncio.sleep(1.0)
                         continue
 
@@ -615,6 +619,7 @@ class OutboundDispatcher:
                             return out
 
                         setup_results = await loop.run_in_executor(None, _setup_sessions, need_setup)
+                        reconnect_failures = 0
                         for sid, hist, is_init, sub_ok in setup_results:
                             if sub_ok:
                                 subscribed_sids.add(sid)
@@ -623,6 +628,7 @@ class OutboundDispatcher:
 
                     if not subscribed_sids:
                         # All watched sessions are lazy/uncreated (waiting for first user message)
+                        reconnect_failures = 0
                         await asyncio.sleep(0.5)
                         continue
 
@@ -685,6 +691,7 @@ class OutboundDispatcher:
                         return synced
 
                     synced_batches = await loop.run_in_executor(None, _read_And_sync_events)
+                    reconnect_failures = 0
                     for sid, hist in synced_batches:
                         await self._hydrate_and_dispatch(sid, hist, is_initial_gate=(sid not in self._gated))
 
@@ -692,6 +699,7 @@ class OutboundDispatcher:
                 break
             except Exception as e:
                 if isinstance(e, LoginRequired):
+                    reconnect_failures = 0
                     if not self._login_alerted:
                         self._login_alerted = True
                         logger.warning('Cookie 会话不可用，等待管理员登录。 error=%s', safe_error(e))
@@ -700,7 +708,22 @@ class OutboundDispatcher:
                     continue
                 if is_runtime_auth_error(e) and client is not None:
                     await asyncio.to_thread(self.muse_service.token_manager.invalidate_mint, client.token, client.notary_token)
-                logger.warning("连接暂不可用，保留 Cookie，3 秒后重连。 error=%s", safe_error(e))
+                reconnect_failures += 1
+                max_retries = self.config.reconnect_max_retries
+                if reconnect_failures > max_retries:
+                    logger.error(
+                        "重新连接失败，连续重连已达上限（%d 次），停止自动重连，保留 Cookie。 error=%s",
+                        max_retries,
+                        safe_error(e),
+                    )
+                    self._running = False
+                    break
+                logger.warning(
+                    "重新连接中，保留 Cookie，3 秒后重试（%d/%d）。 error=%s",
+                    reconnect_failures,
+                    max_retries,
+                    safe_error(e),
+                )
                 await asyncio.sleep(3.0)
                 continue
             finally:

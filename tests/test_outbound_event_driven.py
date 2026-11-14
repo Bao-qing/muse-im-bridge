@@ -469,6 +469,57 @@ class TestOutboundEventDriven(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(fake_client.subscribe.call_count, 1)
         self.assertEqual(fake_client.get_history.call_count, 1)
 
+    async def test_reconnect_stops_after_max_retries(self):
+        from muse_bridge.muse.client.errors import HandshakeError
+
+        pusher, _, service, _ = self._make_pusher(bind_sid="GLOBAL", reconnect_max_retries=2)
+        client = mock.MagicMock()
+        client.connect.side_effect = HandshakeError("gateway handshake failed", status=502)
+        service.create_client.return_value = client
+
+        sleep_calls = []
+
+        async def fake_sleep(delay):
+            sleep_calls.append(delay)
+
+        with mock.patch("muse_bridge.gateway.outbound.asyncio.sleep", side_effect=fake_sleep):
+            await asyncio.wait_for(pusher.start(), timeout=3.0)
+
+        # 1 initial attempt + 2 retries = 3 connection attempts; 2 sleeps of 3s; then stops.
+        self.assertEqual(client.connect.call_count, 3)
+        self.assertEqual(sleep_calls, [3.0, 3.0])
+        self.assertFalse(pusher._running)
+
+    async def test_reconnect_counter_resets_after_healthy_cycle(self):
+        from muse_bridge.muse.client.errors import HandshakeError
+
+        pusher, _, service, _ = self._make_pusher(bind_sid="GLOBAL", reconnect_max_retries=1)
+        failing = mock.MagicMock()
+        failing.connect.side_effect = HandshakeError("gateway handshake failed", status=502)
+
+        healthy = mock.MagicMock()
+        healthy.credentials_current.return_value = True
+        healthy.get_history.return_value = []
+        healthy.read_any_subscription_events.side_effect = [
+            [],
+            HandshakeError("dropped after healthy tick", status=502),
+        ]
+
+        # Sequence: fail -> succeed (resets counter) -> drop (1st retry) -> fail (exceeds 1)
+        service.create_client.side_effect = [failing, healthy, failing]
+
+        sleep_calls = []
+
+        async def fake_sleep(delay):
+            sleep_calls.append(delay)
+
+        with mock.patch("muse_bridge.gateway.outbound.asyncio.sleep", side_effect=fake_sleep):
+            await asyncio.wait_for(pusher.start(), timeout=3.0)
+
+        self.assertEqual(service.create_client.call_count, 3)
+        self.assertEqual(sleep_calls, [3.0, 3.0])
+        self.assertFalse(pusher._running)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -99,6 +99,7 @@ class TestSessionConfig(unittest.TestCase):
         self.assertEqual(cfg.qq.catch_up_window_s, 6 * 3600)
         self.assertEqual(cfg.qq.catch_up_max_messages, 5)
         self.assertEqual(cfg.qq.recheck_sleep_s, 5)
+        self.assertEqual(cfg.qq.reconnect_max_retries, 30)
         self.assertEqual(cfg.qq.in_flight_ttl_s, 300)
         self.assertEqual(cfg.qq.processing_ttl_s, 300)
 
@@ -110,6 +111,7 @@ class TestSessionConfig(unittest.TestCase):
             "catch_up_window_s": 60,
             "catch_up_max_messages": 2,
             "recheck_sleep_s": 7,
+            "reconnect_max_retries": 3,
             "in_flight_ttl_s": 11,
             "processing_ttl_s": 12,
             "session_mode": "global",
@@ -120,7 +122,7 @@ class TestSessionConfig(unittest.TestCase):
         self.assertEqual(q.push_state_file, "p.json")
         self.assertTrue(q.catch_up_enabled)
         self.assertEqual((q.catch_up_window_s, q.catch_up_max_messages), (60, 2))
-        self.assertEqual((q.recheck_sleep_s, q.in_flight_ttl_s, q.processing_ttl_s), (7, 11, 12))
+        self.assertEqual((q.recheck_sleep_s, q.reconnect_max_retries, q.in_flight_ttl_s, q.processing_ttl_s), (7, 3, 11, 12))
         self.assertFalse(hasattr(q, "push"))
         self.assertFalse(hasattr(q, "session_mode"))
 

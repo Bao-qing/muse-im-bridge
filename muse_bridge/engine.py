@@ -62,7 +62,7 @@ class BridgeEngine:
         except Exception as exc:
             cred_ok = False
             login_required = False
-            logger.warning("启动验证暂不可用，保留 Cookie，后台重试。 error=%s", safe_error(exc))
+            logger.warning("正在重新连接中，保留 Cookie，后台重试。 error=%s", safe_error(exc))
         if login_required:
             logger.warning("启动验证：Muse 会话凭据未就绪或已失效，进入登录回落流程。")
             for adapter in self.adapters:

@@ -44,6 +44,7 @@ class TestWeChatConfig(unittest.TestCase):
         self.assertEqual(cfg.chunk_chars, 4000)
         self.assertEqual(cfg.polling_timeout_ms, 35000)
         self.assertEqual(cfg.http_timeout_s, 35)
+        self.assertEqual(cfg.reconnect_max_retries, 30)
         self.assertEqual(AppConfig().wechat, cfg)
         self.assertFalse(REMOVED_POLICY & dataclasses.asdict(cfg).keys())
         for name in REMOVED_POLICY | {"is_admin", "admin_target"}:
