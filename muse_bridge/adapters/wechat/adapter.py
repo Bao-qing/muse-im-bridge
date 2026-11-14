@@ -22,6 +22,32 @@ from .state import WeChatState, WeChatStateError, _id, _text
 logger = get_logger(__name__)
 
 
+def _ref_msg_id(reference):
+    if not isinstance(reference, dict):
+        return None
+    ref_item = reference.get("message_item")
+    if not isinstance(ref_item, dict):
+        return None
+    mid = ref_item.get("msg_id")
+    if type(mid) is int:
+        mid = str(mid)
+    return mid if _id(mid) else None
+
+
+def _ref_fallback_text(reference):
+    if not isinstance(reference, dict):
+        return None
+    title = reference.get("title")
+    if isinstance(title, str) and title:
+        return title
+    ref_item = reference.get("message_item")
+    if isinstance(ref_item, dict):
+        text_item = ref_item.get("text_item")
+        if isinstance(text_item, dict) and isinstance(text_item.get("text"), str) and text_item["text"]:
+            return text_item["text"]
+    return None
+
+
 def parse_event(event, bot_id):
     """Return public message + private media descriptors, never a raw token event."""
     if (not isinstance(event, dict) or type(event.get("message_type")) is not int
@@ -39,20 +65,25 @@ def parse_event(event, bot_id):
     items = event.get("item_list", [])
     if not isinstance(items, list) or len(items) > 64:
         return None
-    texts, attachments, media = [], [], {}
+    texts, attachments, media, references = [], [], {}, []
     for index, item in enumerate(items):
         if not isinstance(item, dict):
             continue
         kind = item.get("type")
         if type(kind) is not int:
             continue
+        reference = item.get("ref_msg")
+        ref_mid = _ref_msg_id(reference)
+        if ref_mid and ("id", ref_mid) not in references:
+            references.append(("id", ref_mid))
         if kind == 1:
             text_item = item.get("text_item") or {}
             text = text_item.get("text") if isinstance(text_item, dict) else None
             if isinstance(text, str):
-                reference = item.get("ref_msg")
-                if isinstance(reference, dict) and isinstance(reference.get("title"), str):
-                    text = "[引用: " + reference["title"][:2000] + "]\n" + text
+                if not ref_mid:
+                    fallback = _ref_fallback_text(reference)
+                    if fallback:
+                        text = "[引用: " + fallback[:2000] + "]\n" + text
                 texts.append(text)
         elif kind in {2, 3, 4, 5}:
             field, att_type = {2: ("image_item", "image"), 3: ("voice_item", "file"),
@@ -74,8 +105,9 @@ def parse_event(event, bot_id):
         return None
     stamp = event.get("create_time_ms", 0)
     stamp = stamp / 1000 if type(stamp) in (int, float) and 0 <= stamp <= 2**63 - 1 else 0
-    message = InboundMessage(str(mid), MessageSource("wechat", "private", user, user, raw_event={}),
-                             text, attachments, stamp)
+    raw_event = {"references": list(references)} if references else {}
+    message = InboundMessage(str(mid), MessageSource("wechat", "private", user, user, raw_event=raw_event),
+                             text, attachments, stamp, references=references)
     return message, media, token
 
 
@@ -120,6 +152,10 @@ class WeChatAdapter(ChatGateway):
         # No recovery POST: even an error response may follow an accepted input.
         return False
 
+    def message_references(self, event):
+        refs = (event or {}).get("references")
+        return list(refs) if isinstance(refs, list) else []
+
     def create_outbound(self):
         return WeChatOutboundPusher(self.config, self.client, self.muse_service, self.deduplicator,
                                    self.route_manager, self.session_mapper,
@@ -136,7 +172,7 @@ class WeChatAdapter(ChatGateway):
             if line.startswith("/登录 "):
                 line = "/登录 [邮箱] — 显式登录 Muse"
             elif line.startswith("/凭证 "):
-                line = "/凭证 [编号] [保存|一次] — 填写凭证"
+                line = "/凭证 [编号] [保存|一次] — 填写凭证，也可引用凭证卡回复"
             lines.append(line)
         return "\n".join(lines)
 
@@ -145,11 +181,12 @@ class WeChatAdapter(ChatGateway):
             raise ValueError("WeChat only supports private chats")
         purpose = "reply" if msg_id else "notification"
         logical_id = f"input:{msg_id}:{hashlib.sha256(text.encode()).hexdigest()}" if msg_id else None
-        ok = await self.sender.send(target_id, self.render_command_output(text), purpose=purpose,
-                                    msg_id=msg_id, logical_id=logical_id)
+        ok, sent_ids = await self.sender.send_messages(
+            target_id, self.render_command_output(text), purpose=purpose,
+            msg_id=msg_id, logical_id=logical_id)
         if not ok:
             raise RuntimeError("WeChat reply was not confirmed; inspect local status")
-        return {}  # ret=0 is not a server message ID or a native quote receipt.
+        return {"id": sent_ids[-1]} if sent_ids else {}
 
     async def download_attachment(self, att, max_bytes):
         entry = self._media_descriptors.get(att.file_info)

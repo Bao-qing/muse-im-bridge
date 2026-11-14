@@ -38,7 +38,7 @@ state_dir/accounts/<sha256(bot_id 的 UTF-8 字节)[:24]>/
 
 - **即时 reply**：接收到一条消息时固定当前上下文快照，命令等即时回复不应因随后收到的新消息而被覆盖。
 - **Muse 异步回复 / proactive**：按 bot + user 查找 latest 上下文，不把异步内容绑定到早先入站的旧 context token。切换账号或用户不得复用别人的上下文。
-- reply/latest 是发送上下文，不等价于原生消息引用。微信通道不保证精确原生引用某条用户消息；不能声称与 QQ message_reference 或 OneBot reply 段完全相同。
+- **入站引用与发送回执**：实测 `sendmessage` 成功后会返回服务端 `message_id`，入站引用消息则在 `item.ref_msg.message_item.msg_id` 携带被引用的 `message_id`。适配器记录发信 `message_id` 并提取入站引用 ID 交给共享网关，用于引用凭证卡、审批卡及转成 Muse 原生 `in_reply_to`。iLink `sendmessage` 本身不渲染出站引用气泡，Muse 发往微信的 `reply_to_id` 在微信出站适配器中丢弃。
 - 不支持群、按钮、编辑或语音发送。审批、凭证等走共享网关文本交互，不凭多行内容自动认领凭证，不要求微信管理员身份。
 
 ## 失效、游标与不确定结果

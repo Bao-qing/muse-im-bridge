@@ -4,6 +4,7 @@ from __future__ import annotations
 import hashlib
 
 from ...gateway.outbound import OutboundDispatcher
+from ...muse.interactions import credential_input_kind, credential_secret_label
 
 
 class WeChatOutboundPusher(OutboundDispatcher):
@@ -32,7 +33,12 @@ class WeChatOutboundPusher(OutboundDispatcher):
     def render_credential_hint(self, item):
         if item.context.get("auth_providers") or item.context.get("grant_request_type"):
             return "请在 Muse 网页完成此登录。"
-        return f"发送 /凭证 {item.id} [保存|一次] [凭证]；微信不支持引用卡片选择凭证。"
+        kind = credential_input_kind(item.context)
+        if kind == "code":
+            return f"可引用此消息发送验证码，或发送 /凭证 {item.id} [保存|一次] 验证码。"
+        if kind == "secret":
+            return f"可引用此消息发送{credential_secret_label(item.context)}（支持多行），或发送 /凭证 {item.id} [保存|一次] 凭证。"
+        return f"可引用此消息发送账号和密码（支持多行），或发送 /凭证 {item.id} [保存|一次] [凭证]。"
 
     async def _send_notice(self, target_id, text):
         if not await self.sender.send(target_id, text, purpose="notification"):
@@ -55,5 +61,16 @@ class WeChatOutboundPusher(OutboundDispatcher):
             binding = getattr(delivery, "approval_binding", None)
             prefix = binding[0].id if binding else (getattr(credential, "id", "") or "notice")
             event_id = prefix + ":" + hashlib.sha256(text.encode()).hexdigest()
-        return await self.sender.send(target_id, text, images=images, files=files, videos=videos,
-                                      purpose=purpose, logical_id=f"muse:{session_id}:{event_id}")
+        # Outbound iLink sendmessage does not render native quotes; drop Muse reply_to_id here,
+        # while still recording sent message_id receipts for inbound quote-replies.
+        ok, sent_ids = await self.sender.send_messages(
+            target_id, text, images=images, files=files, videos=videos,
+            purpose=purpose, logical_id=f"muse:{session_id}:{event_id}")
+        for sent_id in sent_ids:
+            body = {"id": sent_id}
+            self.remember_delivery(delivery, target_type, target_id, body)
+            if credential is not None:
+                self.muse_service.interactions.remember_credential_message(
+                    target_type, target_id, body, credential,
+                    target=self.interaction_target(target_type, target_id))
+        return ok

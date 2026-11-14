@@ -103,6 +103,18 @@ class TestWeChatSender(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(client.send_message.await_count, 2)
             self.assertEqual(client.send_message.call_args.args[0]["item_list"][0]["type"], 2)
 
+    async def test_send_messages_collects_server_message_ids(self):
+        from muse_bridge.adapters.wechat.sender import WeChatSender
+        with tempfile.TemporaryDirectory() as root:
+            state = saved_state(root)
+            state.remember_message("owner", "A", "TA")
+            client = mock.Mock(send_message=mock.AsyncMock(
+                side_effect=[{"message_id": 101}, {"message_id": "102"}]))
+            sender = WeChatSender(client, state, config(), mock.Mock())
+            ok, ids = await sender.send_messages("owner", "a" * 4001, logical_id="multi")
+            self.assertTrue(ok)
+            self.assertEqual(ids, ["101", "102"])
+
 class TestWeChatParsing(unittest.TestCase):
     def test_no_secret_raw_event_or_media_filename_path(self):
         from muse_bridge.adapters.wechat.adapter import parse_event
@@ -135,6 +147,35 @@ class TestWeChatParsing(unittest.TestCase):
         message, media, _ = parse_event(raw, "bot@im.bot")
         self.assertEqual(message.text, "line one\nline two\ntranscribed")
         self.assertFalse(message.attachments)
+
+    def test_ref_msg_id_parsed_without_secrets(self):
+        from muse_bridge.adapters.wechat.adapter import parse_event
+        raw = event(mid="20", text="引用上一条消息")
+        raw["item_list"][0]["ref_msg"] = {
+            "message_item": {
+                "type": 0,
+                "create_time_ms": 1794623884000,
+                "msg_id": "7527198144967907592",
+            }
+        }
+        message, _, _ = parse_event(raw, "bot@im.bot")
+        self.assertEqual(message.text, "引用上一条消息")
+        self.assertEqual(message.references, [("id", "7527198144967907592")])
+        self.assertEqual(message.source.raw_event, {"references": [("id", "7527198144967907592")]})
+
+        raw_int = event(mid="21", text="int ref")
+        raw_int["item_list"][0]["ref_msg"] = {"message_item": {"type": 0, "msg_id": 123456}}
+        message_int, _, _ = parse_event(raw_int, "bot@im.bot")
+        self.assertEqual(message_int.references, [("id", "123456")])
+
+    def test_ref_msg_fallback_text_when_no_msg_id(self):
+        from muse_bridge.adapters.wechat.adapter import parse_event
+        raw = event(mid="22", text="回复")
+        raw["item_list"][0]["ref_msg"] = {"title": "摘要内容"}
+        message, _, _ = parse_event(raw, "bot@im.bot")
+        self.assertEqual(message.references, [])
+        self.assertEqual(message.source.raw_event, {})
+        self.assertEqual(message.text, "[引用: 摘要内容]\n回复")
 
 
 def make_adapter(root, state=None, *, muse=None):
@@ -230,8 +271,9 @@ class TestWeChatIntake(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(client.send_message.await_count)
             self.assertEqual(client.send_message.call_args.args[0]["context_token"], "TA")
             help_text = client.send_message.call_args.args[0]["item_list"][0]["text_item"]["text"]
-            for obsolete in ("管理员", "申请", "白名单", "鉴权", "群", "回复凭证卡"):
+            for obsolete in ("管理员", "申请", "白名单", "鉴权", "群"):
                 self.assertNotIn(obsolete, help_text)
+            self.assertIn("引用凭证卡", help_text)
             for retained in ("/登录", "/凭证", "/审批", "/新建"):
                 self.assertIn(retained, help_text)
             arbitrary = "用户原文：管理员申请群聊；如需在群聊中使用"
@@ -354,6 +396,32 @@ class TestWeChatIntake(unittest.IsolatedAsyncioTestCase):
             body = await adapter.send_reply("private", "owner", "immediate", "A")
             self.assertEqual(body, {})
             self.assertEqual(client.send_message.call_args.args[0]["context_token"], "TA")
+            client.send_message.return_value = {"message_id": 7527198718193190536}
+            body_with_id = await adapter.send_reply("private", "owner", "with-id", "A")
+            self.assertEqual(body_with_id, {"id": "7527198718193190536"})
+
+    async def test_inbound_quote_resolves_to_muse_in_reply_to_and_outbound_drops_quote(self):
+        with tempfile.TemporaryDirectory() as root:
+            adapter, muse, client = make_adapter(root)
+            client.send_message.side_effect = [{"message_id": 2001}]
+            await adapter.handle_batch([event("1001", text="first", token="TA")])
+            sid = muse.post_message.call_args.args[0]
+            history = [
+                {"role": "user", "message_id": "mid-first", "seq": 1},
+                {"role": "assistant", "message_id": "muse-2001", "seq": 2,
+                 "reply_to_id": "mid-first", "event_name": "message.assistant",
+                 "display_text": "bot reply", "payload": {"status": "completed"}},
+            ]
+            await adapter.outbound_pusher._scan_and_dispatch(history, sid)
+            sent_msg = client.send_message.call_args.args[0]
+            self.assertEqual(sent_msg["item_list"][0]["text_item"]["text"], "bot reply")
+            self.assertNotIn("ref_msg", sent_msg["item_list"][0])
+
+            quote_ev = event("1002", text="follow up", token="TB")
+            quote_ev["item_list"][0]["ref_msg"] = {"message_item": {"type": 0, "msg_id": "2001"}}
+            await adapter.handle_batch([quote_ev])
+            self.assertEqual(muse.post_message.call_args.args[1], "follow up")
+            self.assertEqual(muse.post_message.call_args.kwargs.get("in_reply_to"), "muse-2001")
 
 
 class TestWeChatMuseInteractions(unittest.IsolatedAsyncioTestCase):
@@ -464,6 +532,82 @@ class TestWeChatMuseInteractions(unittest.IsolatedAsyncioTestCase):
             self.assertIn("审批已全部完成", self.texts(client)[-1])
             await adapter.handle_batch([event("chat", "stranger", "continue")])
             service.post_message.assert_called_once()
+            self.assert_no_access_copy(client)
+
+    async def test_quote_credential_card_captures_input_without_posting_to_chat(self):
+        with tempfile.TemporaryDirectory() as root:
+            adapter, service, client = self.make(root)
+            client.send_message.return_value = {"message_id": 888001}
+            await adapter.handle_batch([event("seed", "stranger", "hi", "TA")])
+            sid = adapter.session_mapper.current("private", "stranger")
+            service.post_message.reset_mock()
+
+            history = [{
+                "role": "assistant",
+                "message_id": "pres-cred-1",
+                "seq": 1,
+                "event_name": "delta.presentation",
+                "payload": {
+                    "presentation_id": "pres-cred-1",
+                    "data": {
+                        "action": {
+                            "type": "credentials_vault",
+                            "data": {
+                                "url": "https://muse.ai/connect/browser-credentials"
+                                       "#page_url=https%3A%2F%2Fexample.invalid%2Flogin"
+                                       "&capture_authorization=cap-auth-1",
+                            },
+                        }
+                    },
+                },
+            }]
+            await adapter.outbound_pusher._scan_and_dispatch(history, sid)
+            sent_text = client.send_message.call_args.args[0]["item_list"][0]["text_item"]["text"]
+            self.assertIn("可引用此消息", sent_text)
+            card = service.interactions.by_remote("credential", "pres-cred-1")
+            self.assertIsNotNone(card)
+
+            quote_ev = event("cred-reply", "stranger", "alice\nsecret-pw", "TB")
+            quote_ev["item_list"][0]["ref_msg"] = {"message_item": {"type": 0, "msg_id": "888001"}}
+            usernames = []
+            with mock.patch.object(service, "capture_credential",
+                                   side_effect=lambda item, secret: usernames.append(item.context["username"])) as capture:
+                await adapter.handle_batch([quote_ev])
+            capture.assert_called_once_with(card, "secret-pw")
+            self.assertEqual(usernames, ["alice"])
+            self.assertTrue(card.terminal)
+            service.post_message.assert_not_called()
+            self.assert_no_access_copy(client)
+
+    async def test_quote_approval_card_submits_decision(self):
+        with tempfile.TemporaryDirectory() as root:
+            adapter, service, client = self.make(root)
+            client.send_message.return_value = {"message_id": 999001}
+            await adapter.handle_batch([event("seed", "stranger", "hi", "TA")])
+            sid = adapter.session_mapper.current("private", "stranger")
+            service.interactions.managed_sessions.add(sid)
+            row = {"approval_id": "remote-approval", "status": "pending", "scope": {"thread_id": sid},
+                   "requested_at_ms": 1, "display": {"summary_title": "Continue operation"},
+                   "decision_options": [{"kind": "allow_once", "label": {"kind": "allow_once"},
+                                         "label_text": "允许一次"}]}
+            decisions = []
+            def request(method, path, body=None, **kwargs):
+                if path == "/approvals":
+                    return {"pending": [copy.deepcopy(row)] if row["status"] == "pending" else [], "recent": []}
+                if method == "POST":
+                    decisions.append(body)
+                    row["status"] = "approved"
+                return copy.deepcopy(row)
+            service.interaction_protocol.request = mock.Mock(side_effect=request)
+            service.interaction_protocol.fetch_approvals()
+            item = service.interactions.by_remote("approval", "remote-approval")
+            await service.interaction_protocol.announce(
+                item, lambda it, text: adapter.outbound_pusher.notify_interaction(it, text))
+
+            quote_ev = event("approve-quote", "stranger", "1", "TB")
+            quote_ev["item_list"][0]["ref_msg"] = {"message_item": {"type": 0, "msg_id": "999001"}}
+            await adapter.handle_batch([quote_ev])
+            self.assertEqual(decisions, [{"decision": "allow_once", "notification_channel": "ui"}])
             self.assert_no_access_copy(client)
 
     async def test_login_required_runtime_hints_and_notice_target(self):
