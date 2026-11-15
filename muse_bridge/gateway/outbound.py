@@ -834,7 +834,19 @@ class OutboundDispatcher:
                 route = fallback
         return target_type, target_id, route, None
 
+    async def notify_background_approval(self, item, text, admin):
+        """Engine-selected inbox, explicitly separate from session-owned delivery."""
+        if (item.kind != "approval" or not item.context.get("background_approval")
+                or not isinstance(self.config, ChatConfig) or not self.config.is_admin(admin) or admin == "*"):
+            return False
+        delivered = await self._deliver_interaction(item, text, [("private", admin)], background=True)
+        logger.info("Background approval %s %s administrator private chat %s:%s", item.id,
+                    "delivered to" if delivered else "not delivered to", self.platform, admin)
+        return delivered
+
     async def notify_interaction(self, item, text):
+        if item.context.get("background_approval"):
+            return False  # Only the engine's single administrator inbox may receive it.
         # Unbound sessions must not emit cards, including admin copies.
         if not self.session_mapper.owners(item.session_id):
             return False
@@ -856,20 +868,24 @@ class OutboundDispatcher:
             await self.on_turn_finished(item.session_id)
         return delivered
 
-    async def _deliver_interaction(self, item, text, targets):
+    async def _deliver_interaction(self, item, text, targets, *, background=False):
         protocol = self.muse_service.interaction_protocol
         delivered = False
         for target_type, target_id in dict.fromkeys(targets):
-            if not self.session_mapper.owners(item.session_id):
+            if background:
+                if target_type != "private" or not self.config.is_admin(target_id) or target_id == "*":
+                    return delivered
+            elif not self.session_mapper.owners(item.session_id):
                 return delivered
             if not target_id:
                 continue
-            if (item.kind == "approval" and item.context.get("displayed_to", {}).get(self.interaction_target(target_type, target_id))
+            if (item.kind == "approval" and not item.terminal
+                    and item.context.get("displayed_to", {}).get(self.interaction_target(target_type, target_id))
                     == item.context.get("fingerprint")):
                 delivered = True  # This chat already shows the current card.
                 continue
             route = self.route_manager.get_latest_for_target(target_type, target_id, max_age_s=280.0)
-            snapshot = protocol.display_snapshot(item) if item.kind == "approval" else None
+            snapshot = protocol.display_snapshot(item) if item.kind == "approval" and not item.terminal else None
             delivery = DeliveryReference(item.session_id, "",
                 approval_binding=(item, snapshot) if snapshot is not None else None,
                 purpose="notification")
@@ -1169,14 +1185,14 @@ class OutboundDispatcher:
         return "【引用】" + (excerpt or "[非文本消息]").replace(chr(10), chr(10) + "> ") + chr(10)
 
     def remember_delivery(self, delivery, target_type, target_id, body):
-        if not delivery or not delivery.session_id or not isinstance(body, dict):
+        if not delivery or not isinstance(body, dict):
             return
         if delivery.approval_binding is not None:
             item, snapshot = delivery.approval_binding
             self.muse_service.interaction_protocol.remember_approval_message(
                 self.interaction_target(target_type, target_id), body, [item], [snapshot])
             return
-        if not delivery.muse_id:
+        if not delivery.session_id or not delivery.muse_id:
             return
         info = body.get("ext_info") or {}
         refs = [("id", body.get("id") or body.get("message_id"))]

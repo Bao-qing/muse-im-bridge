@@ -237,6 +237,7 @@ def make_adapter(root, state=None, *, muse=None):
         muse.interactions = InteractionManager()
         muse.interaction_protocol.approval_queue.return_value = []
         muse.interaction_protocol.queue_heads.return_value = []
+        muse.interaction_protocol.referenced_approvals.return_value = None
         muse.token_manager.has_credentials.return_value = True
         muse.post_message.side_effect = lambda sid, text, *a, **kw: "mid-" + text
     client = mock.Mock(send_message=mock.AsyncMock(return_value={"ret": 0}), aclose=mock.AsyncMock())

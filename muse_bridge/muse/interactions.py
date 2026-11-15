@@ -380,6 +380,24 @@ class MuseInteractions:
         return scope.get("thread_id") or row.get("thread_id") or trace.get("thread_id") or ""
 
     @staticmethod
+    def is_background_approval(row):
+        """Positive server evidence, never guess from a missing thread alone."""
+        scope = row.get("scope") or {}
+        trace = scope.get("runtime_request_trace") or row.get("runtime_request_trace") or {}
+        return ((row.get("display") or {}).get("attention_mode") == "background"
+                or (row.get("presentation") or {}).get("attention_mode") == "background"
+                or (scope.get("scope_type") or row.get("scope_type")) == "schedule"
+                or (scope.get("requester_source") or row.get("requester_source")
+                    or trace.get("requester_source")) == "scheduler.cron")
+
+    BACKGROUND_QUEUE = "background:approvals"
+
+    @classmethod
+    def queue_id(cls, item):
+        # A local queue key, not a Muse thread or an IM session binding.
+        return cls.BACKGROUND_QUEUE if item.context.get("background_approval") else item.session_id
+
+    @staticmethod
     def merge_approval(row, detail):
         full = {**row, **detail}
         # Sentinel snapshot contains scoped objects; the legacy detail endpoint
@@ -481,12 +499,15 @@ class MuseInteractions:
             return item
         if status != "pending":
             raise ValueError("Approval status missing")
-        sid = self.approval_session(full) or (item.session_id if item else "")
-        if not sid or sid not in self.manager.managed_sessions:
+        background = (self.is_background_approval(row) or self.is_background_approval(full)
+                      or bool(item and item.context.get("background_approval")))
+        sid = "" if background else self.approval_session(full) or (item.session_id if item else "")
+        if not background and (not sid or sid not in self.manager.managed_sessions):
             return None
         if item and (item.terminal or item.session_id != sid):
             return item
         item = item or self.manager.add("approval", session_id=sid, remote_id=remote_id, state="pending", ttl=0)
+        item.context["background_approval"] = background
         fingerprint = self.approval_fingerprint(full)
         if item.context.get("fingerprint") != fingerprint:
             item.context["notified"] = False
@@ -508,7 +529,7 @@ class MuseInteractions:
                         raise ValueError("Invalid pending approval")
                     remote_id = row.get("approval_id")
                     sid = self.approval_session(row)
-                    if sid and sid not in self.manager.managed_sessions:
+                    if sid and sid not in self.manager.managed_sessions and not self.is_background_approval(row):
                         continue
                     if not isinstance(remote_id, str) or not remote_id:
                         raise ValueError("Approval identifier missing")
@@ -550,7 +571,8 @@ class MuseInteractions:
 
     def approval_queue(self, session_id):
         """Pending approvals of one session in stable display order; the head is shown."""
-        pending = sorted(self.manager.pending_approvals(session_id), key=self._requested_at)
+        pending = sorted((i for i in self.manager.pending_approvals()
+                          if self.queue_id(i) == session_id), key=self._requested_at)
         with self._queue_lock:
             if not pending:
                 self._rounds.pop(session_id, None)
@@ -561,7 +583,7 @@ class MuseInteractions:
             return sorted(pending, key=lambda i: rank[i.id])
 
     def queue_heads(self):
-        sessions = list(dict.fromkeys(i.session_id for i in self.manager.pending_approvals()))
+        sessions = list(dict.fromkeys(self.queue_id(i) for i in self.manager.pending_approvals()))
         with self._queue_lock:
             for sid in [s for s in self._rounds if s not in sessions]:
                 del self._rounds[sid]
@@ -569,9 +591,9 @@ class MuseInteractions:
 
     def queue_position(self, item):
         """(position, round size, still pending) for the card header and hints."""
-        queue = self.approval_queue(item.session_id)
+        queue = self.approval_queue(self.queue_id(item))
         with self._queue_lock:
-            order = self._rounds.get(item.session_id, [])
+            order = self._rounds.get(self.queue_id(item), [])
             if item.id not in order:
                 return 1, 1, len(queue)
             return order.index(item.id) + 1, len(order), len(queue)
@@ -579,7 +601,7 @@ class MuseInteractions:
     def display_snapshot(self, item):
         """Taken before sending: what the user will see, to bind later choices."""
         return (item.context.get("fingerprint"),
-                [(i.id, i.context.get("fingerprint")) for i in self.approval_queue(item.session_id)])
+                [(i.id, i.context.get("fingerprint")) for i in self.approval_queue(self.queue_id(item))])
 
     def mark_displayed(self, item, target, snapshot):
         target = self.manager.target_key(target)
@@ -657,10 +679,16 @@ class MuseInteractions:
         lines.extend(f"选项 {n}｜{o['label']}" for n, o in enumerate(options, 1))
         if not options:
             lines.append("服务端未提供可验证的原生选项，请在 Muse 网页处理；")
-        lines.append(f"可直接回复数字审批，也可使用 /审批 {item.id} <数字> ")
-        if waiting > 1:
-            lines.append(f"回复「<数字> all」或 /审批 all <数字>，对排队中的 {waiting} 项全部使用该选项")
-        lines.append("完成审批以继续聊天")
+        if item.context.get("background_approval"):
+            lines.append(f"请引用本卡回复数字，或使用 /审批 {item.id} <数字>；直接发送数字仍作为普通聊天转发")
+            if waiting > 1:
+                lines.append(f"引用本卡回复「<数字> all」或 /审批 {item.id} <数字> 全部，对排队中的 {waiting} 项全部使用该选项")
+        else:
+            lines.append(f"当前会话等待审批时可直接回复数字；其他聊天请引用本卡回复数字，或使用 /审批 {item.id} <数字>")
+            if waiting > 1:
+                lines.append(f"当前会话回复「<数字> all」或 /审批 {item.id} <数字> 全部，对排队中的 {waiting} 项全部使用该选项")
+        lines.append("后台任务等待审批；不影响其他聊天" if item.context.get("background_approval")
+                     else "完成审批以继续聊天")
         return "\n".join(line for line in lines if line)
 
     async def submit_approval(self, item, choice, *, expected_fingerprint=None, automatic=False):
@@ -743,11 +771,16 @@ class MuseInteractions:
                         if any(o["decision"] == choice and not o.get("scope") for o in item.context["options"]):
                             text = await self.submit_approval(item, choice, automatic=True)
                             if policy.notify and item.terminal:
-                                await notify(item, text)
+                                item.context["auto_notification"] = text
                             continue
-                # One card per session at a time; the next is pushed once the head ends.
+                # Keep results pending if no administrator is reachable yet.
+                for item in list(self.manager.items.values()):
+                    text = item.context.get("auto_notification")
+                    if text and self.service.config.approval.notify and await notify(item, text):
+                        item.context.pop("auto_notification", None)
+                # One card per queue at a time; background work has its own queue.
                 for head in self.queue_heads():
-                    if head.session_id not in self._deciding:
+                    if self.queue_id(head) not in self._deciding:
                         await self.announce(head, notify)
             except asyncio.CancelledError:
                 raise

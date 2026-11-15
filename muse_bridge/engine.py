@@ -8,7 +8,7 @@ from typing import List
 from .adapters.base import BaseAdapter
 from .adapters.onebot import OneBotAdapter
 from .adapters.qq import QQAdapter
-from .config.models import AppConfig
+from .config.models import AppConfig, ChatConfig
 from .gateway.chat import ChatGateway
 from .muse.service import MuseService
 from .muse.token_manager import MuseTokenManager
@@ -92,13 +92,38 @@ class BridgeEngine:
             pass
 
     async def _notify_interaction(self, item, text):
-        """Push a card only through adapters with chats bound to its session."""
+        """Route chat-owned cards or one independent background approval inbox."""
         chats = [a for a in self.adapters if isinstance(a, ChatGateway) and a.is_enabled]
+        if item.kind == "approval" and item.context.get("background_approval"):
+            return await self._notify_background_approval(item, text, chats)
         owners = [a for a in chats if a.owns_session(item.session_id)]
         delivered = False
         for adapter in owners or chats:
             delivered = await adapter.notify_interaction(item, text) or delivered
         return delivered
+
+    async def _notify_background_approval(self, item, text, chats):
+        """Select one administrator inbox; never bind the task to a chat thread."""
+        chats = [a for a in chats if isinstance(a.config, ChatConfig)]
+        configured = self.config.gateway.background_approval_push
+        if configured:
+            platform, target = configured.split(":", 1)
+            adapter = next((a for a in chats if a.name == platform and a.config.is_admin(target)
+                            and target != "*"), None)
+        else:
+            # Keep a selected inbox across retries/content revisions, not one per gateway.
+            saved = item.context.get("background_target")
+            adapter = next((a for a in chats if saved and (a.name, a.account_identity()) == tuple(saved[:2])
+                            and a.config.is_admin(saved[2]) and saved[2] != "*"), None)
+            target = saved[2] if adapter else None
+            if adapter is None:
+                candidates = [(a, recent) for a in chats if (recent := a.latest_admin_private())]
+                if candidates:
+                    adapter, (target, _) = max(candidates, key=lambda entry: entry[1][1])
+        if adapter is None:
+            return False  # Retain pending work until an administrator is reachable.
+        item.context["background_target"] = (adapter.name, adapter.account_identity(), target)
+        return await adapter.notify_background_approval(item, text, target)
 
     def _login_adapter(self):
         """Account notice channel selected by ``gateway.login_through_adapter``."""
