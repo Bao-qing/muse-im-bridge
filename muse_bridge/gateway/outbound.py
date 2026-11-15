@@ -1076,13 +1076,20 @@ class OutboundDispatcher:
         def message_identity(mid):
             return mid.removeprefix("assistant-msg-") if isinstance(mid, str) else mid
 
-        # Muse may link an assistant message to its own bare execution ID.
+        # Muse may link an assistant message to its own bare execution ID, or
+        # link follow-up bubbles in a turn to metadata.root_message_execution_id.
         own_ids = {
             message_identity(mid) for mid in (event.get("message_id"), payload.get("message_id"))
             if mid
         }
+        meta = payload.get("metadata") if isinstance(payload, dict) else None
+        root_exec_id = (
+            message_identity(meta.get("root_message_execution_id"))
+            if isinstance(meta, dict) and meta.get("root_message_execution_id") else None
+        )
+        ignored_reply_ids = own_ids | ({root_exec_id} if root_exec_id else set())
         for candidate in (event.get("reply_to_message_id"), payload.get("reply_to_message_id")):
-            if candidate and message_identity(candidate) not in own_ids:
+            if candidate and message_identity(candidate) not in ignored_reply_ids:
                 return candidate
         target = payload.get("reply_to_target")
         candidate = cls._reply_target_id(target)
