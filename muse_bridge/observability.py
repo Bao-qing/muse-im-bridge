@@ -29,7 +29,7 @@ _LEVELS = {"TRACE": TRACE, "DEBUG": logging.DEBUG, "INFO": logging.INFO,
 _SECRET = re.compile(r"token|secret|password|passwd|authorization|cookie|csrf|otp|credential|capture_authorization|signature|clientsecret|private_key|file_info|aes_key|aeskey|encrypt_query_param|encrypted_query_param|qrcode|qrcode_img_content|verify_code|upload_param", re.I)
 _BINARY = {"file_data", "data_base64", "base64", "image_base64"}
 _MESSAGE = {"content", "text", "message", "raw_message", "display_text", "markdown", "items"}
-_AUTH_PATH = re.compile(r"/api/auth/|/api/hatch/(?:token|noise-notary-token)|getAppAccessToken|credential|capture|/aymh|get_bot_qrcode|get_qrcode_status", re.I)
+_AUTH_PATH = re.compile(r"/api/auth/|/api/hatch/(?:token|noise-notary-token)|getAppAccessToken|credential|capture|/api_key_auth/|/v1/custom-connectors/register|/aymh|get_bot_qrcode|get_qrcode_status", re.I)
 _URL = re.compile(r"(?:https?|wss?)://[^\s<>\"']+", re.I)
 _KEY_VALUE = re.compile(
     r"(?i)(?<![A-Za-z0-9_-])"

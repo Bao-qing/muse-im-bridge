@@ -12,7 +12,8 @@ import uuid
 from urllib.parse import parse_qs, quote, urlparse
 
 from ..core.state_file import atomic_json_write
-from .client.errors import LoginRequired
+from .client.errors import LoginRequired, RPCError
+from .connector_keys import ConnectorKeyRejected, connector_key_context
 from ..observability import get_logger, safe_error, trace_event
 
 
@@ -31,6 +32,8 @@ SECRET_CAPTURE_FIELDS = {
 
 def credential_input_kind(context):
     capture = context.get("capture", "sign_in")
+    if capture == "connector_key":
+        return "key"
     if capture == "verification_code":
         return "code"
     if capture in SECRET_CAPTURE_FIELDS or context.get("secret_field"):
@@ -147,7 +150,11 @@ class MuseInteractions:
         if not isinstance(data, dict):
             return None
         action = data.get("action", data)
-        if not isinstance(action, dict) or action.get("type") != "credentials_vault":
+        if not isinstance(action, dict):
+            return None
+        if action.get("type") == "connector":
+            return self._register_connector_key(event, payload, data, action, session_id, owner)
+        if action.get("type") != "credentials_vault":
             return None
         fields = action.get("data", action)
         if not isinstance(fields, dict):
@@ -242,10 +249,92 @@ class MuseInteractions:
         context["receipt_key"] = receipt_key
         return self.manager.add("credential", owner=owner, session_id=session_id, remote_id=remote_id, ttl=0, context=context)
 
+    def _register_connector_key(self, event, payload, data, action, session_id, owner):
+        if not session_id:
+            return None
+        fields = action.get("data", action)
+        if not isinstance(fields, dict):
+            return None
+        context = connector_key_context(fields, session_id,
+                                        agent_id=payload.get("agent_id") or event.get("agent_id"))
+        if context is None:
+            return None
+        remote_id = next((payload.get(key) for key in
+                          ("presentation_id", "widget_id", "id", "message_id", "host_message_id")
+                          if isinstance(payload.get(key), str) and payload[key]), None)
+        remote_id = remote_id or event.get("message_id")
+        if not isinstance(remote_id, str) or not remote_id:
+            return None
+        state = payload.get("state") or {}
+        if not isinstance(state, dict):
+            return None
+        version = state.get("version", 0)
+        if type(version) is not int or version < 0:
+            return None
+        context.update(state_version=version, title=data.get("title") or "连接器",
+                       subtitle=data.get("subtitle") or "连接器")
+        context["receipt_key"] = self._capture_key(session_id, remote_id, context)
+        completed = context["receipt_key"] in self._capture_receipts
+        existing = self.manager.by_remote("credential", remote_id)
+        if existing:
+            if existing.session_id != session_id or existing.context.get("capture") != "connector_key":
+                return None
+            if existing.terminal or version < existing.context.get("state_version", 0):
+                return existing
+            changed = any(existing.context.get(key) != context.get(key) for key in
+                          ("key_request", "key_endpoint", "key_session_id", "service_name"))
+            if changed:
+                if version <= existing.context.get("state_version", 0):
+                    return existing
+                return self.manager.supersede_credential(existing, context,
+                                                        state="completed" if completed else "available")
+            existing.context["state_version"] = version
+            return existing
+        return self.manager.add("credential", owner=owner, session_id=session_id,
+                                remote_id=remote_id, ttl=0, context=context,
+                                state="completed" if completed else "available")
+
+    def register_connector_key(self, item, secret):
+        if item.kind != "credential" or item.context.get("capture") != "connector_key" or item.terminal:
+            raise ValueError("Connector key input is no longer active")
+        if not isinstance(secret, str) or not secret.strip() or "\n" in secret or "\r" in secret:
+            raise ValueError("Connector key must be one non-empty line")
+        c = item.context
+        body = {**c["key_request"], "api_key": {"key": secret.strip()},
+                "replace_existing": True}
+        if c.get("key_endpoint") == "/api_key_auth/callback":
+            body = {"provider": c["service_name"], "key": secret.strip(),
+                    "session_id": c["key_session_id"]}
+        else:
+            body["session_id"] = c["key_session_id"]
+        digest = hashlib.sha256(json.dumps(body, sort_keys=True).encode()).hexdigest()
+        try:
+            if c.get("submitted_digest") not in (None, digest):
+                raise ValueError("An uncertain connector-key submission can only retry identical input")
+            c["submitted_digest"] = digest
+            # The web client only awaits this RPC; unlike vault capture, its
+            # successful response does not require a capture id.
+            try:
+                self.request("POST", c["key_endpoint"], body, service="authd")
+            except RPCError as exc:
+                if exc.status in {400, 401, 403, 404, 409, 422}:
+                    c.pop("submitted_digest", None)
+                    raise ConnectorKeyRejected("Connector key registration rejected") from exc
+                raise
+            self._record_capture(c["receipt_key"])
+            return c["service_name"]
+        finally:
+            if "api_key" in body:
+                body["api_key"]["key"] = ""
+            else:
+                body["key"] = ""
+
     def capture_credential(self, item, secret):
         if item.kind != "credential" or item.terminal:
             raise ValueError("Credential capture is no longer active")
         c = item.context
+        if credential_input_kind(c) == "key":
+            return self.register_connector_key(item, secret)
         if c.get("auth_providers") or c.get("grant_request_type"):
             raise ValueError("Provider capture must be completed in the web client")
         page = urlparse(c["page_url"])

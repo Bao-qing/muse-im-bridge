@@ -108,6 +108,8 @@ class InteractionManager:
                 if existing is not None:
                     return existing
             prefix = {"login": "L", "credential": "C", "approval": "A"}[kind]
+            if kind == "credential" and (context or {}).get("capture") == "connector_key":
+                prefix = "K"
             while True:
                 key = prefix + secrets.token_hex(3).upper()
                 if key not in self.items:
@@ -120,6 +122,17 @@ class InteractionManager:
             if session_id:
                 self.managed_sessions.add(session_id)
             return item
+
+    def supersede_credential(self, item: Interaction, context, *, state="available") -> Interaction:
+        """Keep old quotes/focus as tombstones when a card changes its destination."""
+        with self._guard:
+            if item.kind != "credential" or item.terminal:
+                raise ValueError("Only active credential cards can be superseded")
+            self.finish(item, "expired")
+            item.expires_at = time.time()
+            self._remote.pop((item.kind, item.remote_id), None)
+            return self.add("credential", session_id=item.session_id, remote_id=item.remote_id,
+                            context=context, state=state, ttl=0)
 
     def by_remote(self, kind: str, remote_id: str) -> Optional[Interaction]:
         key = self._remote.get((kind, remote_id))

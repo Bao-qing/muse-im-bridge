@@ -51,6 +51,8 @@ class WeChatOutboundPusher(OutboundDispatcher):
         if item.context.get("auth_providers") or item.context.get("grant_request_type"):
             return "请在 Muse 网页完成此登录。"
         kind = credential_input_kind(item.context)
+        if kind == "key":
+            return f"可引用此消息发送单行密钥，无需填写账号，或发送 /密钥 {item.id}。"
         if kind == "code":
             return f"可引用此消息发送验证码，或发送 /凭证 {item.id} [保存|一次] 验证码。"
         if kind == "secret":

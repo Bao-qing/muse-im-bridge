@@ -315,6 +315,8 @@ class ObservabilityTests(unittest.TestCase):
     def test_observed_auth_path_and_login_component_hide_whole_call_and_return(self):
         self.configure()
         for component, url in (("service", "https://service.test/api/auth/exchange"),
+                               ("muse.rpc", "/v1/custom-connectors/register"),
+                               ("muse.rpc", "/api_key_auth/callback"),
                                ("muse.login", "https://service.test/ordinary")):
             with self.subTest(component=component):
                 result = {"unknown": "opaque-result-secret"}

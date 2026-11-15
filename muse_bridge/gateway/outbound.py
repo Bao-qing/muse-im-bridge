@@ -228,6 +228,8 @@ class OutboundDispatcher:
         if not self.config.credentials_in_place:
             return "请管理员私聊填写。"
         kind = credential_input_kind(credential.context)
+        if kind == "key":
+            return "管理员可引用此消息，发送单行密钥/授权凭据，无需填写账号。"
         if kind == "code":
             return "管理员可引用此消息，发送验证码。"
         if kind == "secret":
@@ -956,11 +958,18 @@ class OutboundDispatcher:
                 credential = self.muse_service.interaction_protocol.register_credential(event, session_id) if session_id else None
                 if credential and not credential.terminal:
                     hint = self.render_credential_hint(credential)
-                    clean_text = chr(10).join((
-                        f"【凭证 {credential.id}】{credential.context['page_url']}",
-                        hint, f"也可发送 \n/凭证 {credential.id} [保存/一次] [凭证]"))
+                    if credential_input_kind(credential.context) == "key":
+                        c = credential.context
+                        clean_text = chr(10).join((
+                            f"【{c['title']}提示】{c['subtitle']}（需要输入单行秘钥/授权凭据）",
+                            f"【密钥 {credential.id}】", hint,
+                            f"也可发送 /密钥 {credential.id}，再发送一行密钥。"))
+                    else:
+                        clean_text = chr(10).join((
+                            f"【凭证 {credential.id}】{credential.context['page_url']}",
+                            hint, f"也可发送 \n/凭证 {credential.id} [保存/一次] [凭证]"))
                 elif credential:
-                    clean_text = "凭证卡已结束。"
+                    clean_text = "密钥卡已结束。" if credential_input_kind(credential.context) == "key" else "凭证卡已结束。"
                 else:
                     clean_text = render_presentation_card_to_text(event) or ""
             else:
