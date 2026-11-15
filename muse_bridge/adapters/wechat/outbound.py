@@ -10,9 +10,26 @@ from ...muse.interactions import credential_input_kind, credential_secret_label
 class WeChatOutboundPusher(OutboundDispatcher):
     platform = "wechat"
 
-    def __init__(self, *args, state, sender, **kwargs):
+    def __init__(self, *args, state, sender, on_turn_started=None,
+                 on_turn_finished=None, on_turns_cleared=None, **kwargs):
         self.state, self.sender = state, sender
+        self._on_turn_started = on_turn_started
+        self._on_turn_finished = on_turn_finished
+        self._on_turns_cleared = on_turns_cleared
         super().__init__(*args, **kwargs)
+
+    def track_session(self, session_id: str, fresh: bool = False) -> None:
+        super().track_session(session_id, fresh=fresh)
+        if not fresh and session_id and self._on_turn_started:
+            self._on_turn_started(session_id)
+
+    async def on_turn_finished(self, session_id: str) -> None:
+        if self._on_turn_finished:
+            await self._on_turn_finished(session_id)
+
+    async def on_turns_cleared(self) -> None:
+        if self._on_turns_cleared:
+            await self._on_turns_cleared()
 
     def account_identity(self):
         return self.state.bot_id

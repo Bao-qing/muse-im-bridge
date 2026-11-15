@@ -220,8 +220,8 @@ class ConsoleFixture(unittest.IsolatedAsyncioTestCase):
         incoming = event(items=items)
         await self.cli.handle_batch([incoming, incoming])
         self.assertEqual(self.media.download.await_count, 4)
-        self.assertEqual([call.args[1] for call in self.media.download.await_args_list], [64, 128, 256, 128])
-        self.assertEqual([call.kwargs["image"] for call in self.media.download.await_args_list], [True, False, False, False])
+        self.assertEqual([call.args[1] for call in self.media.download.await_args_list], [256, 64, 128, 128])
+        self.assertEqual([call.kwargs["image"] for call in self.media.download.await_args_list], [False, True, False, False])
         paths = list(self.cli.download_dir.iterdir())
         self.assertEqual(len(paths), 4)
         for path in paths:

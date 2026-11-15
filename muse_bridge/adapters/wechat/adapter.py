@@ -21,6 +21,42 @@ from .state import WeChatState, WeChatStateError, _id, _text
 
 logger = get_logger(__name__)
 
+_TYPING_MAX_SECONDS = 600.0
+_MEDIA_ORDER = {"video": 0, "image": 1, "file": 2}
+
+
+def _message_media_priority(message: InboundMessage) -> int:
+    if not message.attachments:
+        return 3
+    return min(_MEDIA_ORDER.get(att.type, 2) for att in message.attachments)
+
+
+def _order_ready_batch(ready):
+    if len(ready) <= 1:
+        return ready
+    ordered = list(ready)
+    by_user: dict[str, list[int]] = {}
+    for idx, (message, _) in enumerate(ready):
+        by_user.setdefault(message.source.sender_id, []).append(idx)
+    for indices in by_user.values():
+        if len(indices) <= 1:
+            continue
+        segment: list[int] = []
+        for idx in indices:
+            if (ready[idx][0].text or "").lstrip().startswith("/"):
+                if len(segment) > 1:
+                    items = sorted((ready[i] for i in segment), key=lambda pair: _message_media_priority(pair[0]))
+                    for pos, item in zip(segment, items):
+                        ordered[pos] = item
+                segment.clear()
+            else:
+                segment.append(idx)
+        if len(segment) > 1:
+            items = sorted((ready[i] for i in segment), key=lambda pair: _message_media_priority(pair[0]))
+            for pos, item in zip(segment, items):
+                ordered[pos] = item
+    return ordered
+
 
 def _ref_msg_id(reference):
     if not isinstance(reference, dict):
@@ -103,6 +139,7 @@ def parse_event(event, bot_id):
     text = "\n".join(texts)
     if len(text) > 1048576:
         return None
+    attachments.sort(key=lambda att: _MEDIA_ORDER.get(att.type, 2))
     stamp = event.get("create_time_ms", 0)
     stamp = stamp / 1000 if type(stamp) in (int, float) and 0 <= stamp <= 2**63 - 1 else 0
     raw_event = {"references": list(references)} if references else {}
@@ -131,12 +168,15 @@ class WeChatAdapter(ChatGateway):
         self.media = WeChatMedia(self.client)
         self._media_descriptors = {}
         self.sender = WeChatSender(self.client, self.state, config, self.media)
-        super().__init__(config, muse_service, deduplicator)
-        self.gateway = WeChatGateway(self.client, self.state, self.handle_batch, config.polling_timeout_ms)
         self._tasks = []
-        self._typing_task = None
+        self._typing_tasks = {}
+        self._typing_sessions = {}
+        self._typing_deadlines = {}
+        self._typing_turn_seqs = {}
         self._typing_tickets = {}
         self._typing_retry = {}
+        super().__init__(config, muse_service, deduplicator)
+        self.gateway = WeChatGateway(self.client, self.state, self.handle_batch, config.polling_timeout_ms)
 
     @property
     def name(self):
@@ -157,9 +197,12 @@ class WeChatAdapter(ChatGateway):
         return list(refs) if isinstance(refs, list) else []
 
     def create_outbound(self):
-        return WeChatOutboundPusher(self.config, self.client, self.muse_service, self.deduplicator,
-                                   self.route_manager, self.session_mapper,
-                                   on_login_required=self.enter_login_mode, state=self.state, sender=self.sender)
+        return WeChatOutboundPusher(
+            self.config, self.client, self.muse_service, self.deduplicator,
+            self.route_manager, self.session_mapper,
+            on_login_required=self.enter_login_mode, state=self.state, sender=self.sender,
+            on_turn_started=self._on_turn_started, on_turn_finished=self._on_turn_finished,
+            on_turns_cleared=self._on_turns_cleared)
 
     def render_command_output(self, text):
         if text != HELP_TEXT:
@@ -208,7 +251,7 @@ class WeChatAdapter(ChatGateway):
             self.state.remember_message(user, message.id, token)
             ready.append((message, media))
         # Latest reflects the whole accepted batch; immediate replies use snapshots.
-        for message, media in ready:
+        for message, media in _order_ready_batch(ready):
             user = message.source.sender_id
             if self.state.message_status(user, message.id) != "accepted":
                 continue
@@ -225,19 +268,63 @@ class WeChatAdapter(ChatGateway):
                 for key in media:
                     self._media_descriptors.pop(key, None)
 
+    def _on_turn_started(self, session_id):
+        if session_id:
+            self._typing_turn_seqs[session_id] = self._typing_turn_seqs.get(session_id, 0) + 1
+
+    async def _on_turn_finished(self, session_id):
+        if not session_id:
+            return
+        users = [u for u, sid in list(self._typing_sessions.items()) if sid == session_id]
+        for user in users:
+            await self._stop_typing(user)
+
+    async def _on_turns_cleared(self):
+        for user in list(self._typing_tasks):
+            await self._stop_typing(user)
+
+    def _ensure_typing(self, user, msg_id):
+        self._typing_deadlines[user] = time.monotonic() + _TYPING_MAX_SECONDS
+        existing = self._typing_tasks.get(user)
+        if existing and not existing.done():
+            return
+        self._typing_tasks[user] = asyncio.create_task(self._typing(user, msg_id))
+
+    async def _stop_typing(self, user):
+        self._typing_sessions.pop(user, None)
+        self._typing_deadlines.pop(user, None)
+        task = self._typing_tasks.pop(user, None)
+        if task and not task.done():
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
     async def _with_typing(self, message):
-        # Only cover the local intake operation; no guessed Muse execution lifetime.
-        task = None
-        if self.config.typing_enabled and not message.text.startswith("/"):
-            task = asyncio.create_task(self._typing(message.source.sender_id, message.id))
-            self._typing_task = task
+        user = message.source.sender_id
+        before_sid = self.session_mapper.current("private", user)
+        if not self.config.typing_enabled or message.text.startswith("/"):
+            try:
+                return await self.handle_inbound(message)
+            finally:
+                cmd = (message.text or "").strip().split(None, 1)[0].lower() if message.text else ""
+                after_sid = self.session_mapper.current("private", user)
+                if cmd in ("/stop", "/停止") or after_sid != before_sid:
+                    await self._stop_typing(user)
+        before_seqs = dict(self._typing_turn_seqs)
+        self._ensure_typing(user, message.id)
+        keep_typing = False
         try:
-            return await self.handle_inbound(message)
+            result = await self.handle_inbound(message)
+            after_sid = self.session_mapper.current("private", user)
+            dispatched = (result == "handled" and after_sid
+                          and self._typing_turn_seqs.get(after_sid, 0) > before_seqs.get(after_sid, 0))
+            if dispatched:
+                self._typing_sessions[user] = after_sid
+                self._ensure_typing(user, message.id)
+                keep_typing = True
+            return result
         finally:
-            if task:
-                task.cancel()
-                await asyncio.gather(task, return_exceptions=True)
-                self._typing_task = None
+            if not keep_typing:
+                await self._stop_typing(user)
 
     async def _typing_ticket(self, user, msg_id):
         now = time.monotonic()
@@ -266,18 +353,30 @@ class WeChatAdapter(ChatGateway):
 
     async def _typing(self, user, msg_id):
         ticket = None
+        deadline = self._typing_deadlines.setdefault(user, time.monotonic() + _TYPING_MAX_SECONDS)
         try:
             ticket = await self._typing_ticket(user, msg_id)
             if not ticket:
                 return
             while True:
+                remaining = self._typing_deadlines.get(user, deadline) - time.monotonic()
+                if remaining <= 0:
+                    break
                 await self.client.send_typing(user, ticket, 1)
-                await asyncio.sleep(5)
+                remaining = self._typing_deadlines.get(user, deadline) - time.monotonic()
+                if remaining <= 0:
+                    break
+                await asyncio.sleep(min(5.0, remaining))
         except asyncio.CancelledError:
             raise
         except Exception as exc:
             logger.debug("WeChat typing unavailable: %s", safe_error(exc))
         finally:
+            current = asyncio.current_task()
+            if self._typing_tasks.get(user) is current:
+                self._typing_tasks.pop(user, None)
+                self._typing_sessions.pop(user, None)
+                self._typing_deadlines.pop(user, None)
             if ticket:
                 try:
                     await asyncio.wait_for(self.client.send_typing(user, ticket, 2),
@@ -306,9 +405,13 @@ class WeChatAdapter(ChatGateway):
         tasks = [t for t in self._tasks if t is not current]
         for task in tasks:
             task.cancel()
-        if self._typing_task:
-            self._typing_task.cancel()
-            tasks.append(self._typing_task)
+        for task in list(self._typing_tasks.values()):
+            if task and not task.done():
+                task.cancel()
+                tasks.append(task)
+        self._typing_tasks.clear()
+        self._typing_sessions.clear()
+        self._typing_deadlines.clear()
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
         self._tasks = []

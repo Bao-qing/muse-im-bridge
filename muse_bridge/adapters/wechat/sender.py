@@ -53,12 +53,13 @@ class WeChatSender:
         if self.state.cooldown_until > time.time():
             return False, []
         logical_id = logical_id or secrets.token_hex(16)
-        parts = [("text", chunk, "") for chunk in self.chunks(text)]
-        for kind, descriptors, cap in (("image", images, self.config.max_image_bytes),
-                                       ("file", files, self.config.max_file_bytes),
-                                       ("video", videos, self.config.max_video_upload_bytes)):
+        parts = []
+        for kind, descriptors, cap in (("video", videos, self.config.max_video_upload_bytes),
+                                       ("image", images, self.config.max_image_bytes),
+                                       ("file", files, self.config.max_file_bytes)):
             parts.extend((kind, (descriptor, cap), descriptor.get("filename") or f"media.{kind}")
                          for descriptor in descriptors)
+        parts.extend(("text", chunk, "") for chunk in self.chunks(text))
         if not parts:
             return False, []
         sent_ids = []

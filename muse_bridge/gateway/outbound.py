@@ -184,6 +184,7 @@ class OutboundDispatcher:
         self.muse_service.interactions.register_namespace(self.platform, self.account_identity(), owner=self)
 
         self._running = False
+        self._using_push_stream = False
         self._login_alerted: bool = False
         self._seen_ids: Set[str] = set()
         self._last_seq: int = 0
@@ -291,8 +292,16 @@ class OutboundDispatcher:
                 logger.debug('Event stream loop error: %s, reconnecting in 3s...', safe_error(e))
                 await asyncio.sleep(3.0)
 
+    async def on_turn_finished(self, session_id: str) -> None:
+        """Called when a session's active turn finishes, fails, or pauses for input."""
+
+    async def on_turns_cleared(self) -> None:
+        """Called when the dispatcher stops or pauses (e.g. login required)."""
+
     async def stop(self) -> None:
         self._running = False
+        self._using_push_stream = False
+        await self.on_turns_cleared()
 
     # ------------------------------------------------------------------
     # History fetching & media extraction (triggered on demand by events)
@@ -424,7 +433,7 @@ class OutboundDispatcher:
             try:
                 await self._send_notice(
                     admin_target,
-                    "【系统提示】获取 Muse 消息时检测到凭据失效（401 Unauthorized）。\n已自动进入登录回落流程，请直接在此私聊发送：\n/登录 <您的邮箱>\n即可获取验证码重新登录恢复服务 ♪",
+                    "【系统提示】获取 Muse 消息时检测到凭据失效（401 Unauthorized）。\n已自动进入登录回落流程，请直接在此私聊发送：\n/登录 <您的邮箱>\n即可获取验证码重新登录恢复服务",
                 )
             except Exception as e:
                 logger.debug('Failed to notify admin for login: %s', safe_error(e))
@@ -472,6 +481,28 @@ class OutboundDispatcher:
         return isinstance(exc, LoginRequired) or is_runtime_auth_error(exc)
 
     @staticmethod
+    def _is_turn_terminal_abort(ev: dict) -> bool:
+        if not isinstance(ev, dict):
+            return False
+        name = ev.get("event") or ev.get("event_name")
+        payload = ev.get("payload") or {}
+        if not isinstance(payload, dict):
+            payload = {}
+        status = payload.get("status") or ev.get("status")
+        if name in ("delta.message_done", "message.assistant"):
+            return status in ("interrupted", "cancelled", "failed", "error")
+        if name == "task.status" and status in ("cancelled", "interrupted", "failed", "error", "stopped"):
+            tid = payload.get("task_id")
+            root = payload.get("root_agent_id")
+            agent = payload.get("agent_id")
+            if root:
+                return tid == root
+            if agent:
+                return tid == agent
+            return True
+        return False
+
+    @staticmethod
     def _classify_push_event(ev: dict, default_sid: Optional[str] = None) -> Tuple[Optional[str], Optional[str]]:
         """Extract (session_id, trigger_kind) from a /聊天/subscribe event.
 
@@ -497,7 +528,7 @@ class OutboundDispatcher:
 
         if name in ("delta.message_done", "message.assistant"):
             status = payload.get("status") or ev.get("status")
-            if status in ("interrupted", "cancelled"):
+            if status in ("interrupted", "cancelled", "failed", "error"):
                 return sid, None
             return sid, "sync"
 
@@ -512,6 +543,8 @@ class OutboundDispatcher:
         if name == "task.status":
             if payload.get("status") == "completed":
                 return sid, "sync"
+            if OutboundDispatcher._is_turn_terminal_abort(ev):
+                return sid, None
             return sid, "stream"
 
         return sid, None
@@ -524,6 +557,8 @@ class OutboundDispatcher:
         while self._running:
             if not await asyncio.to_thread(self.muse_service.token_manager.has_credentials):
                 reconnect_failures = 0
+                self._using_push_stream = False
+                await self.on_turns_cleared()
                 if not self._login_alerted:
                     self._login_alerted = True
                     logger.warning('Muse 尚未登录或凭据失效，暂停出站监听，触发回落登录...')
@@ -547,6 +582,7 @@ class OutboundDispatcher:
 
                 # Compatibility fallback if a test mock does not implement `subscribe`
                 if not hasattr(client, "subscribe"):
+                    self._using_push_stream = False
                     await self._run_legacy_poll_once(client)
                     reconnect_failures = 0
                     now = time.monotonic()
@@ -555,6 +591,7 @@ class OutboundDispatcher:
                     await asyncio.sleep(sleep_s)
                     continue
 
+                self._using_push_stream = True
                 subscribed_sids: Set[str] = set()
                 trackers: Dict[str, PushTurnTracker] = {}
                 last_ping_mono: float = time.monotonic()
@@ -633,7 +670,7 @@ class OutboundDispatcher:
                         continue
 
                     # 2. Read real-time push events from active /聊天/subscribe stream(s)
-                    def _read_And_sync_events() -> List[Tuple[str, List[dict]]]:
+                    def _read_And_sync_events() -> Tuple[List[Tuple[str, List[dict]]], Set[str]]:
                         nonlocal last_ping_mono
                         if hasattr(client, "read_any_subscription_events"):
                             events = client.read_any_subscription_events(timeout=1.0)
@@ -652,10 +689,11 @@ class OutboundDispatcher:
                             if hasattr(client, "read_any_subscription_events"):
                                 events = client.read_any_subscription_events(timeout=0.0)
                         if not events:
-                            return []
+                            return [], set()
 
                         default_sid = next(iter(subscribed_sids)) if len(subscribed_sids) == 1 else None
                         dirty_sids: Set[str] = set()
+                        finished_sids: Set[str] = set()
                         reaction_events: Dict[str, List[dict]] = {}
 
                         for ev in events:
@@ -668,13 +706,18 @@ class OutboundDispatcher:
                             if tracker.feed(ev):
                                 dirty_sids.add(sid)
                                 trackers[sid] = PushTurnTracker(sid)
+                                finished_sids.add(sid)
+                            elif self._is_turn_terminal_abort(ev):
+                                trackers[sid] = PushTurnTracker(sid)
+                                finished_sids.add(sid)
                             elif kind == "sync":
                                 dirty_sids.add(sid)
                             elif kind == "stream":
                                 self._touch_hot(sid)
+                                finished_sids.discard(sid)
 
                         if not dirty_sids:
-                            return []
+                            return [], finished_sids
 
                         synced: List[Tuple[str, List[dict]]] = []
                         for sid in dirty_sids:
@@ -688,18 +731,22 @@ class OutboundDispatcher:
                                 logger.debug('Event-triggered sync failed for %s: %s', sid[:8], safe_error(ex))
                                 if reaction_events.get(sid):
                                     synced.append((sid, reaction_events[sid]))
-                        return synced
+                        return synced, finished_sids
 
-                    synced_batches = await loop.run_in_executor(None, _read_And_sync_events)
+                    synced_batches, finished_sids = await loop.run_in_executor(None, _read_And_sync_events)
                     reconnect_failures = 0
                     for sid, hist in synced_batches:
                         await self._hydrate_and_dispatch(sid, hist, is_initial_gate=(sid not in self._gated))
+                    for sid in finished_sids:
+                        await self.on_turn_finished(sid)
 
             except asyncio.CancelledError:
                 break
             except Exception as e:
                 if isinstance(e, LoginRequired):
                     reconnect_failures = 0
+                    self._using_push_stream = False
+                    await self.on_turns_cleared()
                     if not self._login_alerted:
                         self._login_alerted = True
                         logger.warning('Cookie 会话不可用，等待管理员登录。 error=%s', safe_error(e))
@@ -717,6 +764,8 @@ class OutboundDispatcher:
                         safe_error(e),
                     )
                     self._running = False
+                    self._using_push_stream = False
+                    await self.on_turns_cleared()
                     break
                 logger.warning(
                     "重新连接中，保留 Cookie，3 秒后重试（%d/%d）。 error=%s",
@@ -797,9 +846,13 @@ class OutboundDispatcher:
         if self.config.approvals_in_place and item.kind == "approval":
             # In-place push replaces the admin copy; admins are only the
             # fallback when no chat of the session could show the card.
-            return (await self._deliver_interaction(item, text, targets)
-                    or await self._deliver_interaction(item, text, admins))
-        return await self._deliver_interaction(item, text, targets + admins)
+            delivered = (await self._deliver_interaction(item, text, targets)
+                         or await self._deliver_interaction(item, text, admins))
+        else:
+            delivered = await self._deliver_interaction(item, text, targets + admins)
+        if delivered and item.kind == "approval":
+            await self.on_turn_finished(item.session_id)
+        return delivered
 
     async def _deliver_interaction(self, item, text, targets):
         protocol = self.muse_service.interaction_protocol
@@ -969,6 +1022,9 @@ class OutboundDispatcher:
                                 msg_id=reply_msg_id, target_type=target_type,
                                 target_id=target_id, route_type=route_type,
                                 image_count=len(images), file_count=len(files), video_count=len(videos))
+                    if session_id and ((credential and not credential.terminal)
+                                       or (not self._using_push_stream and purpose != "notification")):
+                        await self.on_turn_finished(session_id)
                 else:
                     self.deduplicator.rollback_processing([mid])
             except Exception as e:

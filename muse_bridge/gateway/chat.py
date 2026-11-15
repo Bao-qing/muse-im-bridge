@@ -184,7 +184,7 @@ class ChatGateway(BaseAdapter):
         try:
             await self.send_notice(
                 admin_target,
-                "【系统告警】向 Muse 发送消息时检测到凭据失效（401 Unauthorized）。\n已自动进入登录回落流程，请直接在此私聊发送：\n/登录 <您的邮箱>\n即可获取验证码重新登录恢复服务 ♪",
+                "【系统告警】向 Muse 发送消息时检测到凭据失效（401 Unauthorized）。\n已自动进入登录回落流程，请直接在此私聊发送：\n/登录 <您的邮箱>\n即可获取验证码重新登录恢复服务",
             )
         except Exception as e:
             logger.debug('Failed to notify admin for login: %s', safe_error(e))

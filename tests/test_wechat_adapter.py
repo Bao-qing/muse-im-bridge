@@ -93,15 +93,44 @@ class TestWeChatSender(unittest.IsolatedAsyncioTestCase):
             state = saved_state(root)
             state.remember_message("owner", "A", "TA")
             client = mock.Mock(send_message=mock.AsyncMock(return_value={"ret": 0}))
-            media = mock.Mock(upload=mock.AsyncMock(side_effect=ValueError("upload failed")))
+            media = mock.Mock(upload=mock.AsyncMock(
+                side_effect=[{"type": 5, "video_item": {}}, ValueError("upload failed")]))
             sender = WeChatSender(client, state, config(), media)
-            self.assertFalse(await sender.send("owner", "caption", images=[{"data": b"image"}], logical_id="pic"))
+            self.assertFalse(await sender.send(
+                "owner", "caption", images=[{"data": b"image"}], videos=[{"data": b"video"}], logical_id="pic"))
             self.assertEqual(client.send_message.await_count, 1)
             media.upload.side_effect = None
             media.upload.return_value = {"type": 2, "image_item": {}}
-            self.assertTrue(await sender.send("owner", "caption", images=[{"data": b"image"}], logical_id="pic"))
-            self.assertEqual(client.send_message.await_count, 2)
-            self.assertEqual(client.send_message.call_args.args[0]["item_list"][0]["type"], 2)
+            self.assertTrue(await sender.send(
+                "owner", "caption", images=[{"data": b"image"}], videos=[{"data": b"video"}], logical_id="pic"))
+            self.assertEqual(client.send_message.await_count, 3)
+            self.assertEqual(
+                [c.args[0]["item_list"][0]["type"] for c in client.send_message.await_args_list],
+                [5, 2, 1],
+            )
+
+    async def test_send_order_video_image_file_then_text(self):
+        from muse_bridge.adapters.wechat.sender import WeChatSender
+        with tempfile.TemporaryDirectory() as root:
+            state = saved_state(root)
+            state.remember_message("owner", "A", "TA")
+            client = mock.Mock(send_message=mock.AsyncMock(return_value={"ret": 0}))
+            type_map = {"video": 5, "image": 2, "file": 4}
+            media = mock.Mock(upload=mock.AsyncMock(
+                side_effect=lambda data, user, kind, name: {"type": type_map[kind]}))
+            sender = WeChatSender(client, state, config(), media)
+            ok = await sender.send(
+                "owner", "caption",
+                images=[{"data": b"img", "filename": "a.png"}],
+                files=[{"data": b"doc", "filename": "b.pdf"}],
+                videos=[{"data": b"vid", "filename": "c.mp4"}],
+                logical_id="order",
+            )
+            self.assertTrue(ok)
+            self.assertEqual(
+                [c.args[0]["item_list"][0]["type"] for c in client.send_message.await_args_list],
+                [5, 2, 4, 1],
+            )
 
     async def test_send_messages_collects_server_message_ids(self):
         from muse_bridge.adapters.wechat.sender import WeChatSender
@@ -168,6 +197,25 @@ class TestWeChatParsing(unittest.TestCase):
         message_int, _, _ = parse_event(raw_int, "bot@im.bot")
         self.assertEqual(message_int.references, [("id", "123456")])
 
+    def test_single_event_orders_attachments_video_image_file(self):
+        from muse_bridge.adapters.wechat.adapter import parse_event
+        raw = {
+            "message_type": 1,
+            "message_id": "multi-item",
+            "from_user_id": "owner",
+            "to_user_id": "bot@im.bot",
+            "context_token": "TA",
+            "item_list": [
+                {"type": 1, "text_item": {"text": "请看附件"}},
+                {"type": 4, "file_item": {"file_name": "doc.pdf"}},
+                {"type": 2, "image_item": {"file_name": "pic.jpg"}},
+                {"type": 5, "video_item": {"file_name": "clip.mp4"}},
+            ],
+        }
+        message, _, _ = parse_event(raw, "bot@im.bot")
+        self.assertEqual([att.type for att in message.attachments], ["video", "image", "file"])
+        self.assertEqual(message.text, "请看附件")
+
     def test_ref_msg_fallback_text_when_no_msg_id(self):
         from muse_bridge.adapters.wechat.adapter import parse_event
         raw = event(mid="22", text="回复")
@@ -212,6 +260,48 @@ class TestWeChatIntake(unittest.IsolatedAsyncioTestCase):
             await adapter.handle_batch(batch)
             self.assertEqual(len(contexts), 2)
 
+    async def test_batch_orders_video_image_file_before_text_and_keeps_command_barrier(self):
+        with tempfile.TemporaryDirectory() as root:
+            adapter, muse, client = make_adapter(root)
+            adapter.media.download = mock.AsyncMock(side_effect=lambda desc, cap, image=False: desc["payload"])
+            posted = []
+
+            def record_post(sid, text, attachments=None, *a, **kw):
+                posted.append((text, [att.type for att in (attachments or [])]))
+                return f"mid-{len(posted)}"
+
+            muse.post_message.side_effect = record_post
+
+            batch = [
+                {"message_type": 1, "message_id": "m-txt1", "from_user_id": "owner", "to_user_id": "bot@im.bot",
+                 "context_token": "T1", "item_list": [{"type": 1, "text_item": {"text": "帮我分析"}}]},
+                {"message_type": 1, "message_id": "m-file", "from_user_id": "owner", "to_user_id": "bot@im.bot",
+                 "context_token": "T2", "item_list": [{"type": 4, "file_item": {"file_name": "a.pdf", "payload": b"f"}}]},
+                {"message_type": 1, "message_id": "m-img1", "from_user_id": "owner", "to_user_id": "bot@im.bot",
+                 "context_token": "T3", "item_list": [{"type": 2, "image_item": {"file_name": "a.png", "payload": b"i"}}]},
+                {"message_type": 1, "message_id": "m-vid1", "from_user_id": "owner", "to_user_id": "bot@im.bot",
+                 "context_token": "T4", "item_list": [{"type": 5, "video_item": {"file_name": "a.mp4", "payload": b"v"}}]},
+                {"message_type": 1, "message_id": "m-cmd", "from_user_id": "owner", "to_user_id": "bot@im.bot",
+                 "context_token": "T5", "item_list": [{"type": 1, "text_item": {"text": "/新建"}}]},
+                {"message_type": 1, "message_id": "m-txt2", "from_user_id": "owner", "to_user_id": "bot@im.bot",
+                 "context_token": "T6", "item_list": [{"type": 1, "text_item": {"text": "新会话内容"}}]},
+                {"message_type": 1, "message_id": "m-img2", "from_user_id": "owner", "to_user_id": "bot@im.bot",
+                 "context_token": "T7", "item_list": [{"type": 2, "image_item": {"file_name": "b.png", "payload": b"i2"}}]},
+            ]
+            await adapter.handle_batch(batch)
+            self.assertEqual(
+                posted,
+                [
+                    ("", ["video"]),
+                    ("", ["image"]),
+                    ("", ["file"]),
+                    ("帮我分析", []),
+                    ("", ["image"]),
+                    ("新会话内容", []),
+                ],
+            )
+            self.assertEqual(adapter.state.context("owner"), "T7")
+
     async def test_any_personal_sender_can_chat_without_access_state(self):
         with tempfile.TemporaryDirectory() as root:
             with mock.patch("muse_bridge.gateway.chat.ChatAccessRequests", side_effect=AssertionError("No access policy")):
@@ -255,6 +345,136 @@ class TestWeChatIntake(unittest.IsolatedAsyncioTestCase):
             task.cancel()
             await asyncio.gather(task, return_exceptions=True)
             self.assertEqual([call.args[2] for call in client.send_typing.await_args_list], [1, 2])
+
+    async def test_full_turn_typing_persists_across_intake_and_stops_on_turn_finish(self):
+        with tempfile.TemporaryDirectory() as root:
+            adapter, muse, client = make_adapter(root)
+            adapter.config.typing_enabled = True
+            client.get_config = mock.AsyncMock(return_value={"typing_ticket": "ticket"})
+            started = asyncio.Event()
+
+            async def send_typing(user, ticket, status):
+                if status == 1:
+                    started.set()
+                return {"ret": 0}
+
+            client.send_typing = mock.AsyncMock(side_effect=send_typing)
+
+            await adapter.handle_batch([event("A", text="hello", token="TA")])
+            await started.wait()
+            sid = muse.post_message.call_args.args[0]
+            self.assertIn("owner", adapter._typing_tasks)
+            self.assertEqual(adapter._typing_sessions.get("owner"), sid)
+            self.assertEqual([c.args[2] for c in client.send_typing.await_args_list], [1])
+
+            # Second message in the same turn reuses the running typing task without status=2 flicker
+            task_before = adapter._typing_tasks["owner"]
+            await adapter.handle_batch([event("B", text="more", token="TB")])
+            self.assertIs(adapter._typing_tasks["owner"], task_before)
+            self.assertNotIn(2, [c.args[2] for c in client.send_typing.await_args_list])
+
+            # Turn completion stops typing and sends status=2
+            await adapter.outbound_pusher.on_turn_finished(sid)
+            self.assertNotIn("owner", adapter._typing_tasks)
+            self.assertNotIn("owner", adapter._typing_sessions)
+            self.assertEqual([c.args[2] for c in client.send_typing.await_args_list], [1, 2])
+
+    async def test_typing_stops_on_failed_intake_commands_clear_and_stop(self):
+        with tempfile.TemporaryDirectory() as root:
+            adapter, muse, client = make_adapter(root)
+            adapter.config.typing_enabled = True
+            client.get_config = mock.AsyncMock(return_value={"typing_ticket": "ticket"})
+            client.send_typing = mock.AsyncMock(return_value={"ret": 0})
+
+            # 1. Local/failed post does not leak typing past handle_inbound
+            muse.post_message.side_effect = TimeoutError("unconfirmed")
+            await adapter.handle_batch([event("fail-1", text="hello", token="TA")])
+            await asyncio.sleep(0)
+            self.assertNotIn("owner", adapter._typing_tasks)
+            self.assertEqual([c.args[2] for c in client.send_typing.await_args_list], [1, 2])
+
+            # 2. /停止 cancels active turn typing
+            client.send_typing.reset_mock()
+            muse.post_message.side_effect = lambda sid, text, *a, **kw: "mid-" + text
+            await adapter.handle_batch([event("chat-1", text="hello", token="TB")])
+            await asyncio.sleep(0)
+            self.assertIn("owner", adapter._typing_tasks)
+            with mock.patch.object(adapter, "handle_inbound", new=mock.AsyncMock(return_value="handled")):
+                await adapter.handle_batch([event("stop-1", text="/停止", token="TC")])
+            self.assertNotIn("owner", adapter._typing_tasks)
+            self.assertEqual([c.args[2] for c in client.send_typing.await_args_list], [1, 2])
+
+            # 3. /新建 switching session cancels active turn typing
+            client.send_typing.reset_mock()
+            await adapter.handle_batch([event("chat-2", text="hello", token="TD")])
+            await asyncio.sleep(0)
+            self.assertIn("owner", adapter._typing_tasks)
+            await adapter.handle_batch([event("new-1", text="/新建", token="TE")])
+            self.assertNotIn("owner", adapter._typing_tasks)
+            self.assertEqual([c.args[2] for c in client.send_typing.await_args_list], [1, 2])
+
+            # 4. on_turns_cleared and adapter.stop() clear active typing
+            client.send_typing.reset_mock()
+            await adapter.handle_batch([event("chat-3", text="hello", token="TF")])
+            await asyncio.sleep(0)
+            self.assertIn("owner", adapter._typing_tasks)
+            await adapter.outbound_pusher.on_turns_cleared()
+            self.assertNotIn("owner", adapter._typing_tasks)
+            self.assertEqual([c.args[2] for c in client.send_typing.await_args_list], [1, 2])
+
+            client.send_typing.reset_mock()
+            await adapter.handle_batch([event("chat-4", text="hello", token="TG")])
+            await asyncio.sleep(0)
+            self.assertIn("owner", adapter._typing_tasks)
+            await adapter.stop()
+            self.assertFalse(adapter._typing_tasks)
+            self.assertEqual([c.args[2] for c in client.send_typing.await_args_list], [1, 2])
+
+    async def test_typing_stops_when_waiting_for_approval_or_credential(self):
+        with tempfile.TemporaryDirectory() as root:
+            adapter, muse, client = make_adapter(root)
+            adapter.config.typing_enabled = True
+            client.get_config = mock.AsyncMock(return_value={"typing_ticket": "ticket"})
+            client.send_typing = mock.AsyncMock(return_value={"ret": 0})
+
+            # Approval pause stops typing after card delivery
+            await adapter.handle_batch([event("A", "owner", "run tool", "TA")])
+            await asyncio.sleep(0)
+            sid = adapter.session_mapper.current("private", "owner")
+            self.assertIn("owner", adapter._typing_tasks)
+            approval = muse.interactions.add("approval", session_id=sid, context={"fingerprint": "fp1"})
+            self.assertTrue(await adapter.outbound_pusher.notify_interaction(approval, "approval-card"))
+            self.assertNotIn("owner", adapter._typing_tasks)
+            self.assertEqual([c.args[2] for c in client.send_typing.await_args_list], [1, 2])
+            approval.state = "approved"
+
+            # Credential card pause stops typing after card delivery
+            client.send_typing.reset_mock()
+            await adapter.handle_batch([event("B", "owner", "login please", "TB")])
+            await asyncio.sleep(0)
+            self.assertIn("owner", adapter._typing_tasks)
+            history = [{
+                "role": "assistant",
+                "message_id": "pres-cred-typing",
+                "seq": 10,
+                "event_name": "delta.presentation",
+                "payload": {
+                    "presentation_id": "pres-cred-typing",
+                    "data": {
+                        "action": {
+                            "type": "credentials_vault",
+                            "data": {
+                                "url": "https://muse.ai/connect/browser-credentials"
+                                       "#page_url=https%3A%2F%2Fexample.invalid%2Flogin"
+                                       "&capture_authorization=cap-auth-typing",
+                            },
+                        }
+                    },
+                },
+            }]
+            await adapter.outbound_pusher._scan_and_dispatch(history, sid)
+            self.assertNotIn("owner", adapter._typing_tasks)
+            self.assertEqual([c.args[2] for c in client.send_typing.await_args_list], [1, 2])
 
     async def test_group_events_never_reach_shared_gateway(self):
         with tempfile.TemporaryDirectory() as root:
