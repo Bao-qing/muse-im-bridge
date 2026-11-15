@@ -23,7 +23,7 @@ if ROOT_DIR not in sys.path:
     sys.path.insert(0, ROOT_DIR)
 
 from muse_bridge.config import constants
-from muse_bridge.config.models import LoggingConfig, QzoneFeedConfig, WeChatConfig, ConfigLoader
+from muse_bridge.config.models import GatewayConfig, LoggingConfig, QzoneFeedConfig, WeChatConfig, ConfigLoader
 from muse_bridge.observability import configure_logging, get_logger, safe_error
 
 logger = get_logger("setup_wizard")
@@ -143,7 +143,7 @@ class FullConfigEditor:
             print("=" * 60)
             print("请选择要修改的配置分类：")
             print("  [1] 🧠 Muse 核心配置 (会话ID / Cookie / 域名 / 审批模式)")
-            print("  [2] 🚪 默认登录通道 (gateway.login_through_adapter)")
+            print("  [2] 🚪 网关配置 (登录通道 / 后台审批推送)")
             print("  [3] 🐧 QQ 官方机器人 (凭据 / 管理员 / 权限开关 / 白名单)")
             print("  [4] 🤖 OneBot (NapCat) (地址 / Token / 触发策略 / 白名单)")
             print("  [5] 📝 日志与监控 (级别 / 控制台 / 日志文件 / 追踪 Trace)")
@@ -239,18 +239,29 @@ class FullConfigEditor:
         gw = self.data.setdefault("gateway", {})
         while True:
             curr = gw.get("login_through_adapter", "")
-            print("\n--- [2] 🚪 默认登录通道配置 ---")
+            print("\n--- [2] 🚪 网关配置 ---")
             print(f"当前 login_through_adapter: {curr or '(未设置)'}")
             print("说明：Cookie 失效时通过此适配器私聊提示登录；QQ / OneBot 发给管理员，微信发给扫码用户。")
             print("可选值: qq / onebot / wechat / 留空（微信通知发给当前扫码用户）")
             print("  [1] 修改 login_through_adapter")
+            print(f"  [2] 后台审批推送: {gw.get('background_approval_push') or '(最近活跃的管理员私聊)'}")
+            print("      qq:<管理员OpenID> / onebot:<管理员QQ号>；留空自动选择，仅私聊")
             print("  [0] 返回上级菜单")
 
-            c = _prompt_input("请输入选项 (0/1)", default="0")
+            c = _prompt_input("请输入选项 (0/1/2)", default="0")
             if c == "0":
                 break
             elif c == "1":
                 gw["login_through_adapter"] = _prompt_choice("请选择登录通知适配器", ["qq", "onebot", "wechat", ""], curr)
+                self._modified = True
+            elif c == "2":
+                value = _prompt_input("后台审批推送目标（留空恢复最近活跃管理员私聊）")
+                try:
+                    value = GatewayConfig(background_approval_push=value).background_approval_push
+                except ValueError as exc:
+                    print(f"❌ {exc}")
+                    continue
+                gw["background_approval_push"] = value
                 self._modified = True
 
     # ---------------- 3. QQ 适配器分类 ----------------

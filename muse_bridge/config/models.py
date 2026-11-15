@@ -345,6 +345,18 @@ class WeChatConfig(ConversationConfig):
 @dataclasses.dataclass
 class GatewayConfig:
     login_through_adapter: str = ""
+    background_approval_push: str = ""
+
+    def __post_init__(self):
+        value = self.background_approval_push
+        if not isinstance(value, str):
+            raise ValueError("gateway.background_approval_push must be a string")
+        self.background_approval_push = value = value.strip()
+        if value:
+            platform, separator, target = value.partition(":")
+            if (platform not in {"qq", "onebot"} or not separator or not target.strip()
+                    or target != target.strip() or ":" in target or any(c.isspace() for c in target)):
+                raise ValueError("gateway.background_approval_push must be qq:<admin id>, onebot:<admin id>, or empty")
 
 
 @dataclasses.dataclass
@@ -393,6 +405,13 @@ class AppConfig:
     debug: bool = False
     logging: LoggingConfig = dataclasses.field(default_factory=LoggingConfig)
     wechat: WeChatConfig = dataclasses.field(default_factory=WeChatConfig)
+
+    def __post_init__(self):
+        if self.gateway.background_approval_push:
+            platform, target = self.gateway.background_approval_push.split(":", 1)
+            adapter = getattr(self, platform)
+            if not adapter.enabled or not adapter.is_admin(target) or target == "*":
+                raise ValueError("gateway.background_approval_push must name an enabled adapter's configured administrator")
 
 
 class ConfigLoader:
@@ -611,7 +630,12 @@ class ConfigLoader:
 
         # 4. Gateway config
         gw_raw = raw_data.get("gateway", {})
-        gw_cfg = GatewayConfig(login_through_adapter=str(gw_raw.get("login_through_adapter", "")))
+        if not isinstance(gw_raw, dict):
+            raise ValueError("gateway must be an object")
+        gw_cfg = GatewayConfig(
+            login_through_adapter=str(gw_raw.get("login_through_adapter", "")),
+            background_approval_push=gw_raw.get("background_approval_push", ""),
+        )
 
         # 5. Logging config. An explicit level wins over legacy debug flags.
         debug = raw_data.get("debug", False) or qq_cfg.debug

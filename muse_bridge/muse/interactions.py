@@ -12,7 +12,8 @@ import uuid
 from urllib.parse import parse_qs, quote, urlparse
 
 from ..core.state_file import atomic_json_write
-from .client.errors import LoginRequired
+from .client.errors import LoginRequired, RPCError
+from .connector_keys import ConnectorKeyRejected, connector_key_context
 from ..observability import get_logger, safe_error, trace_event
 
 
@@ -31,6 +32,8 @@ SECRET_CAPTURE_FIELDS = {
 
 def credential_input_kind(context):
     capture = context.get("capture", "sign_in")
+    if capture == "connector_key":
+        return "key"
     if capture == "verification_code":
         return "code"
     if capture in SECRET_CAPTURE_FIELDS or context.get("secret_field"):
@@ -147,7 +150,11 @@ class MuseInteractions:
         if not isinstance(data, dict):
             return None
         action = data.get("action", data)
-        if not isinstance(action, dict) or action.get("type") != "credentials_vault":
+        if not isinstance(action, dict):
+            return None
+        if action.get("type") == "connector":
+            return self._register_connector_key(event, payload, data, action, session_id, owner)
+        if action.get("type") != "credentials_vault":
             return None
         fields = action.get("data", action)
         if not isinstance(fields, dict):
@@ -242,10 +249,92 @@ class MuseInteractions:
         context["receipt_key"] = receipt_key
         return self.manager.add("credential", owner=owner, session_id=session_id, remote_id=remote_id, ttl=0, context=context)
 
+    def _register_connector_key(self, event, payload, data, action, session_id, owner):
+        if not session_id:
+            return None
+        fields = action.get("data", action)
+        if not isinstance(fields, dict):
+            return None
+        context = connector_key_context(fields, session_id,
+                                        agent_id=payload.get("agent_id") or event.get("agent_id"))
+        if context is None:
+            return None
+        remote_id = next((payload.get(key) for key in
+                          ("presentation_id", "widget_id", "id", "message_id", "host_message_id")
+                          if isinstance(payload.get(key), str) and payload[key]), None)
+        remote_id = remote_id or event.get("message_id")
+        if not isinstance(remote_id, str) or not remote_id:
+            return None
+        state = payload.get("state") or {}
+        if not isinstance(state, dict):
+            return None
+        version = state.get("version", 0)
+        if type(version) is not int or version < 0:
+            return None
+        context.update(state_version=version, title=data.get("title") or "连接器",
+                       subtitle=data.get("subtitle") or "连接器")
+        context["receipt_key"] = self._capture_key(session_id, remote_id, context)
+        completed = context["receipt_key"] in self._capture_receipts
+        existing = self.manager.by_remote("credential", remote_id)
+        if existing:
+            if existing.session_id != session_id or existing.context.get("capture") != "connector_key":
+                return None
+            if existing.terminal or version < existing.context.get("state_version", 0):
+                return existing
+            changed = any(existing.context.get(key) != context.get(key) for key in
+                          ("key_request", "key_endpoint", "key_session_id", "service_name"))
+            if changed:
+                if version <= existing.context.get("state_version", 0):
+                    return existing
+                return self.manager.supersede_credential(existing, context,
+                                                        state="completed" if completed else "available")
+            existing.context["state_version"] = version
+            return existing
+        return self.manager.add("credential", owner=owner, session_id=session_id,
+                                remote_id=remote_id, ttl=0, context=context,
+                                state="completed" if completed else "available")
+
+    def register_connector_key(self, item, secret):
+        if item.kind != "credential" or item.context.get("capture") != "connector_key" or item.terminal:
+            raise ValueError("Connector key input is no longer active")
+        if not isinstance(secret, str) or not secret.strip() or "\n" in secret or "\r" in secret:
+            raise ValueError("Connector key must be one non-empty line")
+        c = item.context
+        body = {**c["key_request"], "api_key": {"key": secret.strip()},
+                "replace_existing": True}
+        if c.get("key_endpoint") == "/api_key_auth/callback":
+            body = {"provider": c["service_name"], "key": secret.strip(),
+                    "session_id": c["key_session_id"]}
+        else:
+            body["session_id"] = c["key_session_id"]
+        digest = hashlib.sha256(json.dumps(body, sort_keys=True).encode()).hexdigest()
+        try:
+            if c.get("submitted_digest") not in (None, digest):
+                raise ValueError("An uncertain connector-key submission can only retry identical input")
+            c["submitted_digest"] = digest
+            # The web client only awaits this RPC; unlike vault capture, its
+            # successful response does not require a capture id.
+            try:
+                self.request("POST", c["key_endpoint"], body, service="authd")
+            except RPCError as exc:
+                if exc.status in {400, 401, 403, 404, 409, 422}:
+                    c.pop("submitted_digest", None)
+                    raise ConnectorKeyRejected("Connector key registration rejected") from exc
+                raise
+            self._record_capture(c["receipt_key"])
+            return c["service_name"]
+        finally:
+            if "api_key" in body:
+                body["api_key"]["key"] = ""
+            else:
+                body["key"] = ""
+
     def capture_credential(self, item, secret):
         if item.kind != "credential" or item.terminal:
             raise ValueError("Credential capture is no longer active")
         c = item.context
+        if credential_input_kind(c) == "key":
+            return self.register_connector_key(item, secret)
         if c.get("auth_providers") or c.get("grant_request_type"):
             raise ValueError("Provider capture must be completed in the web client")
         page = urlparse(c["page_url"])
@@ -289,6 +378,24 @@ class MuseInteractions:
         scope = row.get("scope") or {}
         trace = scope.get("runtime_request_trace") or row.get("runtime_request_trace") or {}
         return scope.get("thread_id") or row.get("thread_id") or trace.get("thread_id") or ""
+
+    @staticmethod
+    def is_background_approval(row):
+        """Positive server evidence, never guess from a missing thread alone."""
+        scope = row.get("scope") or {}
+        trace = scope.get("runtime_request_trace") or row.get("runtime_request_trace") or {}
+        return ((row.get("display") or {}).get("attention_mode") == "background"
+                or (row.get("presentation") or {}).get("attention_mode") == "background"
+                or (scope.get("scope_type") or row.get("scope_type")) == "schedule"
+                or (scope.get("requester_source") or row.get("requester_source")
+                    or trace.get("requester_source")) == "scheduler.cron")
+
+    BACKGROUND_QUEUE = "background:approvals"
+
+    @classmethod
+    def queue_id(cls, item):
+        # A local queue key, not a Muse thread or an IM session binding.
+        return cls.BACKGROUND_QUEUE if item.context.get("background_approval") else item.session_id
 
     @staticmethod
     def merge_approval(row, detail):
@@ -392,12 +499,15 @@ class MuseInteractions:
             return item
         if status != "pending":
             raise ValueError("Approval status missing")
-        sid = self.approval_session(full) or (item.session_id if item else "")
-        if not sid or sid not in self.manager.managed_sessions:
+        background = (self.is_background_approval(row) or self.is_background_approval(full)
+                      or bool(item and item.context.get("background_approval")))
+        sid = "" if background else self.approval_session(full) or (item.session_id if item else "")
+        if not background and (not sid or sid not in self.manager.managed_sessions):
             return None
         if item and (item.terminal or item.session_id != sid):
             return item
         item = item or self.manager.add("approval", session_id=sid, remote_id=remote_id, state="pending", ttl=0)
+        item.context["background_approval"] = background
         fingerprint = self.approval_fingerprint(full)
         if item.context.get("fingerprint") != fingerprint:
             item.context["notified"] = False
@@ -419,7 +529,7 @@ class MuseInteractions:
                         raise ValueError("Invalid pending approval")
                     remote_id = row.get("approval_id")
                     sid = self.approval_session(row)
-                    if sid and sid not in self.manager.managed_sessions:
+                    if sid and sid not in self.manager.managed_sessions and not self.is_background_approval(row):
                         continue
                     if not isinstance(remote_id, str) or not remote_id:
                         raise ValueError("Approval identifier missing")
@@ -461,7 +571,8 @@ class MuseInteractions:
 
     def approval_queue(self, session_id):
         """Pending approvals of one session in stable display order; the head is shown."""
-        pending = sorted(self.manager.pending_approvals(session_id), key=self._requested_at)
+        pending = sorted((i for i in self.manager.pending_approvals()
+                          if self.queue_id(i) == session_id), key=self._requested_at)
         with self._queue_lock:
             if not pending:
                 self._rounds.pop(session_id, None)
@@ -472,7 +583,7 @@ class MuseInteractions:
             return sorted(pending, key=lambda i: rank[i.id])
 
     def queue_heads(self):
-        sessions = list(dict.fromkeys(i.session_id for i in self.manager.pending_approvals()))
+        sessions = list(dict.fromkeys(self.queue_id(i) for i in self.manager.pending_approvals()))
         with self._queue_lock:
             for sid in [s for s in self._rounds if s not in sessions]:
                 del self._rounds[sid]
@@ -480,9 +591,9 @@ class MuseInteractions:
 
     def queue_position(self, item):
         """(position, round size, still pending) for the card header and hints."""
-        queue = self.approval_queue(item.session_id)
+        queue = self.approval_queue(self.queue_id(item))
         with self._queue_lock:
-            order = self._rounds.get(item.session_id, [])
+            order = self._rounds.get(self.queue_id(item), [])
             if item.id not in order:
                 return 1, 1, len(queue)
             return order.index(item.id) + 1, len(order), len(queue)
@@ -490,7 +601,7 @@ class MuseInteractions:
     def display_snapshot(self, item):
         """Taken before sending: what the user will see, to bind later choices."""
         return (item.context.get("fingerprint"),
-                [(i.id, i.context.get("fingerprint")) for i in self.approval_queue(item.session_id)])
+                [(i.id, i.context.get("fingerprint")) for i in self.approval_queue(self.queue_id(item))])
 
     def mark_displayed(self, item, target, snapshot):
         target = self.manager.target_key(target)
@@ -568,10 +679,16 @@ class MuseInteractions:
         lines.extend(f"选项 {n}｜{o['label']}" for n, o in enumerate(options, 1))
         if not options:
             lines.append("服务端未提供可验证的原生选项，请在 Muse 网页处理；")
-        lines.append(f"可直接回复数字审批，也可使用 /审批 {item.id} <数字> ")
-        if waiting > 1:
-            lines.append(f"回复「<数字> all」或 /审批 all <数字>，对排队中的 {waiting} 项全部使用该选项")
-        lines.append("完成审批以继续聊天")
+        if item.context.get("background_approval"):
+            lines.append(f"请引用本卡回复数字，或使用 /审批 {item.id} <数字>；直接发送数字仍作为普通聊天转发")
+            if waiting > 1:
+                lines.append(f"引用本卡回复「<数字> all」或 /审批 {item.id} <数字> 全部，对排队中的 {waiting} 项全部使用该选项")
+        else:
+            lines.append(f"当前会话等待审批时可直接回复数字；其他聊天请引用本卡回复数字，或使用 /审批 {item.id} <数字>")
+            if waiting > 1:
+                lines.append(f"当前会话回复「<数字> all」或 /审批 {item.id} <数字> 全部，对排队中的 {waiting} 项全部使用该选项")
+        lines.append("后台任务等待审批；不影响其他聊天" if item.context.get("background_approval")
+                     else "完成审批以继续聊天")
         return "\n".join(line for line in lines if line)
 
     async def submit_approval(self, item, choice, *, expected_fingerprint=None, automatic=False):
@@ -654,11 +771,16 @@ class MuseInteractions:
                         if any(o["decision"] == choice and not o.get("scope") for o in item.context["options"]):
                             text = await self.submit_approval(item, choice, automatic=True)
                             if policy.notify and item.terminal:
-                                await notify(item, text)
+                                item.context["auto_notification"] = text
                             continue
-                # One card per session at a time; the next is pushed once the head ends.
+                # Keep results pending if no administrator is reachable yet.
+                for item in list(self.manager.items.values()):
+                    text = item.context.get("auto_notification")
+                    if text and self.service.config.approval.notify and await notify(item, text):
+                        item.context.pop("auto_notification", None)
+                # One card per queue at a time; background work has its own queue.
                 for head in self.queue_heads():
-                    if head.session_id not in self._deciding:
+                    if self.queue_id(head) not in self._deciding:
                         await self.announce(head, notify)
             except asyncio.CancelledError:
                 raise

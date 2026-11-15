@@ -187,6 +187,7 @@ def _make_adapter(tmp, **extra):
     cfg = OneBotConfig(**fields)
     muse = mock.Mock()
     muse.interactions = InteractionManager()
+    muse.interaction_protocol.referenced_approvals.return_value = None
     muse.post_message = mock.Mock(side_effect=lambda sid, text, atts, thr: f"mid-{sid}-{text}")
     adapter = OneBotAdapter(config=cfg, muse_service=muse)
     adapter.self_id = SELF

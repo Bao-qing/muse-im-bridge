@@ -83,7 +83,8 @@
     }
   },
   "gateway": {
-    "login_through_adapter": "qq"
+    "login_through_adapter": "qq",
+    "background_approval_push": ""
   },
   "logging": {
     "level": "INFO",

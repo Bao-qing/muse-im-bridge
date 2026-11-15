@@ -173,7 +173,7 @@ class QueueCase(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.remote.posts, [])
         self.assertIn("仅限", self.texts()[-1])
 
-    async def test_admin_private_answers_queue_pushed_from_other_session(self):
+    async def test_other_session_push_does_not_own_admin_private_input(self):
         self.service.interactions.managed_sessions.add("s2")
         self.adapter.session_mapper.bind("group", "G", "s2")
         self.adapter.config.approvals_in_place = False
@@ -182,7 +182,12 @@ class QueueCase(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(queue), 2)
         await self.adapter.notify_interaction(queue[0], self.protocol.format_approval(queue[0]))
         self.adapter.session_mapper.bind("private", "ADMIN", "s9")
+        self.adapter.outbound_pusher.ensure_baseline = AsyncMock()
         await self.send("1 all")
+        self.service.post_message.assert_called_once()
+        self.assertEqual(self.service.post_message.call_args.args[:2], ("s9", "1 all"))
+        self.assertEqual(self.remote.posts, [])
+        await self.send(f"/审批 {queue[0].id} 1 全部")
         self.assertEqual(sorted(r for r, _ in self.remote.posts), ["remote-a", "remote-b"])
 
     def bind_group_only(self):
@@ -339,14 +344,11 @@ class QueueCase(unittest.IsolatedAsyncioTestCase):
         self.assertIn("不属于当前群", self.texts()[-1])
         self.assertEqual(self.remote.posts, [])
 
-    async def test_unverified_background_quote_redisplays_without_decision(self):
+    async def test_unverified_quote_does_not_select_another_sessions_card(self):
         item, = self.load(row("remote-a", 1))
         await self.adapter.notify_interaction(item, self.protocol.format_approval(item))
-        self.assertTrue(await self.quoted("1", "background-card"))
-        self.assertIn("无法验证", self.texts()[-1])
-        self.assertIn(item.id, self.texts()[-1])
+        self.assertFalse(await self.quoted("1", "unrelated-card", session="s9"))
         self.assertEqual(self.remote.posts, [])
-        self.service.post_message.assert_not_called()
 
     async def test_onebot_ordinary_approvals_report_results_for_every_group_trigger(self):
         for trigger in ("all", "at", "prefix"):

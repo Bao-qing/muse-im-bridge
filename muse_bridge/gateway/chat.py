@@ -32,6 +32,7 @@ from ..muse.interactions import ApprovalBlocked
 from ..muse.service import MuseService
 from ..observability import get_logger, safe_error, trace_event
 from .access import ChatAccessRequests
+from .admin_activity import AdminPrivateActivity
 from .interactions import ChatInteractions
 from .outbound import OutboundDispatcher
 from .routes import RouteManager
@@ -77,6 +78,8 @@ class ChatGateway(BaseAdapter):
 
         # Sole exit to the chat for both replies & proactive pushes
         self.outbound_pusher = self.create_outbound()
+        self.admin_private_activity = AdminPrivateActivity(
+            str(config.routes_file) + ".admins.local.json" if config.routes_file else None)
 
         self._in_login_fallback: bool = False
         self.interaction_router = ChatInteractions(self)
@@ -168,6 +171,17 @@ class ChatGateway(BaseAdapter):
     async def notify_interaction(self, item, text):
         return await self.outbound_pusher.notify_interaction(item, text)
 
+    def _admin_activity_identity(self):
+        return self.outbound_pusher.reference_identity() + ":" + self.account_identity()
+
+    def latest_admin_private(self):
+        if not isinstance(self.config, ChatConfig):
+            return None
+        return self.admin_private_activity.latest(self._admin_activity_identity(), self.config.admin_id)
+
+    async def notify_background_approval(self, item, text, admin):
+        return await self.outbound_pusher.notify_background_approval(item, text, admin)
+
     def owns_session(self, session_id: str) -> bool:
         """Whether a chat of this adapter is bound to ``session_id``."""
         return bool(session_id and self.session_mapper.owners(session_id))
@@ -201,6 +215,10 @@ class ChatGateway(BaseAdapter):
         msg_id = msg.id or None
         content = msg.text
         attachments = msg.attachments
+        if (kind == "private" and user == target and isinstance(self.config, ChatConfig)
+                and self.config.is_admin(user)
+                and (content or attachments or self.interaction_router.message_references(event))):
+            self.admin_private_activity.record(self._admin_activity_identity(), user, self.config.admin_id)
 
         if self.access_requests is not None:
             if self.access_requests.is_command(content):

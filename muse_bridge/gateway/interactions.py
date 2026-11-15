@@ -11,6 +11,7 @@ from ..core.state_file import atomic_json_write
 from ..muse.client.errors import LoginRequired
 from ..muse.login import MuseProtocolLogin
 from ..muse.interactions import credential_input_kind, credential_secret_label
+from ..muse.connector_keys import ConnectorKeyRejected
 from ..observability import get_logger, safe_error, trace_event
 
 
@@ -53,15 +54,13 @@ class ChatInteractions:
     def approval_queue(self, session_id):
         return self.protocol.approval_queue(session_id) if session_id else []
 
-    def approval_targets(self, owner, session_id):
-        """Sessions whose queue a bare numeric reply in this chat may answer."""
-        if self.pending(session_id):
-            return [session_id]
-        if owner[0] != "private":
-            return []
-        # Admin private chat also answers queues whose current card it was shown.
-        return [head.session_id for head in self.protocol.queue_heads()
-                if self.target(owner) in head.context.get("displayed_to", {})]
+    def command_approval_targets(self, owner, session_id):
+        """Queues selectable by an explicit batch command, never by ordinary input."""
+        targets = [session_id] if self.pending(session_id) else []
+        if owner[0] == "private":
+            targets.extend(self.protocol.queue_id(head) for head in self.protocol.queue_heads()
+                           if self.target(owner) in head.context.get("displayed_to", {}))
+        return list(dict.fromkeys(targets))
 
     async def display_approval(self, owner, item, msg_id, *, prefix="", items=None):
         """Send one message holding the given cards and bind later choices to it."""
@@ -77,7 +76,7 @@ class ChatInteractions:
         """Keep secret whitespace and route replies past ordinary group triggers."""
         owner = self.adapter.interaction_owner(*owner[:3])
         parts = content.split(None, 1)
-        if parts and parts[0].lower() in {"/凭证", "/密码", "/验证码", "/credential", "/password", "/code"}:
+        if parts and parts[0].lower() in {"/密钥", "/key", "/凭证", "/密码", "/验证码", "/credential", "/password", "/code"}:
             return True
         current = self.manager.current(owner)
         references = self.message_references(event)
@@ -88,32 +87,20 @@ class ChatInteractions:
         session_id = self.adapter.session_mapper.current(owner[0], owner[1]) or ""
         # OneBot calls this before group triggers. Quoted approval choices must
         # reach the local router too; this does not grant approval permission.
-        if APPROVAL_REPLY.fullmatch(content.strip()):
-            if references and self.protocol.referenced_approvals(self.target(owner), references) is not None:
-                return True
-            if self.approval_targets(owner, session_id) or (references and self.approval_cards(owner, session_id)):
-                return True
-        return False
-
-    def approval_cards(self, owner, session_id):
-        return [item for item in list(self.manager.items.values())
-                if item.kind == "approval"
-                and self.target(owner) in item.context.get("displayed_to", {})
-                and (owner[0] == "private" or item.session_id == session_id)]
+        if references:
+            return self.protocol.referenced_approvals(self.target(owner), references) is not None
+        return bool(self.pending(session_id))
 
     async def quoted_approval(self, owner, content, references, session_id, msg_id, is_admin):
-        choice = APPROVAL_REPLY.fullmatch(content.strip())
         bindings = self.protocol.referenced_approvals(self.target(owner), references)
-        if not choice or (bindings is None and not self.approval_cards(owner, session_id)):
+        if bindings is None:
             return False
         if not is_admin:
             await self.reply(owner, "审批仅限已配置的管理员操作。", msg_id)
             return True
-        if bindings is None or len(bindings) != 1:
-            # Background pushes expose no sent-message receipt here. Do not
-            # reinterpret an unverified/ambiguous quote as today's queue head.
-            await self.show_approval(owner, session_id, msg_id, all_sessions=owner[0] == "private",
-                                     prefix="无法验证所引用的审批卡，未提交决定；请按新卡重新选择。\n\n")
+        choice = APPROVAL_REPLY.fullmatch(content.strip())
+        if len(bindings) != 1 or not choice:
+            await self.reply(owner, "请引用单张审批卡回复选项数字，或使用 /审批 编号 <数字>；未提交决定。", msg_id)
             return True
         key, snapshot = bindings[0]
         number = choice.group(1) or choice.group(3)
@@ -128,24 +115,28 @@ class ChatInteractions:
             parts = content.split(None, 1)
             command = parts[0].lower() if parts else ""
             command = {"/login": "/登录", "/cancel": "/取消", "/chat": "/聊天",
-                       "/credential": "/凭证", "/password": "/密码", "/code": "/验证码",
+                       "/key": "/密钥", "/credential": "/凭证", "/password": "/密码", "/code": "/验证码",
                        "/approval": "/审批", "/approve": "/同意", "/deny": "/拒绝"}.get(command, command)
             args = parts[1] if len(parts) > 1 else ""
-            if command not in {"/凭证", "/密码", "/验证码"}:
+            if command not in {"/密钥", "/key", "/凭证", "/密码", "/验证码"}:
                 args = args.strip()
             current = self.manager.current(owner)
             references = self.message_references(event or {})
             referenced = self.manager.referenced_credential(owner[0], owner[1], references, target=self.target(owner))
             if references and command not in {"/取消", "/聊天"}:
                 if referenced is not None:
-                    await self.start_credential(referenced, owner, content, msg_id, is_admin, session_id)
-                    return True
+                    if command in {"/密钥", "/凭证", "/密码", "/验证码"}:
+                        if not args:
+                            args = referenced.id
+                    else:
+                        await self.start_credential(referenced, owner, content, msg_id, is_admin, session_id)
+                        return True
                 if not (current and not current.terminal) and await self.quoted_approval(
                         owner, content, references, session_id, msg_id, is_admin):
                     return True
                 # Quoting any other message is chat, even during credential
                 # entry. Explicit slash commands still use the command router.
-                if current and current.kind == "credential" and command not in {"/登录", "/凭证", "/密码", "/验证码"}:
+                if current and current.kind == "credential" and command not in {"/登录", "/密钥", "/key", "/凭证", "/密码", "/验证码"}:
                     current = None
             if command == "/登录":
                 if owner[0] != "private" or not is_admin:
@@ -186,7 +177,7 @@ class ChatInteractions:
                     await self.reply(owner, "已返回聊天，请重新发送消息。", msg_id)
                 return True
 
-            if command in {"/凭证", "/密码", "/验证码"}:
+            if command in {"/密钥", "/key", "/凭证", "/密码", "/验证码"}:
                 await self.handle_credential(owner, command, args, current, session_id, msg_id, is_admin)
                 return True
             if command in {"/审批", "/同意", "/拒绝"}:
@@ -221,26 +212,18 @@ class ChatInteractions:
                         await self.credential_input(current, owner, content, msg_id, is_admin)
                 return True
 
-            # A bare option number answers the card at the head of the queue.
-            reply = APPROVAL_REPLY.fullmatch(content.strip())
-            targets = self.approval_targets(owner, session_id) if reply else []
-            if len(targets) > 1:
-                await self.show_approval(owner, session_id, msg_id, all_sessions=True,
-                                         prefix="多个会话有待审批，请使用 /审批 编号 <数字>。\n\n")
-                return True
-            if targets:
-                target = targets[0]
-                number = reply.group(1) or reply.group(3)
-                if reply.group(2) or reply.group(3):
-                    await self.handle_approval(owner, "/审批", f"all {number}", target, msg_id, is_admin)
-                else:
-                    head = self.approval_queue(target)[0]
-                    await self.handle_approval(owner, "/审批", f"{head.id} {number}", target, msg_id, is_admin)
-                return True
-
-            # Muse refuses chat while this session has a pending approval.
+            # Only this chat's foreground approval gate owns ordinary input.
+            # Pushing or listing background/other-session cards never enters it.
             if self.pending(session_id):
-                await self.show_approval(owner, session_id, msg_id)
+                reply = APPROVAL_REPLY.fullmatch(content.strip())
+                if reply:
+                    number = reply.group(1) or reply.group(3)
+                    head = self.approval_queue(session_id)[0]
+                    suffix = " 全部" if reply.group(2) or reply.group(3) else ""
+                    await self.handle_approval(owner, "/审批", f"{head.id} {number}{suffix}",
+                                               session_id, msg_id, is_admin)
+                else:
+                    await self.show_approval(owner, session_id, msg_id)
                 return True
             return False
 
@@ -376,7 +359,7 @@ class ChatInteractions:
             return
         parts = args.split()
         if parts[0].lower() in {"all", "全部"}:
-            targets = self.approval_targets(owner, session_id)
+            targets = self.command_approval_targets(owner, session_id)
             if len(parts) != 2 or len(targets) != 1:
                 text = ("当前没有待处理审批。" if not targets else
                         "多个会话有待审批，请使用 /审批 编号 <数字> 全部。" if len(targets) > 1 else
@@ -391,7 +374,7 @@ class ChatInteractions:
             return
         # Admin private chat is the explicit account-wide control surface.
         # A group may only act on its own currently bound Muse session.
-        if owner[0] != "private" and item.session_id != session_id:
+        if owner[0] != "private" and (item.context.get("background_approval") or item.session_id != session_id):
             await self.reply(owner, "此审批不属于当前群绑定的 Muse 会话。", msg_id)
             return
         if item.terminal:
@@ -404,21 +387,23 @@ class ChatInteractions:
             choice = "allow_once"
         elif command == "/拒绝":
             choice = "deny"
+        queue_id = self.protocol.queue_id(item)
+        if (len(parts) == 3 and parts[2].lower() in {"all", "全部"}
+                and item is next(iter(self.approval_queue(queue_id)), None)):
+            await self.decide_all(owner, choice, queue_id, msg_id, snapshot=snapshot)
+            return
         fingerprint = snapshot[0] if snapshot is not None else item.context.get("displayed_to", {}).get(self.target(owner))
         if choice is None or not fingerprint:
             await self.display_approval(owner, item, msg_id)
             return
-        if len(parts) == 3 and parts[2].lower() in {"all", "全部"} and item is next(iter(self.approval_queue(item.session_id)), None):
-            await self.decide_all(owner, choice, item.session_id, msg_id, snapshot=snapshot)
-            return
-        with self.protocol.deciding(item.session_id):
+        with self.protocol.deciding(queue_id):
             try:
                 text = await self.adapter.muse_service.submit_approval(item, choice, expected_fingerprint=fingerprint)
             except Exception as exc:
                 logger.warning('handle_approval unavailable: %s', safe_error(exc))
                 text = "审批结果暂未确认，未放行、未补发任何消息，请重新查看审批。"
             if item.terminal:
-                await self.advance_queue(owner, item.session_id, msg_id, text)
+                await self.advance_queue(owner, queue_id, msg_id, text)
             else:
                 # Re-display authoritative state; never reinterpret an old numeric choice.
                 # The result's first line is the reason; the card itself follows once.
@@ -437,12 +422,13 @@ class ChatInteractions:
 
     async def start_credential(self, item, owner, content, msg_id, is_admin, session_id, lifetime=None):
         owner = self.adapter.interaction_owner(*owner[:3])
+        label = "密钥" if credential_input_kind(item.context) == "key" else "凭证"
         if not self.can_fill_credential(owner, is_admin):
-            text = "仅管理员可以填写凭证。" if not is_admin else "请私聊填写此凭证。"
+            text = f"仅管理员可以填写{label}。" if not is_admin else f"请私聊填写此{label}。"
             await self.reply(owner, text, msg_id)
             return
         if item not in self.credential_candidates(owner, session_id):
-            await self.reply(owner, "此凭证已失效或不属于当前聊天。", msg_id)
+            await self.reply(owner, f"此{label}已失效或不属于当前聊天。", msg_id)
             return
         current = self.manager.current(owner)
         if current and not current.terminal and current is not item:
@@ -454,12 +440,12 @@ class ChatInteractions:
         try:
             self.manager.activate(item, owner)
         except ValueError:
-            await self.reply(owner, "此凭证正在由其他人填写。", msg_id)
+            await self.reply(owner, f"此{label}正在由其他人填写。", msg_id)
             return
         if item.state not in {"wait_username", "wait_password", "wait_code", "wait_secret"}:
             kind = credential_input_kind(item.context)
             item.context["lifetime"] = "on_read" if kind == "code" else (lifetime or "persist")
-            item.state = {"code": "wait_code", "secret": "wait_secret", "sign_in": "wait_username"}[kind]
+            item.state = {"key": "wait_secret", "code": "wait_code", "secret": "wait_secret", "sign_in": "wait_username"}[kind]
             item.expires_at = time.time() + 300
         elif lifetime is not None and lifetime != item.context.get("lifetime"):
             await self.reply(owner, "请先 /取消，再更改保存方式。", msg_id)
@@ -472,7 +458,23 @@ class ChatInteractions:
     async def handle_credential(self, owner, command, args, current, session_id, msg_id, is_admin):
         owner = self.adapter.interaction_owner(*owner[:3])
         if not self.can_fill_credential(owner, is_admin):
-            await self.reply(owner, "仅管理员可以填写凭证。" if not is_admin else "请私聊填写此凭证。", msg_id)
+            label = "密钥" if command == "/密钥" else "凭证"
+            await self.reply(owner, f"仅管理员可以填写{label}。" if not is_admin else f"请私聊填写此{label}。", msg_id)
+            return
+        if command == "/密钥":
+            header, separator, supplied = args.partition("\n")
+            parts = header.split(None, 1)
+            candidates = [i for i in self.credential_candidates(owner, session_id)
+                          if credential_input_kind(i.context) == "key"]
+            item = self.manager.items.get(parts[0].upper()) if parts else (candidates[0] if len(candidates) == 1 else None)
+            if item not in candidates:
+                listing = chr(10).join(f"{i.id}：{i.context.get('title', '连接器')}" for i in candidates)
+                await self.reply(owner, (listing + "\n发送 /密钥 编号，或引用密钥卡发送单行密钥。")
+                                 if listing else "暂无待填写的密钥。", msg_id)
+                return
+            if len(parts) > 1:
+                supplied = parts[1] + separator + supplied
+            await self.start_credential(item, owner, supplied, msg_id, is_admin, session_id)
             return
         if command in {"/密码", "/验证码"}:
             parts = args.split(None, 1)
@@ -487,7 +489,8 @@ class ChatInteractions:
             return
         header, _, supplied = args.partition("\n")
         parts = header.split()
-        candidates = self.credential_candidates(owner, session_id)
+        candidates = [i for i in self.credential_candidates(owner, session_id)
+                      if credential_input_kind(i.context) != "key"]
         item = self.manager.items.get(parts[0].upper()) if parts else (candidates[0] if len(candidates) == 1 else None)
         if item not in candidates:
             listing = chr(10).join(f"{i.id}：{i.context.get('page_url', '')}" for i in candidates)
@@ -536,6 +539,8 @@ class ChatInteractions:
 
     @staticmethod
     def credential_prompt(item):
+        if credential_input_kind(item.context) == "key":
+            return "请发送单行密钥/授权凭据，无需填写账号；凭证才需要账号、密码两行。"
         if item.state == "wait_code":
             return "请输入验证码。"
         if item.state == "wait_secret":
@@ -545,6 +550,9 @@ class ChatInteractions:
         return "请发送账号和密码，每项一行；也可以先发账号。"
 
     async def _capture(self, item, owner, secret, msg_id):
+        if credential_input_kind(item.context) == "key" and ("\n" in secret or "\r" in secret):
+            await self.reply(owner, "密钥只接受一行，请勿发送账号和密码两行。", msg_id, item=item)
+            return
         if not secret or not secret.strip():
             await self.reply(owner, self.credential_prompt(item), msg_id, item=item)
             return
@@ -561,8 +569,10 @@ class ChatInteractions:
             logger.warning('capture unavailable: %s', safe_error(exc))
             if not item.terminal:
                 item.state = previous
-            await self.reply(owner, "保存结果未确认，请用相同内容重试，或 /取消 取消。", msg_id, item=item)
+            text = ("密钥提交被拒绝，请检查后重新输入，或 /取消 取消。" if isinstance(exc, ConnectorKeyRejected)
+                    else "保存结果未确认，请用相同内容重试，或 /取消 取消。")
+            await self.reply(owner, text, msg_id, item=item)
             return
         self.manager.finish(item)
         self.manager.release(owner)
-        await self.reply(owner, "【凭证已保存】", msg_id)
+        await self.reply(owner, "【密钥已保存】" if credential_input_kind(item.context) == "key" else "【凭证已保存】", msg_id)

@@ -228,6 +228,8 @@ class OutboundDispatcher:
         if not self.config.credentials_in_place:
             return "请管理员私聊填写。"
         kind = credential_input_kind(credential.context)
+        if kind == "key":
+            return "管理员可引用此消息，发送单行密钥/授权凭据，无需填写账号。"
         if kind == "code":
             return "管理员可引用此消息，发送验证码。"
         if kind == "secret":
@@ -832,7 +834,19 @@ class OutboundDispatcher:
                 route = fallback
         return target_type, target_id, route, None
 
+    async def notify_background_approval(self, item, text, admin):
+        """Engine-selected inbox, explicitly separate from session-owned delivery."""
+        if (item.kind != "approval" or not item.context.get("background_approval")
+                or not isinstance(self.config, ChatConfig) or not self.config.is_admin(admin) or admin == "*"):
+            return False
+        delivered = await self._deliver_interaction(item, text, [("private", admin)], background=True)
+        logger.info("Background approval %s %s administrator private chat %s:%s", item.id,
+                    "delivered to" if delivered else "not delivered to", self.platform, admin)
+        return delivered
+
     async def notify_interaction(self, item, text):
+        if item.context.get("background_approval"):
+            return False  # Only the engine's single administrator inbox may receive it.
         # Unbound sessions must not emit cards, including admin copies.
         if not self.session_mapper.owners(item.session_id):
             return False
@@ -854,20 +868,24 @@ class OutboundDispatcher:
             await self.on_turn_finished(item.session_id)
         return delivered
 
-    async def _deliver_interaction(self, item, text, targets):
+    async def _deliver_interaction(self, item, text, targets, *, background=False):
         protocol = self.muse_service.interaction_protocol
         delivered = False
         for target_type, target_id in dict.fromkeys(targets):
-            if not self.session_mapper.owners(item.session_id):
+            if background:
+                if target_type != "private" or not self.config.is_admin(target_id) or target_id == "*":
+                    return delivered
+            elif not self.session_mapper.owners(item.session_id):
                 return delivered
             if not target_id:
                 continue
-            if (item.kind == "approval" and item.context.get("displayed_to", {}).get(self.interaction_target(target_type, target_id))
+            if (item.kind == "approval" and not item.terminal
+                    and item.context.get("displayed_to", {}).get(self.interaction_target(target_type, target_id))
                     == item.context.get("fingerprint")):
                 delivered = True  # This chat already shows the current card.
                 continue
             route = self.route_manager.get_latest_for_target(target_type, target_id, max_age_s=280.0)
-            snapshot = protocol.display_snapshot(item) if item.kind == "approval" else None
+            snapshot = protocol.display_snapshot(item) if item.kind == "approval" and not item.terminal else None
             delivery = DeliveryReference(item.session_id, "",
                 approval_binding=(item, snapshot) if snapshot is not None else None,
                 purpose="notification")
@@ -956,11 +974,18 @@ class OutboundDispatcher:
                 credential = self.muse_service.interaction_protocol.register_credential(event, session_id) if session_id else None
                 if credential and not credential.terminal:
                     hint = self.render_credential_hint(credential)
-                    clean_text = chr(10).join((
-                        f"【凭证 {credential.id}】{credential.context['page_url']}",
-                        hint, f"也可发送 \n/凭证 {credential.id} [保存/一次] [凭证]"))
+                    if credential_input_kind(credential.context) == "key":
+                        c = credential.context
+                        clean_text = chr(10).join((
+                            f"【{c['title']}提示】{c['subtitle']}（需要输入单行秘钥/授权凭据）",
+                            f"【密钥 {credential.id}】", hint,
+                            f"也可发送 /密钥 {credential.id}，再发送一行密钥。"))
+                    else:
+                        clean_text = chr(10).join((
+                            f"【凭证 {credential.id}】{credential.context['page_url']}",
+                            hint, f"也可发送 \n/凭证 {credential.id} [保存/一次] [凭证]"))
                 elif credential:
-                    clean_text = "凭证卡已结束。"
+                    clean_text = "密钥卡已结束。" if credential_input_kind(credential.context) == "key" else "凭证卡已结束。"
                 else:
                     clean_text = render_presentation_card_to_text(event) or ""
             else:
@@ -1160,14 +1185,14 @@ class OutboundDispatcher:
         return "【引用】" + (excerpt or "[非文本消息]").replace(chr(10), chr(10) + "> ") + chr(10)
 
     def remember_delivery(self, delivery, target_type, target_id, body):
-        if not delivery or not delivery.session_id or not isinstance(body, dict):
+        if not delivery or not isinstance(body, dict):
             return
         if delivery.approval_binding is not None:
             item, snapshot = delivery.approval_binding
             self.muse_service.interaction_protocol.remember_approval_message(
                 self.interaction_target(target_type, target_id), body, [item], [snapshot])
             return
-        if not delivery.muse_id:
+        if not delivery.session_id or not delivery.muse_id:
             return
         info = body.get("ext_info") or {}
         refs = [("id", body.get("id") or body.get("message_id"))]

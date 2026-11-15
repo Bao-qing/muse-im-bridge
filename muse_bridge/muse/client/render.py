@@ -74,6 +74,9 @@ def render_presentation_card_to_text(event: dict):
     if kind == "internal_link_action_card" or data.get("type") == "credentials_vault" or "credentials" in str(kind).lower():
         sub = data.get("subtitle") or ""
         title = data.get("title") or payload.get("reply_to_text") or "安全存储"
+        action = data.get("action", data)
+        if isinstance(action, dict) and action.get("type") == "connector":
+            return f"【{title}提示】{sub or '连接器'}（需要输入单行秘钥/授权凭据，请前往网页端完成安全输入）"
         inner_data = data.get("data") or {}
         user_lbl = inner_data.get("username_label")
         pwd_lbl = inner_data.get("password_label")
