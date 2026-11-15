@@ -241,7 +241,7 @@ class TestCredentialReplies(unittest.IsolatedAsyncioTestCase):
         with patch.object(self.service, "capture_credential") as capture:
             await self.quoted("other-account\npassword", group=True, sender="OTHER")
         capture.assert_not_called()
-        self.assertEqual(card.owner, ("group", "G", "ADMIN"))
+        self.assertEqual(card.owner, self.adapter.interaction_owner("group", "G", "ADMIN"))
         self.service.post_message.assert_not_called()
 
     def test_conflicting_or_partial_references_fail_closed(self):

@@ -38,7 +38,16 @@ def parse_args(argv=None):
         action="store_true",
         help="Run interactive configuration manager / setup wizard",
     )
-    parser.add_argument(
+    login_modes = parser.add_mutually_exclusive_group()
+    login_modes.add_argument(
+        "--wechat-login", action="store_true",
+        help="Explicitly log in to WeChat iLink and save the active local account",
+    )
+    login_modes.add_argument(
+        "--wechat-status", action="store_true",
+        help="Show redacted local WeChat status without network access",
+    )
+    login_modes.add_argument(
         "--login",
         action="store_true",
         help="Run interactive pure-protocol login to acquire new cookies.json",
@@ -48,6 +57,22 @@ def parse_args(argv=None):
 
 def main(argv=None) -> int:
     args = parse_args(argv)
+
+    # Standalone WeChat commands must not load Muse credentials or detect IP.
+    if args.wechat_login or args.wechat_status:
+        configure_logging(LoggingConfig(file=""))
+        try:
+            from muse_bridge.adapters.wechat.cli import run_login, run_status
+            wechat_config = ConfigLoader.load_wechat(args.config)
+            (run_login if args.wechat_login else run_status)(wechat_config)
+            return 0
+        except (KeyboardInterrupt, EOFError):
+            print("微信操作已取消。")
+            return 1
+        except Exception:
+            # Auth errors can contain QR tickets or verification URLs.
+            logger.error("微信操作失败，请检查本地配置和账号状态；未输出认证详情。")
+            return 1
 
     # 0. Setup mode or auto-prompt on first run without config
     if args.setup:
@@ -132,8 +157,16 @@ def main(argv=None) -> int:
         else:
             print("OneBot Adapter: DISABLED")
 
+        print(f"WeChat Adapter: {'ENABLED' if config.wechat.enabled else 'DISABLED'}")
+        from muse_bridge.adapters.wechat.cli import run_status
+        try:
+            run_status(config.wechat)
+        except Exception:
+            logger.error("微信本地状态不可读取；未进行联网验证。")
+            return 1
+
         print("========================================")
-        print("Config check passed successfully.")
+        print("Config check passed (local checks only; WeChat was not contacted).")
         return 0
 
     # 3. Initialize and run BridgeEngine

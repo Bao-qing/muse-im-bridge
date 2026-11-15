@@ -7,11 +7,11 @@ import contextlib
 import hashlib
 import json
 import os
-import tempfile
 import threading
 import uuid
 from urllib.parse import parse_qs, quote, urlparse
 
+from ..core.state_file import atomic_json_write
 from .client.errors import LoginRequired
 from ..observability import get_logger, safe_error, trace_event
 
@@ -129,18 +129,8 @@ class MuseInteractions:
             if key in self._capture_receipts:
                 return
             receipts = self._capture_receipts | {key}
-            directory = os.path.dirname(os.path.abspath(self._receipt_path))
-            fd, temporary = tempfile.mkstemp(prefix=".capture-", suffix=".tmp", dir=directory)
-            try:
-                with os.fdopen(fd, "w", encoding="utf-8") as handle:
-                    json.dump(sorted(receipts), handle)
-                    handle.flush()
-                    os.fsync(handle.fileno())
-                os.replace(temporary, self._receipt_path)
-                self._capture_receipts = receipts
-            finally:
-                if os.path.exists(temporary):
-                    os.unlink(temporary)
+            atomic_json_write(self._receipt_path, sorted(receipts))
+            self._capture_receipts = receipts
 
     def request(self, method, path, body=None, *, service="sentinel"):
         with self.service.create_client() as client:
@@ -503,11 +493,13 @@ class MuseInteractions:
                 [(i.id, i.context.get("fingerprint")) for i in self.approval_queue(item.session_id)])
 
     def mark_displayed(self, item, target, snapshot):
+        target = self.manager.target_key(target)
         fingerprint, queue = snapshot
         item.context.setdefault("displayed_to", {})[target] = fingerprint
         item.context.setdefault("queue_shown", {})[target] = queue
 
     def remember_approval_message(self, target, body, items, snapshots):
+        target = self.manager.target_key(target)
         if not isinstance(body, dict):
             return
         info = body.get("ext_info") or {}
@@ -524,6 +516,7 @@ class MuseInteractions:
             self._approval_messages.pop(next(iter(self._approval_messages)))
 
     def referenced_approvals(self, target, references):
+        target = self.manager.target_key(target)
         bindings = [self._approval_messages.get((*target, kind, value))
                     for kind, value in references]
         if not bindings or any(b is None or b != bindings[0] for b in bindings):

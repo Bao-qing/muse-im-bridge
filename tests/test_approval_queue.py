@@ -363,6 +363,8 @@ class QueueCase(unittest.IsolatedAsyncioTestCase):
                     adapter.client = MagicMock()
                     adapter.client.send_msg.return_value = {"message_id": 100}
                     adapter.outbound_pusher.client = adapter.client
+                    adapter.self_id = "99"
+                    adapter.outbound_pusher.bind_reference_account("99")
                     item, = self.load(row(f"{trigger}-{mode}", 1))
                     await adapter.notify_interaction(item, self.protocol.format_approval(item))
                     text = {"number": "1", "batch": "1 all", "command": f"/审批 {item.id} 1"}[mode]
@@ -400,6 +402,8 @@ class QueueCase(unittest.IsolatedAsyncioTestCase):
         adapter.client = MagicMock()
         adapter.client.send_msg.return_value = {"message_id": 100}
         adapter.outbound_pusher.client = adapter.client
+        adapter.self_id = "99"
+        adapter.outbound_pusher.bind_reference_account("99")
         item, = self.load(row("remote-a", 1))
         await adapter.notify_interaction(item, self.protocol.format_approval(item))
         event = {"post_type": "message", "message_type": "group", "group_id": 7,

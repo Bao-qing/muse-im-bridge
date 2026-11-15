@@ -97,7 +97,8 @@ class OneBotOutboundPusher(OutboundDispatcher):
             if credential is not None:
                 # Quoting this message later selects the credential (reply segment id).
                 self.muse_service.interactions.remember_credential_message(
-                    sent_type, sent_id, {"id": str((body or {}).get("message_id") or "")}, credential)
+                    sent_type, sent_id, {"id": str((body or {}).get("message_id") or "")}, credential,
+                    target=self.interaction_target(sent_type, sent_id))
 
         # 2. Images and videos as inline segments
         for kind, items, cap in (("image", images, self.config.max_image_bytes),

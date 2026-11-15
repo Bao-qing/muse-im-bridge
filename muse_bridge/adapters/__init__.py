@@ -1,6 +1,6 @@
 from .base import BaseAdapter
 
-__all__ = ["BaseAdapter", "QQAdapter", "OneBotAdapter"]
+__all__ = ["BaseAdapter", "QQAdapter", "OneBotAdapter", "WeChatAdapter"]
 
 
 def __getattr__(name):
@@ -11,4 +11,7 @@ def __getattr__(name):
     if name == "OneBotAdapter":
         from .onebot import OneBotAdapter
         return OneBotAdapter
+    if name == "WeChatAdapter":
+        from .wechat.adapter import WeChatAdapter
+        return WeChatAdapter
     raise AttributeError(name)

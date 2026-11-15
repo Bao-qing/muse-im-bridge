@@ -6,7 +6,11 @@ Supports deep-merging user config over internal defaults.
 
 from __future__ import annotations
 
+import copy
 import dataclasses
+import hashlib
+import math
+from pathlib import Path
 import ipaddress
 import json
 import os
@@ -108,24 +112,15 @@ def _normalize_whitelist(raw: Any) -> Dict[str, Union[List[str], str]]:
 
 
 @dataclasses.dataclass
-class ChatConfig:
-    """Settings shared by every chat platform behind the gateway layer."""
+class ConversationConfig:
+    """Shared session, delivery and media runtime settings; no access policy."""
 
     # Validation messages name the config section, e.g. ``adapters.qq``.
     section: ClassVar[str] = "adapters.chat"
 
     enabled: bool = True
-    admin_id: List[str] = dataclasses.field(default_factory=list)
-    admin_only: bool = constants.DEFAULT_ADMIN_ONLY
-    # Send messages of a session with no bound chat to the first admin.
-    unbound_push_to_admin: bool = constants.DEFAULT_UNBOUND_PUSH_TO_ADMIN
     credentials_in_place: bool = constants.DEFAULT_CREDENTIALS_IN_PLACE
     approvals_in_place: bool = constants.DEFAULT_APPROVALS_IN_PLACE
-    allow_all_private: bool = constants.DEFAULT_ALLOW_ALL_PRIVATE
-    allow_all_group: bool = constants.DEFAULT_ALLOW_ALL_GROUP
-    group_sender_info: bool = True
-    access_requests: AccessRequestsConfig = dataclasses.field(default_factory=AccessRequestsConfig)
-    whitelist: Dict[str, Union[List[str], str]] = dataclasses.field(default_factory=dict)
     delivered_file: str = "data/qq_delivered.jsonl"
     debug: bool = False
 
@@ -146,6 +141,7 @@ class ChatConfig:
     catch_up_window_s: int = constants.DEFAULT_CATCH_UP_WINDOW_S
     catch_up_max_messages: int = constants.DEFAULT_CATCH_UP_MAX_MESSAGES
     recheck_sleep_s: int = constants.DEFAULT_RECHECK_SLEEP_S
+    reconnect_max_retries: int = constants.DEFAULT_RECONNECT_MAX_RETRIES
     in_flight_ttl_s: int = constants.DEFAULT_IN_FLIGHT_TTL_S
     processing_ttl_s: int = constants.DEFAULT_PROCESSING_TTL_S
 
@@ -165,8 +161,29 @@ class ChatConfig:
     download_timeout_s: int = constants.DEFAULT_DOWNLOAD_TIMEOUT_S
 
     def __post_init__(self):
-        for name in ("credentials_in_place", "approvals_in_place", "unbound_push_to_admin",
-                     "allow_all_private", "allow_all_group", "group_sender_info"):
+        for name in ("credentials_in_place", "approvals_in_place"):
+            if type(getattr(self, name)) is not bool:
+                raise ValueError(f"{self.section}.{name} must be a boolean")
+        if type(self.reconnect_max_retries) is not int or self.reconnect_max_retries < 0:
+            raise ValueError(f"{self.section}.reconnect_max_retries must be a non-negative integer")
+
+
+@dataclasses.dataclass
+class ChatConfig(ConversationConfig):
+    """QQ/OneBot access policy, separate from conversation runtime settings."""
+
+    admin_id: List[str] = dataclasses.field(default_factory=list)
+    admin_only: bool = constants.DEFAULT_ADMIN_ONLY
+    unbound_push_to_admin: bool = constants.DEFAULT_UNBOUND_PUSH_TO_ADMIN
+    allow_all_private: bool = constants.DEFAULT_ALLOW_ALL_PRIVATE
+    allow_all_group: bool = constants.DEFAULT_ALLOW_ALL_GROUP
+    group_sender_info: bool = True
+    access_requests: AccessRequestsConfig = dataclasses.field(default_factory=AccessRequestsConfig)
+    whitelist: Dict[str, Union[List[str], str]] = dataclasses.field(default_factory=dict)
+
+    def __post_init__(self):
+        super().__post_init__()
+        for name in ("unbound_push_to_admin", "allow_all_private", "allow_all_group", "group_sender_info"):
             if type(getattr(self, name)) is not bool:
                 raise ValueError(f"{self.section}.{name} must be a boolean")
 
@@ -264,6 +281,68 @@ class OneBotConfig(ChatConfig):
 
 
 @dataclasses.dataclass
+class WeChatConfig(ConversationConfig):
+    """Private-only iLink channel; runtime state is isolated by bot identity."""
+
+    section: ClassVar[str] = "adapters.wechat"
+    enabled: bool = False
+    chunk_chars: int = 4000
+    state_dir: str = "data/wechat"
+    channel_version: str = "2.4.6"
+    route_tag: str = ""
+    http_timeout_s: float = 35
+    polling_timeout_ms: int = 35000
+    typing_enabled: bool = False
+    delivered_file: str = "data/wechat/delivered.jsonl"
+    session_map_file: str = "data/wechat/session_map.json"
+    push_state_file: str = "data/wechat/push_state.json"
+    routes_file: str = "data/wechat/routes.json"
+
+    def __post_init__(self):
+        # WeChat preserves raw types instead of the legacy adapters' coercion.
+        for field in dataclasses.fields(self):
+            value = getattr(self, field.name)
+            if type(field.default) is bool and type(value) is not bool:
+                raise ValueError(f"{self.section}.{field.name} must be a boolean")
+            if (type(field.default) is int and field.name != "http_timeout_s"
+                    and (type(value) is not int or value <= 0)):
+                raise ValueError(f"{self.section}.{field.name} must be a positive integer")
+        if not 1 <= self.chunk_chars <= 4000:
+            raise ValueError(f"{self.section}.chunk_chars must be in 1..4000")
+        try:
+            valid_timeout = (type(self.http_timeout_s) in (int, float)
+                             and math.isfinite(self.http_timeout_s) and self.http_timeout_s > 0)
+        except OverflowError:
+            valid_timeout = False
+        if not valid_timeout:
+            raise ValueError(f"{self.section}.http_timeout_s must be finite and positive")
+        for name in ("state_dir", "channel_version", "delivered_file", "session_map_file",
+                     "push_state_file", "routes_file"):
+            value = getattr(self, name)
+            if not isinstance(value, str) or not value.strip() or "\x00" in value:
+                raise ValueError(f"{self.section}.{name} must be a nonempty string")
+        if not isinstance(self.route_tag, str):
+            raise ValueError(f"{self.section}.route_tag must be a string")
+        if not isinstance(self.session_bindings, dict) or any(
+                not isinstance(k, str) or not k.startswith("private:") or not k[8:]
+                or not isinstance(v, str) or not v.strip()
+                for k, v in self.session_bindings.items()):
+            raise ValueError(f"{self.section}.session_bindings only supports private:<user> bindings")
+
+    def for_account(self, bot_id: str) -> "WeChatConfig":
+        if not isinstance(bot_id, str) or not bot_id.strip():
+            raise ValueError("WeChat bot_id must be nonempty")
+        account_dir = Path(self.state_dir) / "accounts" / hashlib.sha256(bot_id.encode("utf-8")).hexdigest()[:24]
+        config = copy.deepcopy(self)
+        for field, filename in (("delivered_file", "delivered.jsonl"),
+                                ("session_map_file", "session_map.json"),
+                                ("push_state_file", "push_state.json"),
+                                ("routes_file", "routes.json")):
+            setattr(config, field, str(account_dir / filename))
+        return config
+
+
+@dataclasses.dataclass
 class GatewayConfig:
     login_through_adapter: str = ""
 
@@ -313,6 +392,7 @@ class AppConfig:
     gateway: GatewayConfig = dataclasses.field(default_factory=GatewayConfig)
     debug: bool = False
     logging: LoggingConfig = dataclasses.field(default_factory=LoggingConfig)
+    wechat: WeChatConfig = dataclasses.field(default_factory=WeChatConfig)
 
 
 class ConfigLoader:
@@ -327,7 +407,8 @@ class ConfigLoader:
         return result
 
     @classmethod
-    def load(cls, config_path: Optional[str] = None) -> AppConfig:
+    def _read_raw(cls, config_path: Optional[str] = None) -> dict:
+        """Read configuration only, with the same legacy const.json precedence."""
         raw_data: dict = {}
         target_path = config_path
 
@@ -354,6 +435,47 @@ class ConfigLoader:
             except Exception:
                 pass
 
+        return raw_data
+
+    @classmethod
+    def _wechat_from_raw(cls, raw_data: dict) -> WeChatConfig:
+        adapters = raw_data.get("adapters", {})
+        if not isinstance(adapters, dict):
+            raise ValueError("adapters must be an object")
+        # An old config without this new channel must retain its old semantics:
+        # do not impose WeChat-only limits on legacy QQ/OneBot overrides.
+        if "wechat" not in adapters:
+            return WeChatConfig()
+        raw = adapters["wechat"]
+        if not isinstance(raw, dict):
+            raise ValueError("adapters.wechat must be an object")
+        # Old asdict output included inherited QQ/OneBot policy. Discard only
+        # these removed keys; neither their values nor files become new policy.
+        removed_policy = {"admin_id", "admin_only", "whitelist", "allow_all_private",
+                          "allow_all_group", "allow_all_groups", "access_requests",
+                          "unbound_push_to_admin", "group_sender_info"}
+        values = {key: value for key, value in raw.items() if key not in removed_policy}
+        fields = {f.name for f in dataclasses.fields(WeChatConfig)}
+        if values.keys() - fields:
+            raise ValueError("adapters.wechat contains unknown configuration fields")
+        overrides = raw_data.get("overrides", {})
+        if not isinstance(overrides, dict):
+            raise ValueError("overrides must be an object")
+        # Preserve raw types: unlike legacy adapters no bool()/int() coercion.
+        for key in fields - {"enabled", "session_bindings"}:
+            if key in overrides and overrides[key] is not None:
+                values[key] = overrides[key]
+        return WeChatConfig(**values)
+
+    @classmethod
+    def load_wechat(cls, config_path: Optional[str] = None) -> WeChatConfig:
+        """Offline CLI loader: never initializes Muse or detects an egress IP."""
+        return cls._wechat_from_raw(cls._read_raw(config_path))
+
+    @classmethod
+    def load(cls, config_path: Optional[str] = None) -> AppConfig:
+        raw_data = cls._read_raw(config_path)
+        wechat_cfg = cls._wechat_from_raw(raw_data)
         overrides = raw_data.get("overrides", {})
 
         def _get_val(section: dict, key: str, default: Any) -> Any:
@@ -446,7 +568,8 @@ class ConfigLoader:
                 routes_file=raw.get("routes_file", defaults["routes_file"]),
                 catch_up_enabled=bool(_get_val(raw, "catch_up_enabled", constants.DEFAULT_CATCH_UP_ENABLED)),
                 **{key: _int(key) for key in (
-                    "catch_up_window_s", "catch_up_max_messages", "recheck_sleep_s", "in_flight_ttl_s",
+                    "catch_up_window_s", "catch_up_max_messages", "recheck_sleep_s",
+                    "reconnect_max_retries", "in_flight_ttl_s",
                     "processing_ttl_s", "chunk_chars", "max_chunks", "max_image_bytes", "max_file_bytes",
                     "max_video_bytes", "max_video_upload_bytes", "file_ref_threshold_bytes",
                     "gateway_dedup_s", "download_timeout_s")},
@@ -504,6 +627,7 @@ class ConfigLoader:
             muse=muse_cfg,
             qq=qq_cfg,
             onebot=ob_cfg,
+            wechat=wechat_cfg,
             gateway=gw_cfg,
             debug=debug,
             logging=logging_cfg,

@@ -5,7 +5,7 @@ Unifies interactive replies and proactive notifications for every adapter:
 2. Extracts text, images (URLs & workspace), files (workspace & attachments), and videos.
 3. Automatically reads file-store bytes via client.read_file().
 4. Resolves the destination via RouteManager (the chat that asked, else the
-   chat bound to the session, else the first admin privately).
+   chat bound to the session; unbound sessions are never pushed).
 5. Hands the item to the platform's ``_deliver`` (QQ upload API, OneBot segments, ...).
 """
 
@@ -18,12 +18,12 @@ import re
 import time
 from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
-from ..config.models import ChatConfig
+from ..config.models import ChatConfig, ConversationConfig
 from ..core.deduplicator import MessageDeduplicator
 from ..core.message import DeliveryReference, chunk_text
 from ..core.references import MessageReferenceStore
 from ..core.session_map import SessionMapper
-from ..core.state_file import ensure_parent
+from ..core.state_file import atomic_json_write
 from ..muse.client.errors import ConnectionLost, HandshakeError, MuseError, RPCError, SubscribeError, LoginRequired, is_runtime_auth_error
 from ..muse.client.push import PushTurnTracker
 from ..muse.client.render import (
@@ -160,7 +160,7 @@ class OutboundDispatcher:
 
     def __init__(
         self,
-        config: ChatConfig,
+        config: ConversationConfig,
         client: Any,
         muse_service: MuseService,
         deduplicator: MessageDeduplicator,
@@ -175,15 +175,16 @@ class OutboundDispatcher:
         self.route_manager = route_manager
         self._on_login_required = on_login_required
         self.session_mapper = session_mapper or SessionMapper()
-        identity = getattr(config, "app_id", None) or getattr(config, "base_url", "")
         self._reference_state_file = str(config.routes_file) + ".references.local.json" if config.routes_file else None
-        self._reference_identity = f"{self.platform}:{identity}"
+        self._reference_identity = self.reference_identity()
         self.reference_store = MessageReferenceStore(
             state_file=None if self.platform == "onebot" else self._reference_state_file,
             identity=self._reference_identity)
         self._reference_account = None
+        self.muse_service.interactions.register_namespace(self.platform, self.account_identity(), owner=self)
 
         self._running = False
+        self._using_push_stream = False
         self._login_alerted: bool = False
         self._seen_ids: Set[str] = set()
         self._last_seq: int = 0
@@ -197,6 +198,41 @@ class OutboundDispatcher:
         self._pending_subscribe: Set[str] = set()     # sessions that need /聊天/subscribe opened
         self._uncreated_sessions: Set[str] = set()    # lazy sessions (404 until first message is posted)
         self._load_state()
+
+    def reference_identity(self) -> str:
+        """Persistent reference identity; retain legacy QQ/OneBot format."""
+        identity = getattr(self.config, "app_id", None) or getattr(self.config, "base_url", "")
+        return f"{self.platform}:{identity}"
+
+    def account_identity(self) -> str:
+        if self.platform == "onebot":
+            return str(self._reference_account or getattr(self.config, "base_url", ""))
+        return str(getattr(self.config, "app_id", ""))
+
+    def notification_target(self) -> Optional[str]:
+        """Private account notice recipient; personal platforms override this."""
+        return self.config.admin_target() if isinstance(self.config, ChatConfig) else None
+
+    def _interaction_admin_targets(self):
+        """Only access-controlled platforms send extra administrator copies."""
+        if not isinstance(self.config, ChatConfig):
+            return []
+        return [("private", admin) for admin in self.config.admin_id if admin]
+
+    def interaction_target(self, kind, target):
+        return (kind, target, self.platform, self.account_identity())
+
+    def render_credential_hint(self, credential):
+        if credential.context.get("auth_providers") or credential.context.get("grant_request_type"):
+            return "请在 Muse 网页完成此登录。"
+        if not self.config.credentials_in_place:
+            return "请管理员私聊填写。"
+        kind = credential_input_kind(credential.context)
+        if kind == "code":
+            return "管理员可引用此消息，发送验证码。"
+        if kind == "secret":
+            return f"管理员可引用此消息，发送{credential_secret_label(credential.context)}（支持整段多行内容，无需填写账号）。"
+        return "管理员可引用此消息，第一行发送账号，后续内容发送密码或密钥（支持多行）。"
 
     def track_session(self, session_id: str, fresh: bool = False) -> None:
         """Called by the adapter right after creating or posting into ``session_id``.
@@ -232,27 +268,14 @@ class OutboundDispatcher:
         state_file = self.config.push_state_file
         if not state_file:
             return
-        tmp = f"{state_file}.tmp.{os.getpid()}"
         try:
-            ensure_parent(state_file)
-            with open(tmp, "w", encoding="utf-8") as f:
-                json.dump(
-                    {
-                        "last_seq": self._last_seq,
-                        "seen_ids": list(self._seen_ids)[-2000:],
-                        "updated_ts": time.time(),
-                    },
-                    f,
-                    ensure_ascii=False,
-                    indent=2,
-                )
-            os.replace(tmp, state_file)
-        except Exception:
-            if os.path.exists(tmp):
-                try:
-                    os.unlink(tmp)
-                except Exception:
-                    pass
+            atomic_json_write(state_file, {
+                "last_seq": self._last_seq,
+                "seen_ids": list(self._seen_ids)[-2000:],
+                "updated_ts": time.time(),
+            })
+        except Exception as exc:
+            logger.warning("Outbound state write failed: %s", safe_error(exc))
 
     async def start(self) -> None:
         self._running = True
@@ -269,8 +292,16 @@ class OutboundDispatcher:
                 logger.debug('Event stream loop error: %s, reconnecting in 3s...', safe_error(e))
                 await asyncio.sleep(3.0)
 
+    async def on_turn_finished(self, session_id: str) -> None:
+        """Called when a session's active turn finishes, fails, or pauses for input."""
+
+    async def on_turns_cleared(self) -> None:
+        """Called when the dispatcher stops or pauses (e.g. login required)."""
+
     async def stop(self) -> None:
         self._running = False
+        self._using_push_stream = False
+        await self.on_turns_cleared()
 
     # ------------------------------------------------------------------
     # History fetching & media extraction (triggered on demand by events)
@@ -397,12 +428,12 @@ class OutboundDispatcher:
         self._save_state()
 
     async def _notify_login_required(self) -> None:
-        admin_target = self.config.admin_target()
+        admin_target = self.notification_target()
         if admin_target:
             try:
                 await self._send_notice(
                     admin_target,
-                    "【系统提示】获取 Muse 消息时检测到凭据失效（401 Unauthorized）。\n已自动进入登录回落流程，请直接在此私聊发送：\n/登录 <您的邮箱>\n即可获取验证码重新登录恢复服务 ♪",
+                    "【系统提示】获取 Muse 消息时检测到凭据失效（401 Unauthorized）。\n已自动进入登录回落流程，请直接在此私聊发送：\n/登录 <您的邮箱>\n即可获取验证码重新登录恢复服务",
                 )
             except Exception as e:
                 logger.debug('Failed to notify admin for login: %s', safe_error(e))
@@ -450,6 +481,28 @@ class OutboundDispatcher:
         return isinstance(exc, LoginRequired) or is_runtime_auth_error(exc)
 
     @staticmethod
+    def _is_turn_terminal_abort(ev: dict) -> bool:
+        if not isinstance(ev, dict):
+            return False
+        name = ev.get("event") or ev.get("event_name")
+        payload = ev.get("payload") or {}
+        if not isinstance(payload, dict):
+            payload = {}
+        status = payload.get("status") or ev.get("status")
+        if name in ("delta.message_done", "message.assistant"):
+            return status in ("interrupted", "cancelled", "failed", "error")
+        if name == "task.status" and status in ("cancelled", "interrupted", "failed", "error", "stopped"):
+            tid = payload.get("task_id")
+            root = payload.get("root_agent_id")
+            agent = payload.get("agent_id")
+            if root:
+                return tid == root
+            if agent:
+                return tid == agent
+            return True
+        return False
+
+    @staticmethod
     def _classify_push_event(ev: dict, default_sid: Optional[str] = None) -> Tuple[Optional[str], Optional[str]]:
         """Extract (session_id, trigger_kind) from a /聊天/subscribe event.
 
@@ -475,7 +528,7 @@ class OutboundDispatcher:
 
         if name in ("delta.message_done", "message.assistant"):
             status = payload.get("status") or ev.get("status")
-            if status in ("interrupted", "cancelled"):
+            if status in ("interrupted", "cancelled", "failed", "error"):
                 return sid, None
             return sid, "sync"
 
@@ -490,6 +543,8 @@ class OutboundDispatcher:
         if name == "task.status":
             if payload.get("status") == "completed":
                 return sid, "sync"
+            if OutboundDispatcher._is_turn_terminal_abort(ev):
+                return sid, None
             return sid, "stream"
 
         return sid, None
@@ -497,9 +552,13 @@ class OutboundDispatcher:
     async def _run_loop(self) -> None:
         """Pure event-driven loop powered by /聊天/subscribe over persistent Noise WebSocket."""
         loop = asyncio.get_running_loop()
+        reconnect_failures = 0
 
         while self._running:
             if not await asyncio.to_thread(self.muse_service.token_manager.has_credentials):
+                reconnect_failures = 0
+                self._using_push_stream = False
+                await self.on_turns_cleared()
                 if not self._login_alerted:
                     self._login_alerted = True
                     logger.warning('Muse 尚未登录或凭据失效，暂停出站监听，触发回落登录...')
@@ -523,13 +582,16 @@ class OutboundDispatcher:
 
                 # Compatibility fallback if a test mock does not implement `subscribe`
                 if not hasattr(client, "subscribe"):
+                    self._using_push_stream = False
                     await self._run_legacy_poll_once(client)
+                    reconnect_failures = 0
                     now = time.monotonic()
                     is_hot = any(now < self._hot_until.get(s, 0.0) for s in self.session_mapper.session_ids())
                     sleep_s = 1.0 if is_hot else max(1.0, float(self.config.recheck_sleep_s))
                     await asyncio.sleep(sleep_s)
                     continue
 
+                self._using_push_stream = True
                 subscribed_sids: Set[str] = set()
                 trackers: Dict[str, PushTurnTracker] = {}
                 last_ping_mono: float = time.monotonic()
@@ -547,6 +609,7 @@ class OutboundDispatcher:
                         # connection and rebuild only the current bindings.
                         break
                     if not watched:
+                        reconnect_failures = 0
                         await asyncio.sleep(1.0)
                         continue
 
@@ -593,6 +656,7 @@ class OutboundDispatcher:
                             return out
 
                         setup_results = await loop.run_in_executor(None, _setup_sessions, need_setup)
+                        reconnect_failures = 0
                         for sid, hist, is_init, sub_ok in setup_results:
                             if sub_ok:
                                 subscribed_sids.add(sid)
@@ -601,11 +665,12 @@ class OutboundDispatcher:
 
                     if not subscribed_sids:
                         # All watched sessions are lazy/uncreated (waiting for first user message)
+                        reconnect_failures = 0
                         await asyncio.sleep(0.5)
                         continue
 
                     # 2. Read real-time push events from active /聊天/subscribe stream(s)
-                    def _read_And_sync_events() -> List[Tuple[str, List[dict]]]:
+                    def _read_And_sync_events() -> Tuple[List[Tuple[str, List[dict]]], Set[str]]:
                         nonlocal last_ping_mono
                         if hasattr(client, "read_any_subscription_events"):
                             events = client.read_any_subscription_events(timeout=1.0)
@@ -624,10 +689,11 @@ class OutboundDispatcher:
                             if hasattr(client, "read_any_subscription_events"):
                                 events = client.read_any_subscription_events(timeout=0.0)
                         if not events:
-                            return []
+                            return [], set()
 
                         default_sid = next(iter(subscribed_sids)) if len(subscribed_sids) == 1 else None
                         dirty_sids: Set[str] = set()
+                        finished_sids: Set[str] = set()
                         reaction_events: Dict[str, List[dict]] = {}
 
                         for ev in events:
@@ -640,13 +706,18 @@ class OutboundDispatcher:
                             if tracker.feed(ev):
                                 dirty_sids.add(sid)
                                 trackers[sid] = PushTurnTracker(sid)
+                                finished_sids.add(sid)
+                            elif self._is_turn_terminal_abort(ev):
+                                trackers[sid] = PushTurnTracker(sid)
+                                finished_sids.add(sid)
                             elif kind == "sync":
                                 dirty_sids.add(sid)
                             elif kind == "stream":
                                 self._touch_hot(sid)
+                                finished_sids.discard(sid)
 
                         if not dirty_sids:
-                            return []
+                            return [], finished_sids
 
                         synced: List[Tuple[str, List[dict]]] = []
                         for sid in dirty_sids:
@@ -660,16 +731,22 @@ class OutboundDispatcher:
                                 logger.debug('Event-triggered sync failed for %s: %s', sid[:8], safe_error(ex))
                                 if reaction_events.get(sid):
                                     synced.append((sid, reaction_events[sid]))
-                        return synced
+                        return synced, finished_sids
 
-                    synced_batches = await loop.run_in_executor(None, _read_And_sync_events)
+                    synced_batches, finished_sids = await loop.run_in_executor(None, _read_And_sync_events)
+                    reconnect_failures = 0
                     for sid, hist in synced_batches:
                         await self._hydrate_and_dispatch(sid, hist, is_initial_gate=(sid not in self._gated))
+                    for sid in finished_sids:
+                        await self.on_turn_finished(sid)
 
             except asyncio.CancelledError:
                 break
             except Exception as e:
                 if isinstance(e, LoginRequired):
+                    reconnect_failures = 0
+                    self._using_push_stream = False
+                    await self.on_turns_cleared()
                     if not self._login_alerted:
                         self._login_alerted = True
                         logger.warning('Cookie 会话不可用，等待管理员登录。 error=%s', safe_error(e))
@@ -678,7 +755,24 @@ class OutboundDispatcher:
                     continue
                 if is_runtime_auth_error(e) and client is not None:
                     await asyncio.to_thread(self.muse_service.token_manager.invalidate_mint, client.token, client.notary_token)
-                logger.warning("连接暂不可用，保留 Cookie，3 秒后重连。 error=%s", safe_error(e))
+                reconnect_failures += 1
+                max_retries = self.config.reconnect_max_retries
+                if reconnect_failures > max_retries:
+                    logger.error(
+                        "重新连接失败，连续重连已达上限（%d 次），停止自动重连，保留 Cookie。 error=%s",
+                        max_retries,
+                        safe_error(e),
+                    )
+                    self._running = False
+                    self._using_push_stream = False
+                    await self.on_turns_cleared()
+                    break
+                logger.warning(
+                    "重新连接中，保留 Cookie，3 秒后重试（%d/%d）。 error=%s",
+                    reconnect_failures,
+                    max_retries,
+                    safe_error(e),
+                )
                 await asyncio.sleep(3.0)
                 continue
             finally:
@@ -721,23 +815,44 @@ class OutboundDispatcher:
                 return owners[0]
         return "private", ""
 
+    def resolve_delivery_target(self, session_id, last_user_mid, root_exec_id):
+        """Return (kind, real target ID, passive route, delivery purpose)."""
+        owners = self.session_mapper.owners(session_id) if session_id else []
+        route = self.route_manager.match_route(last_user_mid, root_exec_id)
+        if route and session_id and (route.target_type, route.target_id) not in owners:
+            route = None
+        if session_id and not owners:
+            return "private", "", None, None
+        if route:
+            return route.target_type, route.target_id, route, None
+        target_type, target_id = self._proactive_target(session_id)
+        if target_type == "group":
+            fallback = self.route_manager.get_latest_for_target("group", target_id, max_age_s=280.0)
+            if fallback and fallback.msg_id:
+                route = fallback
+        return target_type, target_id, route, None
+
     async def notify_interaction(self, item, text):
         # Unbound sessions must not emit cards, including admin copies.
         if not self.session_mapper.owners(item.session_id):
             return False
-        # Routing is not authorization; only configured admins can decide.
+        # Routing is not authorization; the inbound channel applies its own policy.
         targets = list(self.session_mapper.owners(item.session_id))
         if not targets:
             target = self._proactive_target(item.session_id)
             if target[1]:
                 targets.append(target)
-        admins = [("private", admin) for admin in self.config.admin_id if admin]
+        admins = self._interaction_admin_targets()
         if self.config.approvals_in_place and item.kind == "approval":
             # In-place push replaces the admin copy; admins are only the
             # fallback when no chat of the session could show the card.
-            return (await self._deliver_interaction(item, text, targets)
-                    or await self._deliver_interaction(item, text, admins))
-        return await self._deliver_interaction(item, text, targets + admins)
+            delivered = (await self._deliver_interaction(item, text, targets)
+                         or await self._deliver_interaction(item, text, admins))
+        else:
+            delivered = await self._deliver_interaction(item, text, targets + admins)
+        if delivered and item.kind == "approval":
+            await self.on_turn_finished(item.session_id)
+        return delivered
 
     async def _deliver_interaction(self, item, text, targets):
         protocol = self.muse_service.interaction_protocol
@@ -747,17 +862,18 @@ class OutboundDispatcher:
                 return delivered
             if not target_id:
                 continue
-            if (item.kind == "approval" and item.context.get("displayed_to", {}).get((target_type, target_id))
+            if (item.kind == "approval" and item.context.get("displayed_to", {}).get(self.interaction_target(target_type, target_id))
                     == item.context.get("fingerprint")):
                 delivered = True  # This chat already shows the current card.
                 continue
             route = self.route_manager.get_latest_for_target(target_type, target_id, max_age_s=280.0)
             snapshot = protocol.display_snapshot(item) if item.kind == "approval" else None
-            delivery = (DeliveryReference(item.session_id, "", approval_binding=(item, snapshot))
-                        if snapshot is not None else None)
+            delivery = DeliveryReference(item.session_id, "",
+                approval_binding=(item, snapshot) if snapshot is not None else None,
+                purpose="notification")
             ok = await self._deliver(target_type, target_id, text, [], [], [], route=route, delivery=delivery)
             if ok and snapshot is not None:
-                protocol.mark_displayed(item, (target_type, target_id), snapshot)
+                protocol.mark_displayed(item, self.interaction_target(target_type, target_id), snapshot)
             delivered = bool(ok) or delivered
         return delivered
 
@@ -839,16 +955,7 @@ class OutboundDispatcher:
                 # Non-media presentation cards (browser tasks, credentials vaults, image options, etc.)
                 credential = self.muse_service.interaction_protocol.register_credential(event, session_id) if session_id else None
                 if credential and not credential.terminal:
-                    if credential.context.get("auth_providers") or credential.context.get("grant_request_type"):
-                        hint = "请在 Muse 网页完成此登录。"
-                    elif not self.config.credentials_in_place:
-                        hint = "请管理员私聊填写。"
-                    elif credential_input_kind(credential.context) == "code":
-                        hint = "管理员可引用此消息，发送验证码。"
-                    elif credential_input_kind(credential.context) == "secret":
-                        hint = f"管理员可引用此消息，发送{credential_secret_label(credential.context)}（支持整段多行内容，无需填写账号）。"
-                    else:
-                        hint = "管理员可引用此消息，第一行发送账号，后续内容发送密码或密钥（支持多行）。"
+                    hint = self.render_credential_hint(credential)
                     clean_text = chr(10).join((
                         f"【凭证 {credential.id}】{credential.context['page_url']}",
                         hint, f"也可发送 \n/凭证 {credential.id} [保存/一次] [凭证]"))
@@ -872,37 +979,16 @@ class OutboundDispatcher:
             if not clean_text and not images and not files and not videos:
                 continue
 
-            # Route resolution: "回给谁？"
             meta = payload.get("metadata") or {}
             root_exec_id = meta.get("root_message_execution_id")
-
-            route = self.route_manager.match_route(last_user_mid, root_exec_id)
-            if route and session_id and (route.target_type, route.target_id) not in self.session_mapper.owners(session_id):
-                route = None
-            if session_id and not self.session_mapper.owners(session_id):
-                return
-            if route:
-                target_type = route.target_type
-                target_id = route.target_id
-                reply_msg_id = route.msg_id
-                route_type = "interactive_reply"
-            else:
-                # Proactive push: the chat bound to the session, else the admin
-                target_type, target_id = self._proactive_target(session_id)
-                route_type = "proactive_push"
-                reply_msg_id = None
-                # If target is a group, try to use a recent passive route within 5-min TTL
-                if target_type == "group":
-                    fallback_route = self.route_manager.get_latest_for_target("group", target_id, max_age_s=280.0)
-                    if fallback_route and fallback_route.msg_id:
-                        route = fallback_route
-                        reply_msg_id = route.msg_id
+            target_type, target_id, route, purpose = self.resolve_delivery_target(
+                session_id, last_user_mid, root_exec_id)
+            reply_msg_id = route.msg_id if route else None
+            route_type = "interactive_reply" if route and purpose != "proactive" else "proactive_push"
 
             if not target_id:
-                reason = ("no admin is configured" if self.config.unbound_push_to_admin
-                          else "unbound_push_to_admin is disabled")
-                logger.warning('Message %s of session %s has no bound chat (%s); dropped.',
-                               mid, (session_id or "")[:8], reason)
+                logger.warning('Message %s of session %s has no bound chat; dropped.',
+                               mid, (session_id or "")[:8])
                 continue
 
             # Mark processing
@@ -922,7 +1008,7 @@ class OutboundDispatcher:
                         session_id or "", mid, clean_text[:240],
                         self._event_reply_id(event),
                         {"type": "presentation", "presentation_event_id": payload.get("presentation_id") or mid}
-                        if event_name == "delta.presentation" else None),
+                        if event_name == "delta.presentation" else None, purpose=purpose),
                 )
                 if success:
                     self.deduplicator.mark_delivered([mid])
@@ -932,9 +1018,13 @@ class OutboundDispatcher:
                     self._save_state()
                     logger.info('Dispatched %s -> %s:%s [%s] (imgs=%s, files=%s, vids=%s)', mid, target_type, target_id, route_type, len(images), len(files), len(videos))
                     trace_event(f"{self.platform}.outbound", "message.dispatched", session_id=session_id,
-                                message_id=mid, sent_mid=last_user_mid, msg_id=reply_msg_id, target_type=target_type,
+                                message_id=mid, sent_mid=last_user_mid if purpose != "proactive" else None,
+                                msg_id=reply_msg_id, target_type=target_type,
                                 target_id=target_id, route_type=route_type,
                                 image_count=len(images), file_count=len(files), video_count=len(videos))
+                    if session_id and ((credential and not credential.terminal)
+                                       or (not self._using_push_stream and purpose != "notification")):
+                        await self.on_turn_finished(session_id)
                 else:
                     self.deduplicator.rollback_processing([mid])
             except Exception as e:
@@ -1041,7 +1131,7 @@ class OutboundDispatcher:
         try:
             success = await self._deliver(
                 target_type, target_id, text, [], [], [],
-                delivery=DeliveryReference(session_id, mid, "", mid, plain_text=True))
+                delivery=DeliveryReference(session_id, mid, "", mid, plain_text=True, purpose="notification", revision=seq))
             if success:
                 self.reference_store.set_reaction_state(session_id, mid, max(seq, prev_seq), emojis)
         except Exception as exc:
@@ -1052,6 +1142,7 @@ class OutboundDispatcher:
         if self.platform != "onebot" or not account_id or self._reference_account == str(account_id):
             return
         self._reference_account = str(account_id)
+        self.muse_service.interactions.register_namespace(self.platform, self.account_identity(), owner=self)
         self.reference_store = MessageReferenceStore(
             self._reference_state_file, self._reference_identity + ":" + self._reference_account)
 
@@ -1074,7 +1165,9 @@ class OutboundDispatcher:
         if delivery.approval_binding is not None:
             item, snapshot = delivery.approval_binding
             self.muse_service.interaction_protocol.remember_approval_message(
-                (target_type, target_id), body, [item], [snapshot])
+                self.interaction_target(target_type, target_id), body, [item], [snapshot])
+            return
+        if not delivery.muse_id:
             return
         info = body.get("ext_info") or {}
         refs = [("id", body.get("id") or body.get("message_id"))]

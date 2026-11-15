@@ -469,6 +469,173 @@ class TestOutboundEventDriven(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(fake_client.subscribe.call_count, 1)
         self.assertEqual(fake_client.get_history.call_count, 1)
 
+    async def test_reconnect_stops_after_max_retries(self):
+        from muse_bridge.muse.client.errors import HandshakeError
+
+        pusher, _, service, _ = self._make_pusher(bind_sid="GLOBAL", reconnect_max_retries=2)
+        client = mock.MagicMock()
+        client.connect.side_effect = HandshakeError("gateway handshake failed", status=502)
+        service.create_client.return_value = client
+
+        sleep_calls = []
+
+        async def fake_sleep(delay):
+            sleep_calls.append(delay)
+
+        with mock.patch("muse_bridge.gateway.outbound.asyncio.sleep", side_effect=fake_sleep):
+            await asyncio.wait_for(pusher.start(), timeout=3.0)
+
+        # 1 initial attempt + 2 retries = 3 connection attempts; 2 sleeps of 3s; then stops.
+        self.assertEqual(client.connect.call_count, 3)
+        self.assertEqual(sleep_calls, [3.0, 3.0])
+        self.assertFalse(pusher._running)
+
+    async def test_reconnect_counter_resets_after_healthy_cycle(self):
+        from muse_bridge.muse.client.errors import HandshakeError
+
+        pusher, _, service, _ = self._make_pusher(bind_sid="GLOBAL", reconnect_max_retries=1)
+        failing = mock.MagicMock()
+        failing.connect.side_effect = HandshakeError("gateway handshake failed", status=502)
+
+        healthy = mock.MagicMock()
+        healthy.credentials_current.return_value = True
+        healthy.get_history.return_value = []
+        healthy.read_any_subscription_events.side_effect = [
+            [],
+            HandshakeError("dropped after healthy tick", status=502),
+        ]
+
+        # Sequence: fail -> succeed (resets counter) -> drop (1st retry) -> fail (exceeds 1)
+        service.create_client.side_effect = [failing, healthy, failing]
+
+        sleep_calls = []
+
+        async def fake_sleep(delay):
+            sleep_calls.append(delay)
+
+        with mock.patch("muse_bridge.gateway.outbound.asyncio.sleep", side_effect=fake_sleep):
+            await asyncio.wait_for(pusher.start(), timeout=3.0)
+
+        self.assertEqual(service.create_client.call_count, 3)
+        self.assertEqual(sleep_calls, [3.0, 3.0])
+        self.assertFalse(pusher._running)
+
+    async def test_turn_finished_hook_runs_after_delivery_and_on_root_terminal_abort(self):
+        pusher, _, muse_service, qq_client = self._make_pusher(bind_sid="GLOBAL")
+        sid = "GLOBAL"
+        events_log = []
+
+        orig_deliver = pusher._deliver
+
+        async def tracked_deliver(*args, **kwargs):
+            events_log.append("deliver")
+            return await orig_deliver(*args, **kwargs)
+
+        pusher._deliver = tracked_deliver
+        pusher.on_turn_finished = mock.AsyncMock(side_effect=lambda s: events_log.append(("finished", s)))
+        pusher.on_turns_cleared = mock.AsyncMock(side_effect=lambda: events_log.append("cleared"))
+
+        mock_sub = mock.Mock()
+        fake_client = mock.MagicMock()
+        fake_client.credentials_current.return_value = True
+        fake_client.subscribe.return_value = mock_sub
+
+        hist_calls = 0
+
+        def fake_get_history(s, limit=25):
+            nonlocal hist_calls
+            hist_calls += 1
+            if hist_calls == 1:
+                return [{"seq": 1, "role": "user", "message_id": "u1"}]
+            return [
+                {"seq": 1, "role": "user", "message_id": "u1"},
+                {
+                    "seq": 2,
+                    "role": "assistant",
+                    "message_id": "a1",
+                    "event_name": "message.assistant",
+                    "display_text": "Done!",
+                    "status": "completed",
+                },
+            ]
+
+        fake_client.get_history.side_effect = fake_get_history
+
+        batches = [
+            # Batch 1: subagent failure does NOT end the root turn
+            [
+                {
+                    "event": "task.status",
+                    "payload": {
+                        "session_id": sid,
+                        "status": "failed",
+                        "task_id": "sub-1",
+                        "root_agent_id": "root-1",
+                    },
+                }
+            ],
+            # Batch 2: normal turn completion -> deliver first, then on_turn_finished
+            [
+                {"event": "delta.message_done", "payload": {"session_id": sid, "status": "completed"}},
+                {"event": "task.status", "payload": {"session_id": sid, "status": "completed"}},
+            ],
+            # Batch 3: root task aborted without assistant reply -> still calls on_turn_finished
+            [
+                {
+                    "event": "task.status",
+                    "payload": {
+                        "session_id": sid,
+                        "status": "cancelled",
+                        "task_id": "root-1",
+                        "root_agent_id": "root-1",
+                    },
+                }
+            ],
+        ]
+        read_idx = 0
+
+        def fake_read_events(timeout=1.0):
+            nonlocal read_idx
+            if read_idx < len(batches):
+                batch = batches[read_idx]
+                read_idx += 1
+                return batch
+            pusher._running = False
+            return []
+
+        fake_client.read_any_subscription_events.side_effect = fake_read_events
+        muse_service.create_client.return_value = fake_client
+
+        pusher._running = True
+        await asyncio.wait_for(pusher._run_loop(), timeout=5.0)
+        await pusher.stop()
+
+        self.assertEqual(
+            events_log,
+            ["deliver", ("finished", sid), ("finished", sid), "cleared"],
+        )
+        qq_client.send_message.assert_called_once()
+
+    async def test_login_required_clears_active_turns(self):
+        from muse_bridge.muse.client.errors import LoginRequired
+
+        pusher, _, muse_service, _ = self._make_pusher(bind_sid="GLOBAL")
+        pusher.on_turns_cleared = mock.AsyncMock()
+        pusher._notify_login_required = mock.AsyncMock()
+
+        fake_client = mock.MagicMock()
+        fake_client.connect.side_effect = LoginRequired("expired")
+        muse_service.create_client.return_value = fake_client
+
+        async def stop_on_sleep(delay):
+            pusher._running = False
+
+        pusher._running = True
+        with mock.patch("muse_bridge.gateway.outbound.asyncio.sleep", side_effect=stop_on_sleep):
+            await asyncio.wait_for(pusher._run_loop(), timeout=3.0)
+
+        pusher.on_turns_cleared.assert_awaited_once()
+
 
 if __name__ == "__main__":
     unittest.main()

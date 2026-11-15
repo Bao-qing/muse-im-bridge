@@ -7,8 +7,8 @@ A platform adapter (QQ, OneBot, ...) subclasses it and only translates:
 raw platform events -> ``InboundMessage`` -> ``handle_inbound``, and the
 send / download hooks below -> platform API calls.
 
-Inbound flow (identical for every platform):
-access command -> whitelist -> interaction input (OTP, passwords, approval
+Inbound flow (access policy only for platforms that configure it):
+optional access command / whitelist -> interaction input (OTP, passwords, approval
 numbers) -> login gate -> local slash commands -> per-chat session ->
 ``post_message`` (returns at once) -> route registration. The reply comes
 back through the outbound dispatcher, never through this call.
@@ -21,13 +21,13 @@ import json
 from typing import Dict, List, Optional, Tuple
 
 from ..adapters.base import BaseAdapter
-from ..config.models import ChatConfig
+from ..config.models import ChatConfig, ConversationConfig
 from ..core.commands import CHINESE_COMMANDS, GATEWAY_COMMANDS, CommandError, CommandHandler
 from ..core.deduplicator import MessageDeduplicator
 from ..core.message import Attachment, InboundMessage
+from ..core.interactions import interaction_owner
 from ..core.session_map import SessionMapper
-from ..muse.client.errors import (ConnectionLost, CredentialRefreshError, HandshakeError,
-                                  LoginRequired, is_runtime_auth_error)
+from ..muse.client.errors import LoginRequired, is_runtime_auth_error
 from ..muse.interactions import ApprovalBlocked
 from ..muse.service import MuseService
 from ..observability import get_logger, safe_error, trace_event
@@ -47,7 +47,7 @@ class ChatGateway(BaseAdapter):
 
     def __init__(
         self,
-        config: ChatConfig,
+        config: ConversationConfig,
         muse_service: MuseService,
         deduplicator: Optional[MessageDeduplicator] = None,
     ):
@@ -67,11 +67,11 @@ class ChatGateway(BaseAdapter):
             bindings=self.config.session_bindings,
         )
 
-        # Bind configured main session to admin's private chat if not already bound
+        # A platform's notification recipient may own the configured main session.
         main_sid = self.muse_service.config.session_id
-        admin_target = self.config.admin_target()
-        if main_sid and admin_target and not self.session_mapper.current("private", admin_target):
-            self.session_mapper.bind("private", admin_target, main_sid)
+        target = self.notification_target()
+        if main_sid and target and not self.session_mapper.current("private", target):
+            self.session_mapper.bind("private", target, main_sid)
 
         self.muse_service.interactions.managed_sessions.update(self.session_mapper.session_ids())
 
@@ -80,7 +80,8 @@ class ChatGateway(BaseAdapter):
 
         self._in_login_fallback: bool = False
         self.interaction_router = ChatInteractions(self)
-        self.access_requests = ChatAccessRequests(self)
+        self.access_requests = (ChatAccessRequests(self)
+                                if getattr(config, "access_requests", None) is not None else None)
         self._chat_send_locks: Dict[Tuple[str, str], asyncio.Lock] = {}
         self._running = False
 
@@ -93,6 +94,40 @@ class ChatGateway(BaseAdapter):
     def access_identity(self) -> str:
         """Bot identity stored with whitelist grants (refuses a foreign state file)."""
         raise NotImplementedError
+
+    def account_identity(self) -> str:
+        """Stable local account namespace; platforms may override (e.g. bot_id)."""
+        return self.outbound_pusher.account_identity()
+
+    def notification_target(self) -> Optional[str]:
+        """Private recipient of account notices; legacy channels use their admin."""
+        return self.config.admin_target() if isinstance(self.config, ChatConfig) else None
+
+    def can_manage(self, user: str) -> bool:
+        """Personal channels need no platform role to manage Muse interactions."""
+        return self.access_requests is None or self.config.is_admin(user)
+
+    def _admin_commands_only(self) -> bool:
+        return isinstance(self.config, ChatConfig) and self.config.admin_only
+
+    def _login_instruction(self) -> str:
+        return ("请管理员私聊发送 /登录 或 /登录 <邮箱>。" if self.access_requests is not None
+                else "请发送 /登录 或 /登录 <邮箱>。")
+
+    def interaction_owner(self, kind, target, user):
+        return interaction_owner(kind, target, user, self.name, self.account_identity())
+
+    def render_command_output(self, text):
+        return text
+
+    def can_recreate_session(self, error) -> bool:
+        """Only a confirmed missing-session rejection permits one new-session POST.
+
+        Platforms requiring conservative acceptance (e.g. WeChat) may return False.
+        A bare 404, a missing quote, or a transport error is not confirmation.
+        """
+        message = str(error).lower()
+        return "status 404" in message and "session not found" in message
 
     async def send_reply(self, target_type: str, target_id: str, text: str,
                          msg_id: Optional[str] = None) -> dict:
@@ -107,7 +142,7 @@ class ChatGateway(BaseAdapter):
                                   msg_id: Optional[str] = None) -> None:
         """Deliver the output of a local slash command (best effort)."""
         try:
-            await self.send_reply(target_type, target_id, text, msg_id)
+            await self.send_reply(target_type, target_id, self.render_command_output(text), msg_id)
         except Exception as e:
             logger.warning('Command reply to %s:%s failed: %s', target_type, target_id, safe_error(e))
 
@@ -149,7 +184,7 @@ class ChatGateway(BaseAdapter):
         try:
             await self.send_notice(
                 admin_target,
-                "【系统告警】向 Muse 发送消息时检测到凭据失效（401 Unauthorized）。\n已自动进入登录回落流程，请直接在此私聊发送：\n/登录 <您的邮箱>\n即可获取验证码重新登录恢复服务 ♪",
+                "【系统告警】向 Muse 发送消息时检测到凭据失效（401 Unauthorized）。\n已自动进入登录回落流程，请直接在此私聊发送：\n/登录 <您的邮箱>\n即可获取验证码重新登录恢复服务",
             )
         except Exception as e:
             logger.debug('Failed to notify admin for login: %s', safe_error(e))
@@ -157,7 +192,7 @@ class ChatGateway(BaseAdapter):
     # ------------------------------------------------------------------
     # Inbound pipeline
     # ------------------------------------------------------------------
-    async def handle_inbound(self, msg: InboundMessage) -> None:
+    async def handle_inbound(self, msg: InboundMessage) -> str:
         """Process one parsed chat message (ids already validated, mentions stripped)."""
         kind = msg.source.chat_type
         target = msg.source.target_id
@@ -167,40 +202,41 @@ class ChatGateway(BaseAdapter):
         content = msg.text
         attachments = msg.attachments
 
-        if self.access_requests.is_command(content):
-            owner = (kind, target, user)
-            async with self.muse_service.interactions.owner_lock(owner):
-                current = self.muse_service.interactions.current(owner)
-                if (current and not current.terminal) or self.interaction_router.message_references(event):
-                    await self.send_reply(kind, target, "请先结束当前填写，再单独发送申请命令。", msg_id)
-                    return
-                await self.access_requests.handle(kind, target, user, content, msg_id)
-            return
-        if not self.access_requests.allows(kind, target, user):
-            logger.debug('Ignored %s message: sender not in whitelist', kind)
-            return
+        if self.access_requests is not None:
+            if self.access_requests.is_command(content):
+                owner = self.interaction_owner(kind, target, user)
+                async with self.muse_service.interactions.owner_lock(owner):
+                    current = self.muse_service.interactions.current(owner)
+                    if (current and not current.terminal) or self.interaction_router.message_references(event):
+                        await self.send_reply(kind, target, "请先结束当前填写，再单独发送申请命令。", msg_id)
+                        return "handled"
+                    await self.access_requests.handle(kind, target, user, content, msg_id)
+                return "handled"
+            if not self.access_requests.allows(kind, target, user):
+                logger.debug('Ignored %s message: sender not in whitelist', kind)
+                return "handled"
 
         if not content and not attachments and not self.interaction_router.message_references(event):
-            return
+            return "handled"
 
         target_type, target_id = kind, target
-        is_admin = self.config.is_admin(user)
-        owner = (target_type, target_id, user)
+        can_manage = self.can_manage(user)
+        owner = self.interaction_owner(target_type, target_id, user)
         session_id = self.session_mapper.current(target_type, target_id) or ""
 
         # Consume sensitive input before any raw message logging.
-        if await self.interaction_router.handle(owner, content, msg_id, is_admin, session_id, event=event):
+        if await self.interaction_router.handle(owner, content, msg_id, can_manage, session_id, event=event):
             logger.info('Local interaction from %s:%s: [redacted]', target_type, target_id)
-            return
+            return "handled"
 
         available = await asyncio.to_thread(self.muse_service.token_manager.has_credentials)
         if available and self._in_login_fallback:
             self.exit_login_mode()
         needs_login = not available
         if needs_login and not content.startswith("/"):
-            text = "Muse 认证不可用，请管理员私聊发送 /登录 或 /登录 <邮箱>。"
+            text = "Muse 认证不可用，" + self._login_instruction()
             await self.send_reply(target_type, target_id, text, msg_id)
-            return
+            return "handled"
 
         logger.info("Inbound platform=%s target_type=%s target_id=%s msg_id=%s attachments=%s",
                     self.name, target_type, target_id, msg_id, len(attachments))
@@ -208,8 +244,8 @@ class ChatGateway(BaseAdapter):
         # 1. Local Slash Commands
         parsed = CommandHandler.parse_command(content)
         if parsed is not None:
-            await self._run_command(parsed, target_type, target_id, msg_id, is_admin)
-            return
+            await self._run_command(parsed, target_type, target_id, msg_id, can_manage)
+            return "handled"
 
         # Muse understands its native English commands, not their Chinese labels.
         parts = content.split(None, 1)
@@ -229,19 +265,20 @@ class ChatGateway(BaseAdapter):
         chat_lock = self._chat_send_locks.setdefault((target_type, target_id), asyncio.Lock())
         async with chat_lock:
             references = msg.references or self.interaction_router.message_references(event)
-            if kind == "group" and self.config.group_sender_info and not content.startswith("/"):
+            if (kind == "group" and isinstance(self.config, ChatConfig)
+                    and self.config.group_sender_info and not content.startswith("/")):
                 info = {"用户ID": user}
                 for label, value in (("昵称", msg.source.sender_name), ("群名片", msg.source.sender_card)):
                     if isinstance(value, str) and value.strip():
                         info[label] = value.strip()
                 content = "【群消息发送者 " + json.dumps(info, ensure_ascii=False) + "】\n" + content
-            await self._forward(target_type, target_id, content, attachments, msg_id, is_admin, references, event)
+            return await self._forward(target_type, target_id, content, attachments, msg_id, can_manage, references, event)
 
-    async def _run_command(self, parsed, target_type, target_id, msg_id, is_admin) -> None:
+    async def _run_command(self, parsed, target_type, target_id, msg_id, can_manage) -> None:
         cmd_name, cmd_args = parsed
 
         # Check admin-only permission switch
-        if self.config.admin_only and cmd_name in ADMIN_COMMANDS and not is_admin:
+        if self._admin_commands_only() and cmd_name in ADMIN_COMMANDS and not can_manage:
             await self.send_reply(
                 target_type,
                 target_id,
@@ -285,7 +322,7 @@ class ChatGateway(BaseAdapter):
         except Exception as e:
             if isinstance(e, LoginRequired):
                 self.enter_login_mode()
-                reply = "Muse Cookie 会话已失效，请管理员私聊 /登录。"
+                reply = "Muse Cookie 会话已失效，" + self._login_instruction()
             else:
                 if is_runtime_auth_error(e) and client is not None:
                     await asyncio.to_thread(self.muse_service.token_manager.invalidate_mint, client.token, client.notary_token)
@@ -300,7 +337,10 @@ class ChatGateway(BaseAdapter):
         # Reply command output directly
         await self.send_command_output(target_type, target_id, reply, msg_id)
 
-    async def _forward(self, target_type, target_id, content, attachments, msg_id, is_admin, references=(), event=None) -> None:
+    async def _forward(self, target_type, target_id, content, attachments, msg_id, can_manage, references=(), event=None) -> str:
+        """handled: consumed; unknown: POST may have run; retryable: no POST attempted."""
+        post_started = False
+        session_id = ""
         loop = asyncio.get_running_loop()
         quote = {}
 
@@ -322,11 +362,13 @@ class ChatGateway(BaseAdapter):
                 try:
                     att.data = await self.download_attachment(att, max_cap)
                 except Exception as e:
-                    content += f"\n[{att.type}下载失败：{e}]"
+                    logger.warning('Attachment download failed: %s', safe_error(e))
+                    content += f"\n[{att.type}下载失败]"
 
         try:
-            # Bind configured main session to admin's private chat if not yet bound
-            if target_type == "private" and is_admin and self.muse_service.config.session_id:
+            # Preserve the legacy admin main-session binding, not every personal chat.
+            if (target_type == "private" and isinstance(self.config, ChatConfig)
+                    and can_manage and self.muse_service.config.session_id):
                 if not self.session_mapper.current("private", target_id):
                     self.session_mapper.bind("private", target_id, self.muse_service.config.session_id)
 
@@ -351,6 +393,7 @@ class ChatGateway(BaseAdapter):
                 content = "【引用消息未关联到当前会话】" + chr(10) + content
 
             # Post message to Muse in strict chronological order
+            post_started = True
             sent_mid = await asyncio.to_thread(
                 self.muse_service.post_message, session_id, content, attachments,
                 self.config.file_ref_threshold_bytes, **quote)
@@ -364,59 +407,46 @@ class ChatGateway(BaseAdapter):
             logger.debug('Message delivered to Muse (mid=%s), route registered for %s:%s', sent_mid, target_type, target_id)
             trace_event(f"{self.name}.adapter", "route.registered", session_id=session_id, sent_mid=sent_mid,
                         target_type=target_type, target_id=target_id, msg_id=msg_id)
+            return "handled" if sent_mid else "unknown"
         except ApprovalBlocked as e:
             await self.send_reply(target_type, target_id, str(e), msg_id)
-            return
+            return "handled"
         except Exception as e:
-            err_msg = str(e).lower()
             if isinstance(e, LoginRequired):
-                logger.warning('Cookie 会话不可用，需要管理员登录。 error=%s', safe_error(e))
+                logger.warning('Cookie 会话不可用，需要重新登录。 error=%s', safe_error(e))
                 self.enter_login_mode()
-                admin_target = self.config.admin_target()
-                if target_type == "private" and is_admin:
-                    reply = "【系统提示】发送消息时检测到 Muse 会话凭据已失效，已进入登录回落流程。\n请发送 /登录 或 /登录 <邮箱> 获取验证码。"
+                target = self.notification_target()
+                if target_type == "private" and can_manage:
+                    reply = "Muse 会话凭据已失效，请发送 /登录 或 /登录 <邮箱>。"
                 else:
-                    reply = "【系统提示】Muse 会话凭据已失效，服务已暂停并进入登录维护状态，已通知管理员重新登录。"
-                    if admin_target and (target_type != "private" or target_id != admin_target):
-                        loop.call_soon(
-                            asyncio.create_task,
-                            self._notify_admin_login(admin_target),
-                        )
+                    reply = "Muse 会话凭据已失效，已通知管理员重新登录。"
+                    if target and (target_type != "private" or target_id != target):
+                        loop.call_soon(asyncio.create_task, self._notify_admin_login(target))
                 await self.send_reply(target_type, target_id, reply, msg_id)
-                return
-            if isinstance(e, (CredentialRefreshError, HandshakeError, ConnectionLost)) or is_runtime_auth_error(e):
-                await self.send_reply(target_type, target_id,
-                    "连接暂不可用，消息结果未确认；未自动重发，请稍后核对。", msg_id)
-                return
-            if quote and ("status 404" in err_msg or "not_found" in err_msg):
-                # A missing quote target is not evidence that the chat session died.
-                await self.send_reply(target_type, target_id,
-                    "引用原消息无法读取，未自动重发；请取消引用后重试。", msg_id)
-                return
-            if "status 404" in err_msg or "session not found" in err_msg or "not_found" in err_msg:
-                # Session expired / deleted on Muse: auto-recreate a new session!
-                new_sid = self.session_mapper.new_session(target_type, target_id)
-                logger.warning('Session %s expired/not found on Muse, auto-created new session %s error=%s', session_id[:8], new_sid[:8], safe_error(e))
+                return "unknown" if post_started else "retryable"
+            if post_started and not quote and self.can_recreate_session(e):
+                # Preserve legacy recovery only for an explicit session rejection.
+                # A failed recovery POST is never replayed again.
                 try:
-                    sent_mid = await loop.run_in_executor(
-                        None,
-                        self.muse_service.post_message,
-                        new_sid,
-                        content,
-                        attachments,
-                        self.config.file_ref_threshold_bytes,
-                    )
+                    new_sid = self.session_mapper.new_session(target_type, target_id)
+                    self.outbound_pusher.track_session(new_sid, fresh=True)
+                    sent_mid = await asyncio.to_thread(
+                        self.muse_service.post_message, new_sid, content, attachments,
+                        self.config.file_ref_threshold_bytes)
                     if sent_mid and msg_id:
                         self.outbound_pusher.reference_store.remember(
                             new_sid, target_type, target_id, sent_mid, own_references, content)
-                    self.outbound_pusher.track_session(new_sid, fresh=True)
+                    self.outbound_pusher.track_session(new_sid)
                     self.route_manager.register(sent_mid, target_type, target_id, msg_id)
-                    trace_event(f"{self.name}.adapter", "route.registered", session_id=new_sid, sent_mid=sent_mid,
-                                target_type=target_type, target_id=target_id, msg_id=msg_id)
-                    return
-                except Exception as retry_err:
-                    logger.error('Failed to post message to new session: %s', safe_error(retry_err))
-                    await self.send_reply(target_type, target_id, f"会话重建后发送出错：{retry_err}", msg_id)
-                    return
+                    return "handled" if sent_mid else "unknown"
+                except Exception as recovery_error:
+                    logger.error('Missing-session recovery unconfirmed: %s', safe_error(recovery_error))
+                    await self.send_command_output(target_type, target_id,
+                        "会话重建后发送结果未确认；未自动重发，请稍后核对。", msg_id)
+                    return "unknown"
+            # Transport failures and unclassified errors never replay user input.
             logger.error('Failed to post message to Muse: %s', safe_error(e))
-            await self.send_reply(target_type, target_id, f"转接出错了：{e}", msg_id)
+            await self.send_reply(target_type, target_id,
+                "连接暂不可用，消息结果未确认；未自动重发，请稍后核对。" if post_started
+                else "连接暂不可用，消息尚未发送，请稍后重试。", msg_id)
+            return "unknown" if post_started else "retryable"

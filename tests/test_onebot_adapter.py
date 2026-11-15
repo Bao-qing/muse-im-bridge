@@ -306,7 +306,9 @@ class TestOneBotInbound(unittest.IsolatedAsyncioTestCase):
             adapter, muse = _make_adapter(tmp)
             muse.post_message.side_effect = RuntimeError("boom")
             await adapter.handle_event(_private(100, "hello", 1))
-            self.assertEqual(_sent_texts(adapter)[-1], "转接出错了：boom")
+            self.assertIn("结果未确认", _sent_texts(adapter)[-1])
+            self.assertNotIn("boom", _sent_texts(adapter)[-1])
+            muse.post_message.assert_called_once()
 
     async def test_image_downloaded_with_cap_and_file_via_file_source(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -332,7 +334,19 @@ class TestOneBotInbound(unittest.IsolatedAsyncioTestCase):
             event = _private(100, "", 1)
             event["message"] = [{"type": "file", "data": {"file": "d.txt", "file_id": "/fid"}}]
             await adapter.handle_event(event)
-            self.assertIn("[file下载失败：NapCat 未提供可下载地址]", muse.post_message.call_args.args[1])
+            self.assertIn("[file下载失败]", muse.post_message.call_args.args[1])
+
+    async def test_attachment_failure_does_not_forward_secret_exception(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            adapter, muse = _make_adapter(tmp)
+            adapter.download_attachment = mock.AsyncMock(side_effect=RuntimeError("aes_key=private-key"))
+            event = _private(100, "", 1)
+            event["message"] = [{"type": "file", "data": {"file": "d.txt", "file_id": "/fid"}}]
+            await adapter.handle_event(event)
+            text = muse.post_message.call_args.args[1]
+            self.assertIn("[file下载失败]", text)
+            self.assertNotIn("private-key", text)
+            self.assertNotIn("aes_key", text)
 
     async def test_admin_fills_group_credential_card_in_place_by_default(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -442,7 +456,8 @@ class TestOneBotOutbound(unittest.IsolatedAsyncioTestCase):
             delivered = await adapter.notify_interaction(item, "【审批】card")
             self.assertTrue(delivered)
             self.assertEqual(adapter.client.send_msg.call_args.args[:2], ("group", "G2"))
-            muse.interaction_protocol.mark_displayed.assert_called_once_with(item, ("group", "G2"), ("fp", []))
+            muse.interaction_protocol.mark_displayed.assert_called_once_with(
+                item, adapter.outbound_pusher.interaction_target("group", "G2"), ("fp", []))
             self.assertTrue(adapter.owns_session("S2"))
             self.assertFalse(adapter.owns_session("other"))
 

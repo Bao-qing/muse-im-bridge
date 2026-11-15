@@ -2,7 +2,7 @@
 """Muse Bridge 配置管理与首次启动向导 (Config Manager & Setup Wizard)
 
 功能包含：
-1. 【首次启动向导】：交互式配置渠道凭证、开启网关监听、自动捕获首条消息将发送者设为管理员，并将对话绑定至主会话；
+1. 【首次启动向导】：QQ / OneBot 监听首条消息并绑定管理员与主会话；微信按项配置并选择扫码登录；
 2. 【全量配置分类修改器】：支持按清晰分类（Muse 核心、登录网关、QQ 适配器、OneBot 适配器、日志与追踪、高级与限制）对所有配置项进行交互式编辑、预览和保存。
 """
 
@@ -23,7 +23,7 @@ if ROOT_DIR not in sys.path:
     sys.path.insert(0, ROOT_DIR)
 
 from muse_bridge.config import constants
-from muse_bridge.config.models import LoggingConfig, QzoneFeedConfig
+from muse_bridge.config.models import LoggingConfig, QzoneFeedConfig, WeChatConfig, ConfigLoader
 from muse_bridge.observability import configure_logging, get_logger, safe_error
 
 logger = get_logger("setup_wizard")
@@ -150,10 +150,11 @@ class FullConfigEditor:
             print("  [6] ⚡ 高级限制与性能参数 (分块字符 / 消息去重 / 超时参数)")
             print("  [7] 📄 预览当前完整 JSON 配置")
             print("  [8] 💾 保存修改到文件")
+            print("  [9] 微信 iLink (本地登录 / 私聊权限 / 超时与分块)")
             print("  [0] 保存并退出")
             print("-" * 60)
 
-            choice = _prompt_input("请输入分类编号 (0-8)", default="0")
+            choice = _prompt_input("请输入分类编号 (0-9)", default="0")
             if choice == "0":
                 if self._modified:
                     self.save()
@@ -176,6 +177,8 @@ class FullConfigEditor:
                 print("=" * 60)
             elif choice == "8":
                 self.save()
+            elif choice == "9":
+                self._edit_wechat_category()
             else:
                 print("❌ 无效的选项，请重新输入。")
 
@@ -238,8 +241,8 @@ class FullConfigEditor:
             curr = gw.get("login_through_adapter", "")
             print("\n--- [2] 🚪 默认登录通道配置 ---")
             print(f"当前 login_through_adapter: {curr or '(未设置)'}")
-            print("说明：当 Cookie 失效进入登录回落时，系统会优先通过此适配器私聊管理员提示登录。")
-            print("可选值: qq / onebot / 留空")
+            print("说明：Cookie 失效时通过此适配器私聊提示登录；QQ / OneBot 发给管理员，微信发给扫码用户。")
+            print("可选值: qq / onebot / wechat / 留空（微信通知发给当前扫码用户）")
             print("  [1] 修改 login_through_adapter")
             print("  [0] 返回上级菜单")
 
@@ -247,7 +250,7 @@ class FullConfigEditor:
             if c == "0":
                 break
             elif c == "1":
-                gw["login_through_adapter"] = _prompt_choice("请选择登录通知适配器", ["qq", "onebot", ""], curr)
+                gw["login_through_adapter"] = _prompt_choice("请选择登录通知适配器", ["qq", "onebot", "wechat", ""], curr)
                 self._modified = True
 
     # ---------------- 3. QQ 适配器分类 ----------------
@@ -435,6 +438,91 @@ class FullConfigEditor:
                     ob["session_bindings"] = b_dict
                     self._modified = True
 
+    def _edit_wechat_category(self) -> None:
+        """Edit only the selected setting; login never walks through config fields."""
+        defaults = asdict(WeChatConfig())
+        fields = {
+            "1": ("enabled", "启用微信适配器"),
+            "4": ("state_dir", "本地账号目录"),
+            "5": ("typing_enabled", "输入状态提示"),
+            "6": ("catch_up_enabled", "启动时补发历史消息"),
+            "7": ("chunk_chars", "每段文字字符数（最多 4000）"),
+            "8": ("max_chunks", "最多文字分段数"),
+            "9": ("polling_timeout_ms", "长轮询超时（毫秒）"),
+            "10": ("http_timeout_s", "HTTP 超时（秒）"),
+            "11": ("session_bindings", "会话预绑定"),
+            "12": ("channel_version", "协议客户端版本"),
+            "13": ("route_tag", "协议路由标签"),
+        }
+        while True:
+            current = self.data["adapters"].get("wechat", {})
+            settings = {**defaults, **current}
+            print("\n--- 微信 iLink（个人私信）---")
+            print(f"  [1] 启用微信适配器: {settings['enabled']}")
+            print("  [2] 扫码登录 / 重新登录（连接微信，凭据保存为本地明文 JSON）")
+            print("  [3] 查看本地登录状态（不连接微信）")
+            for choice, (key, title) in fields.items():
+                if choice != "1":
+                    print(f"  [{choice}] {title}: {settings[key]}")
+            print("  [0] 返回上级菜单")
+            choice = _prompt_input("请选择要修改的项或操作 (0-13)", default="0")
+            if choice == "0":
+                return
+            if choice in ("2", "3"):
+                from muse_bridge.adapters.wechat.cli import run_login, run_status
+                try:
+                    config = ConfigLoader._wechat_from_raw({"adapters": {"wechat": current}})
+                    (run_login if choice == "2" else run_status)(config)
+                except Exception:
+                    print("微信操作失败；请检查配置或稍后重试，未输出认证详情。")
+                continue
+            if choice not in fields:
+                print("请选择菜单中的编号。")
+                continue
+            key, title = fields[choice]
+            value = settings[key]
+            if type(defaults[key]) is bool:
+                value = _prompt_bool(title, value)
+            elif key == "http_timeout_s":
+                try:
+                    value = float(_prompt_input(title, default=str(value)))
+                except ValueError:
+                    print("请输入有效的超时秒数。")
+                    continue
+            elif key in ("chunk_chars", "max_chunks", "polling_timeout_ms"):
+                while True:
+                    value = _prompt_int(title, value, defaults[key])
+                    if value > 0 and (key != "chunk_chars" or value <= 4000):
+                        break
+                    print("请输入正整数，文字每段不能超过 4000 字符。")
+            elif key == "session_bindings":
+                raw = _prompt_input("输入 private:<用户ID>=<Muse会话ID>（clear 清空，回车保留）")
+                if not raw:
+                    continue
+                if raw.lower() == "clear":
+                    value = {}
+                else:
+                    pairs = re.split(r"[,，\s]+", raw)
+                    if any("=" not in item for item in pairs):
+                        print("格式错误；未修改会话预绑定。")
+                        continue
+                    value = dict(item.split("=", 1) for item in pairs)
+            else:
+                value = _prompt_str(title, value)
+            candidate = {**current, key: value}
+            try:
+                config = ConfigLoader._wechat_from_raw({"adapters": {"wechat": candidate}})
+            except (ValueError, TypeError) as exc:
+                print(f"微信配置未修改: {safe_error(exc)}")
+                continue
+            # Preserve sparse configuration and unrelated settings. Removed legacy
+            # policy fields are not written back when a setting is changed.
+            normalized = asdict(config)
+            updated = {name: normalized[name] for name in candidate if name in normalized}
+            if updated != current:
+                self.data["adapters"]["wechat"] = updated
+                self._modified = True
+
     def _edit_qzone_feed(self, ob: dict) -> None:
         defaults = asdict(QzoneFeedConfig())
         settings = {**defaults, **ob.get("qzone_feed", {})}
@@ -559,7 +647,7 @@ class FirstRunWizard:
         print("     🚀 Muse IM Bridge 首次启动配置向导")
         print("=" * 60)
         print("本向导将帮助您配置聊天渠道，并通过发送一条消息")
-        print("自动识别并绑定您的管理员身份与主会话。\n")
+        print("自动识别并绑定 QQ / OneBot 管理员与主会话；微信只需选择启用并扫码登录。\n")
 
         # 1. 选择渠道
         self._select_channels()
@@ -570,12 +658,15 @@ class FirstRunWizard:
                 self._configure_qq()
             elif ch == "onebot":
                 self._configure_onebot()
+            elif ch == "wechat":
+                self._configure_wechat()
 
-        # 3. 运行异步网关监听并捕获第一条消息
-        print("\n" + "=" * 60)
-        print("📡 正在启动网关监听，请准备发送消息...")
-        print("=" * 60)
-        asyncio.run(self._listen_for_first_message())
+        # 微信只使用扫码登录，不进入 QQ / OneBot 的首次消息绑定流程。
+        if any(ch in self.selected_channels for ch in ("qq", "onebot")):
+            print("\n" + "=" * 60)
+            print("📡 正在启动 QQ / OneBot 网关监听，请准备发送消息...")
+            print("=" * 60)
+            asyncio.run(self._listen_for_first_message())
 
         # 4. 生成最小配置并写入文件
         self._generate_and_save_config()
@@ -584,10 +675,12 @@ class FirstRunWizard:
         print("请选择要启用的适配器渠道（可多选）：")
         print("  [1] QQ 官方机器人 (QQ Open Platform 官方协议)")
         print("  [2] OneBot v11 (NapCat / LLOneBot 等正向 WebSocket)")
-        print("  [3] 全部启用 (QQ + OneBot)")
+        print("  [3] 全部启用 (QQ + OneBot，保留原选项含义)")
+        print("  [4] 微信 iLink（仅私聊）")
+        print("  [5] QQ + OneBot + 微信 iLink")
 
         while True:
-            choice = _prompt_input("请输入选项编号 (1/2/3)", default="1").lower()
+            choice = _prompt_input("请输入选项编号 (1/2/3/4/5)", default="1").lower()
             if choice == "1":
                 self.selected_channels = ["qq"]
                 break
@@ -597,8 +690,22 @@ class FirstRunWizard:
             elif choice in ("3", "all", "1,2", "1 2"):
                 self.selected_channels = ["qq", "onebot"]
                 break
+            elif choice == "4":
+                self.selected_channels = ["wechat"]
+                break
+            elif choice == "5":
+                self.selected_channels = ["qq", "onebot", "wechat"]
+                break
             else:
-                print("❌ 输入无效，请重新输入 1、2 或 3。")
+                print("请输入 1、2、3、4 或 5。")
+
+    def _configure_wechat(self) -> None:
+        editor = FullConfigEditor({"adapters": {}}, self.output_file)
+        editor.data["adapters"]["wechat"] = {"enabled": True}
+        editor._edit_wechat_category()
+        self.channel_configs["wechat"] = editor.data["adapters"]["wechat"]
+        self.wechat_login_notifications = _prompt_bool(
+            "将微信设为 Muse 登录通知渠道（发给当前扫码用户）", False)
 
     def _configure_qq(self) -> None:
         print("\n--- [1] 配置 QQ 官方机器人 ---")
@@ -832,11 +939,12 @@ class FirstRunWizard:
             logger.debug("Failed to write initial session map %s: %s", map_file_path, safe_error(e))
 
     def _generate_and_save_config(self) -> None:
-        if not self.first_message_event:
+        if not self.first_message_event and "wechat" not in self.selected_channels:
             print("⚠️ 未收到任何消息，未生成配置。")
             return
 
-        first_channel, admin_id, chat_type, target_id, _ = self.first_message_event
+        first_channel, admin_id, chat_type, target_id, _ = self.first_message_event or ("", "", "private", "", None)
+        notification_channel = "wechat" if getattr(self, "wechat_login_notifications", False) else first_channel
 
         main_session_id = str(uuid.uuid4())
 
@@ -849,7 +957,7 @@ class FirstRunWizard:
             },
             "adapters": {},
             "gateway": {
-                "login_through_adapter": first_channel
+                "login_through_adapter": notification_channel
             }
         }
 
@@ -924,6 +1032,13 @@ class FirstRunWizard:
             ob_entry["whitelist"] = ob_whitelist
             config_data["adapters"]["onebot"] = ob_entry
 
+        if "wechat" in self.selected_channels:
+            config_data["adapters"]["wechat"] = self.channel_configs["wechat"]
+            # QQ historically defaults to enabled when omitted. A new WeChat-only
+            # setup must not accidentally start an unconfigured QQ gateway.
+            if "qq" not in self.selected_channels:
+                config_data["adapters"]["qq"] = {"enabled": False}
+
         # 写入文件
         with open(self.output_file, "w", encoding="utf-8") as f:
             json.dump(config_data, f, indent=2, ensure_ascii=False)
@@ -931,7 +1046,11 @@ class FirstRunWizard:
 
         print("\n" + "=" * 60)
         print(f"🎉 最小配置文件已成功生成并保存至: {self.output_file}")
-        print(f"🔗 本次私聊对话已直接绑定至主会话 (Session ID: {main_session_id})")
+        if self.first_message_event:
+            print(f"本次 QQ / OneBot 私聊已绑定至主会话 (Session ID: {main_session_id})")
+        if "wechat" in self.selected_channels:
+            print("微信仅用于个人私信；首次对话会自动建立会话，也可按需配置 session_bindings。")
+            print("未登录时请显式执行 python main.py --wechat-login；--wechat-status 仅检查本地状态。")
         print("=" * 60)
         print(json.dumps(config_data, indent=2, ensure_ascii=False))
         print("=" * 60)
