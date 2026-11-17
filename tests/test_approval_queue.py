@@ -305,7 +305,7 @@ class QueueCase(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(self.protocol.referenced_approvals(("group", "8"), [("id", "123")]))
         self.assertIsNone(self.protocol.referenced_approvals(("group", "7"), [("id", "123"), ("id", "other")]))
 
-    async def test_quoted_uncertain_failure_never_reposts(self):
+    async def test_quoted_uncertain_failure_reposts_on_explicit_retry(self):
         item, = self.load(row("remote-a", 1))
         await self.show_quoted_card(item)
         def uncertain(method, path, body=None, **kwargs):
@@ -315,11 +315,40 @@ class QueueCase(unittest.IsolatedAsyncioTestCase):
             return self.remote(method, path, body, **kwargs)
         self.protocol.request.side_effect = uncertain
         await self.quoted("1")
-        self.assertIn("结果未确认", self.texts()[-1])
+        self.assertIn("重试", self.texts()[-1])
         await self.quoted("1")
-        self.assertIn("不会重复发送决定", self.texts()[-1])
-        self.assertEqual(len(self.remote.posts), 1)
+        self.assertIn("重试", self.texts()[-1])
+        self.assertEqual(len(self.remote.posts), 2)
         self.assertFalse(item.terminal)
+
+    async def test_batch_uncertain_head_can_be_denied_by_next_numeric_reply(self):
+        first, second = self.load(row("remote-a", 1), row("remote-b", 2))
+        failed = False
+        def uncertain(method, path, body=None, **kwargs):
+            nonlocal failed
+            if method == "POST" and path == "/approvals/remote-a/decide" and not failed:
+                failed = True
+                self.remote.posts.append(("remote-a", body))
+                raise TimeoutError("response lost")
+            result = self.remote(method, path, body, **kwargs)
+            if method == "GET" and path != "/approvals":
+                return {"approval_id": result["approval_id"], "status": result["status"],
+                        "decision_options": ["allow_once", "allow_always", "deny"]}
+            return result
+        self.protocol.request.side_effect = uncertain
+        await self.send("聊天")
+        await self.send("2 all")
+        self.assertFalse(first.terminal)
+        self.assertTrue(second.terminal)
+        self.assertIn("Share with remote-a", self.texts()[-1])
+        self.assertIn("选项 3｜拒绝", self.texts()[-1])
+        await self.send("3")
+        self.assertEqual([(key, body["decision"]) for key, body in self.remote.posts],
+                         [("remote-a", "allow_always"), ("remote-b", "allow_always"),
+                          ("remote-a", "deny")])
+        self.assertEqual(first.state, "denied")
+        self.assertIn("审批已全部完成", self.texts()[-1])
+        self.service.post_message.assert_not_called()
 
     async def test_quoted_changed_revision_does_not_reinterpret_old_choice(self):
         item, = self.load(row("remote-a", 1))

@@ -319,20 +319,103 @@ class DecisionCase(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(count, 1)
         self.assertEqual(self.item.state, "approved")
 
-    async def test_uncertain_decision_never_reposts_on_user_retry(self):
+    async def test_uncertain_decision_reposts_on_explicit_user_retry(self):
         posts = []
         def request(method, path, body=None, **kwargs):
             if path == "/approvals":
                 return {"pending": [copy.deepcopy(self.row)], "recent": []}
             if method == "POST":
                 posts.append(body)
+                if len(posts) == 1:
+                    raise TimeoutError()
+                return approval(status="approved")
+            return copy.deepcopy(self.row)
+        self.p.request.side_effect = request
+        result = await self.p.submit_approval(self.item, "1")
+        self.assertIn("重试", result)
+        self.assertTrue(self.item.context["decision_uncertain"])
+        self.assertEqual(len(posts), 1)
+        await self.p.submit_approval(self.item, "1")
+        self.assertEqual(len(posts), 2)
+        self.assertEqual(posts[0], posts[1])
+        self.assertEqual(self.item.state, "approved")
+        self.assertNotIn("decision_uncertain", self.item.context)
+
+    async def test_uncertain_retry_preserves_snapshot_and_can_change_to_deny(self):
+        detail = {"approval_id": "remote-1", "status": "pending", "message_revision": 3,
+                  "decision_options": ["allow_once", "allow_always", "deny"]}
+        fingerprint = self.item.context["fingerprint"]
+        self.item.context["notified"] = True
+        posts = []
+        def request(method, path, body=None, **kwargs):
+            if path == "/approvals":
+                return {"pending": [copy.deepcopy(self.row)], "recent": []}
+            if method == "POST":
+                posts.append(body)
+                if len(posts) == 1:
+                    return copy.deepcopy(detail)  # Nonterminal response is unconfirmed too.
+                return {**detail, "status": "denied"}
+            return copy.deepcopy(detail)
+        self.p.request.side_effect = request
+        await self.p.submit_approval(self.item, "2", expected_fingerprint=fingerprint)
+        self.assertEqual(self.item.context["fingerprint"], fingerprint)
+        self.assertTrue(self.item.context["notified"])
+        self.assertEqual(len(self.item.context["options"]), 4)
+        self.assertIn("Send test", self.p.format_approval(self.item))
+        self.p.fetch_approvals()
+        self.assertEqual(self.item.context["fingerprint"], fingerprint)
+        await self.p.submit_approval(self.item, "4", expected_fingerprint=fingerprint)
+        self.assertEqual([body["decision"] for body in posts], ["allow_always", "deny"])
+        self.assertEqual(self.item.state, "denied")
+
+    async def test_failed_reconciliation_keeps_card_and_allows_later_retry(self):
+        posts = []
+        unavailable = False
+        def request(method, path, body=None, **kwargs):
+            nonlocal unavailable
+            if path == "/approvals":
+                return {"pending": [copy.deepcopy(self.row)], "recent": []}
+            if method == "POST":
+                posts.append(body)
+                if len(posts) == 1:
+                    unavailable = True
+                    raise TimeoutError()
+                return approval(status="approved")
+            if unavailable:
                 raise TimeoutError()
             return copy.deepcopy(self.row)
         self.p.request.side_effect = request
         await self.p.submit_approval(self.item, "1")
+        self.assertEqual(self.item.state, "unknown")
+        self.assertEqual(len(self.item.context["options"]), 4)
+        unavailable = False
         await self.p.submit_approval(self.item, "1")
-        self.assertEqual(len(posts), 1)
-        self.assertFalse(self.item.terminal)
+        self.assertEqual(len(posts), 2)
+        self.assertEqual(self.item.state, "approved")
+
+    async def test_uncertain_retry_still_checks_changed_revision(self):
+        self.item.context["decision_uncertain"] = True
+        self.row["message_revision"] = 4
+        result = await self.p.submit_approval(self.item, "1")
+        self.assertIn("变化", result)
+        self.assertFalse(any(c[0] == "POST" for c in self.calls))
+
+    async def test_uncertain_retry_checks_remote_completion_without_post(self):
+        self.item.context["decision_uncertain"] = True
+        self.row["status"] = "approved"
+        await self.p.submit_approval(self.item, "1")
+        self.assertEqual(self.item.state, "approved")
+        self.assertFalse(any(c[0] == "POST" for c in self.calls))
+
+    async def test_uncertain_decision_is_not_automatically_replayed(self):
+        self.item.context["decision_uncertain"] = True
+        self.service.config.approval = ApprovalConfig(mode="allow_all")
+        self.p.reconcile = AsyncMock(return_value=[self.item])
+        running = iter([True, False])
+        with unittest.mock.patch("muse_bridge.muse.interactions.asyncio.sleep", new=AsyncMock()):
+            await self.p.run(AsyncMock(return_value=True), lambda: next(running))
+        await self.p.submit_approval(self.item, "1", automatic=True)
+        self.p.request.assert_not_called()
 
     async def test_deny_always_sends_no_allow_scope(self):
         native = {"kind": "deny_always", "label": {"kind": "deny_always_scoped", "scope": "entity"}}

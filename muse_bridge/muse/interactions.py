@@ -710,11 +710,8 @@ class MuseInteractions:
         async with lock:
             if item.terminal:
                 return f"此审批已结束（{self._state_label(item.state)}），无需重复操作。"
-            if item.context.get("decision_uncertain"):
-                result = await asyncio.to_thread(self.request, "GET", f"/approvals/{quote(item.remote_id, safe='')}")
-                self.upsert_approval(result.get("approval", result))
-                return ("此审批已结束。" if item.terminal else
-                        "上次的选择结果未能确认，不会重复提交，请在 Muse 网页核对。")
+            if automatic and item.context.get("decision_uncertain"):
+                return "上次的选择结果未能确认，请回复选项数字重试。"
             shown = expected_fingerprint or item.context.get("fingerprint")
             old_options = item.context.get("options", [])
             if str(choice).isdigit():
@@ -748,20 +745,26 @@ class MuseInteractions:
             item.state = "submitting"
             try:
                 result = await asyncio.to_thread(self.request, "POST", f"/approvals/{quote(item.remote_id, safe='')}/decide", body)
-                self.upsert_approval(result.get("approval", result))
+                self.upsert_approval(fresh, result.get("approval", result))
                 if not item.terminal:
                     raise ValueError("Approval completion not confirmed")
-            except Exception:
-                # Never replay a decision whose response may have been lost.
+            except Exception as exc:
+                logger.warning("Approval decision unconfirmed. interaction_id=%s error=%s", item.id, safe_error(exc))
+                # Reconcile once, preserving the snapshot's display and native
+                # options when the detail endpoint returns a lossy legacy row.
+                # A later explicit user choice may resubmit; the server owns
+                # duplicate decisions. Never replay automatically in this call.
                 try:
                     result = await asyncio.to_thread(self.request, "GET", f"/approvals/{quote(item.remote_id, safe='')}")
-                    self.upsert_approval(result.get("approval", result))
-                except Exception:
-                    pass
+                    self.upsert_approval(fresh, result.get("approval", result))
+                except Exception as reconcile_exc:
+                    logger.warning("Approval decision reconciliation unavailable. interaction_id=%s error=%s",
+                                   item.id, safe_error(reconcile_exc))
                 if not item.terminal:
                     item.state = "unknown"
                     item.context["decision_uncertain"] = True
-                    return "审批结果未能确认，请先在 Muse 网页核对。"
+                    return "审批结果未能确认，可再次回复选项数字重试。"
+            item.context.pop("decision_uncertain", None)
             trace_event("muse.interactions", "approval.resolved", session_id=item.session_id,
                         interaction_id=item.id, state=item.state)
             return f"{self._approval_title(item)}{option['label']}：状态：{self._state_label(item.state)}，服务端：{item.state}。"

@@ -380,7 +380,7 @@ class BackgroundCase(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("always_scope", self.remote.posts[0][1])
         self.assertTrue(item.terminal)
 
-    async def test_background_uncertain_decision_is_never_submitted_twice(self):
+    async def test_background_uncertain_decision_allows_explicit_retry(self):
         item = self.load()
         posts = []
         def uncertain(method, path, body=None, **kwargs):
@@ -391,7 +391,7 @@ class BackgroundCase(unittest.IsolatedAsyncioTestCase):
         self.p.request.side_effect = uncertain
         await self.p.submit_approval(item, "1")
         await self.p.submit_approval(item, "1")
-        self.assertEqual(len(posts), 1)
+        self.assertEqual(len(posts), 2)
         self.assertTrue(item.context["decision_uncertain"])
         self.service.check_approval_gate("unrelated-chat")
 
