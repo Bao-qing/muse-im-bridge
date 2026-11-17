@@ -2,9 +2,16 @@
   "muse": {
     "cookies_file": "cookies.json",
     "session_id": "YOUR_MUSE_SESSION_ID",
+    "worker": {
+      "base": "https://your-worker.example.com",
+      "ws": false,
+      "http": false,
+      "login": false
+    },
     "approval": {
       "mode": "manual",
-      "notify": true
+      "notify": true,
+      "sync_interval_s": 180
     }
   },
   "adapters": {

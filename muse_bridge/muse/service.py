@@ -44,12 +44,7 @@ class MuseService:
         return self.interaction_protocol.capture_credential(item, secret)
 
     def check_approval_gate(self, session_id):
-        self.interactions.managed_sessions.add(session_id)
-        try:
-            self.interaction_protocol.fetch_approvals()
-        except Exception:
-            raise ApprovalBlocked("暂时无法确认审批状态，这条消息没有发送出去，请稍后重发。") from None
-        pending = self.interaction_protocol.approval_queue(session_id)
+        pending = self.interaction_protocol.check_local_gate(session_id)
         if pending:
             raise ApprovalBlocked(self.format_approval(pending[0]))
 
@@ -66,6 +61,7 @@ class MuseService:
             timezone=self.config.timezone,
             proxy_url=self.config.proxy_url,
             direct=self.config.direct,
+            **({"worker": self.config.worker} if self.config.worker.ws else {}),
         )
 
         orig_connect = client.connect

@@ -411,9 +411,7 @@ class DecisionCase(unittest.IsolatedAsyncioTestCase):
         self.item.context["decision_uncertain"] = True
         self.service.config.approval = ApprovalConfig(mode="allow_all")
         self.p.reconcile = AsyncMock(return_value=[self.item])
-        running = iter([True, False])
-        with unittest.mock.patch("muse_bridge.muse.interactions.asyncio.sleep", new=AsyncMock()):
-            await self.p.run(AsyncMock(return_value=True), lambda: next(running))
+        await self.p._notify_pending(AsyncMock(return_value=True), [self.item])
         await self.p.submit_approval(self.item, "1", automatic=True)
         self.p.request.assert_not_called()
 
@@ -429,10 +427,8 @@ class DecisionCase(unittest.IsolatedAsyncioTestCase):
     async def test_auto_allow_is_not_durable_permission(self):
         self.service.config.approval = ApprovalConfig(mode="allow_all", notify=False)
         self.p.reconcile = AsyncMock(return_value=[self.item])
-        running = iter([True, False])
         notify = AsyncMock()
-        with unittest.mock.patch("muse_bridge.muse.interactions.asyncio.sleep", new=AsyncMock()):
-            await self.p.run(notify, lambda: next(running))
+        await self.p._notify_pending(notify, [self.item])
         body = [c[2] for c in self.calls if c[0] == "POST"][0]
         self.assertEqual(body["decision"], "allow_once")
         self.assertNotIn("always_scope", body)
@@ -441,9 +437,7 @@ class DecisionCase(unittest.IsolatedAsyncioTestCase):
     async def test_auto_deny_sends_deny(self):
         self.service.config.approval = ApprovalConfig(mode="deny_all")
         self.p.reconcile = AsyncMock(return_value=[self.item])
-        running = iter([True, False])
-        with unittest.mock.patch("muse_bridge.muse.interactions.asyncio.sleep", new=AsyncMock()):
-            await self.p.run(AsyncMock(), lambda: next(running))
+        await self.p._notify_pending(AsyncMock(), [self.item])
         body = [c[2] for c in self.calls if c[0] == "POST"][0]
         self.assertEqual(body["decision"], "deny")
 
@@ -453,7 +447,7 @@ class DecisionCase(unittest.IsolatedAsyncioTestCase):
         running = iter([True, False])
         with unittest.mock.patch("muse_bridge.muse.interactions.asyncio.sleep", new=AsyncMock()) as mock_sleep, \
              unittest.mock.patch("muse_bridge.muse.interactions.logger.warning") as mock_warn:
-            await self.p.run(AsyncMock(), lambda: next(running))
+            await self.p._run_updates(AsyncMock(), lambda: next(running), asyncio.Event())
         self.p.reconcile.assert_not_called()
         mock_warn.assert_not_called()
         self.assertFalse(self.p.manager.approvals_ready)

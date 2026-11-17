@@ -61,6 +61,8 @@ muse_bridge/
 
 环境要求：Python 3.11 或更高版本。
 
+可选网络传输：默认保留原路由，也可按 WS、普通 HTTPS、登录三个通道独立启用用户自有 Cloudflare Worker。配置示例、分阶段启用与退回步骤见 [Worker 传输说明](docs/worker-transport.md)。
+
 ### 1. 安装依赖
 
 ```bash
@@ -163,7 +165,8 @@ python -m unittest discover tests
     "direct": true,                                // [可选] 是否直连 (默认: true)
     "approval": {                                // [可选] 原生审批策略，不改变长期权限规则
       "mode": "manual",                         // manual / allow_all / deny_all
-      "notify": true                              // 自动决定后通知，默认开启
+      "notify": true,                             // 自动决定后通知，默认开启
+      "sync_interval_s": 180                       // 审批补偿全量同步间隔，正整数秒，默认 180
     }
   },
   "adapters": {
@@ -352,7 +355,8 @@ IM 私聊不等同网页安全输入：密码、验证码和私钥等秘密仍�
 ```json
 "approval": {
   "mode": "manual",
-  "notify": true
+  "notify": true,
+  "sync_interval_s": 180
 }
 ```
 
@@ -361,7 +365,7 @@ IM 私聊不等同网页安全输入：密码、验证码和私钥等秘密仍�
 - 原生 `decision_options` 存在时（即使为空）为权威列表，不从标签、域名或排他标记猜测范围。仅在该字段缺失且请求类型受支持时，采用网页源码已验证的旧版回退规则；无法验证选项时保留门禁并引导网页处理。若只提供长期权限选项，自动策略不擅自创建长期规则，而是交回人工选择。
 - 单字段卡按明确的 capture 类型提交受保护字段，不根据标题猜测字段类型；未知类型、字段与卡片 URL 冲突时仍回退网页。旧版 `create_password` 卡允许不带 `capture_authorization`（与已验证的 Authd 行为一致），其他卡仍要求授权；所有提交都带所属会话 ID。
 - 凭证 capture 返回有效 ID 才记录完成；网页成功回调也只更新本地展示，不额外猜测远端卡片完成接口。桥接在 `cookies_file + .captures.local.json` 中原子保存目标/会话/卡片/授权上下文的 SHA-256 回执，以防重启重开已成功提交的同一卡片。文件不含账号、密码、验证码、授权原文或 capture ID；删除该回执文件会丢失本地完成去重，损坏或不可读时拒绝启动。远端 `credential_capture_completed` 状态仍以服务器事件为准。
-- 审批使用独立 Sentinel 状态协调（约三秒一次，发送前再次核对）；聊天出站仍为事件驱动。尚未把未证实的 `approvals.snapshot` 订阅来源写死。重启从远端恢复待审批，状态查询失败时不放行普通消息。
+- 审批由独立的账号级 `daemon/chat.subscribe` 订阅接收 `approvals.snapshot`，同时覆盖前台与后台审批；不依赖聊天是否已有出站订阅。**普通发送只读本地审批门禁，不再逐条查询 `/approvals`**。启动时先检查远端审批，之后按 `sync_interval_s`（默认 **180 秒**，必须为正整数）全量补偿同步；事件通知不等待慢速补偿查询完成。断线、凭据轮换、无效快照及状态查询失败时保守门禁并重新同步；旧连接或过时查询结果不能覆盖较新事件。快照中消失但没有明确终态的审批保留门禁，再查详情确认。约三秒的本地通知补推／故障重试不是正常全量查询周期。用户显式处理审批时仍查询远端状态与版本，不自动重试不确定的决定。详见 [事件驱动审批说明](docs/approval-event-driven.md) 与 [网页运行时证据](docs/approval-events-runtime.md)。
 
 ## 会话隔离
 

@@ -29,6 +29,7 @@ class BridgeEngine:
             cookies_file=self.config.muse.cookies_file,
             vm_id=self.config.muse.vm_id,
             base_url="https://muse.ai",
+            worker=self.config.muse.worker,
         )
         self.muse_service = MuseService(config=self.config.muse, token_manager=self.token_manager)
 

@@ -104,9 +104,10 @@ class BackgroundCase(unittest.IsolatedAsyncioTestCase):
         await self.qq.handle_event("GROUP_AT_MESSAGE_CREATE" if group else "C2C_MESSAGE_CREATE", event)
 
     async def tick(self, notify=None):
-        turns = iter([True, False])
-        with patch("muse_bridge.muse.interactions.asyncio.sleep", new=AsyncMock()):
-            await self.p.run(notify or self.engine._notify_interaction, lambda: next(turns))
+        # Policy/routing tests drive one completed synchronization, without
+        # starting the separately tested account-wide socket worker.
+        pending = await self.p.reconcile()
+        await self.p._notify_pending(notify or self.engine._notify_interaction, pending)
 
     def test_schedule_is_independent_of_every_chat_gate(self):
         item = self.load()

@@ -19,6 +19,8 @@ from typing import Dict, Optional
 import httpx
 
 from ..observability import http_request
+from ..config.models import WorkerConfig
+from .routing import auth_url, cookie_domain, http_base, worker_http_options
 
 _BASE_HEADERS = {
     "User-Agent": (
@@ -39,18 +41,23 @@ _BASE_HEADERS = {
 
 
 class MuseProtocolLogin:
-    def __init__(self, base_url: str = "https://muse.ai"):
-        self.base_url = base_url.rstrip("/")
-        self.client = httpx.Client(http2=True, follow_redirects=True, timeout=25.0)
+    def __init__(self, base_url: str = "https://muse.ai", *, worker: WorkerConfig | None = None):
+        self.worker = worker or WorkerConfig()
+        self.real_base_url = base_url.rstrip("/")
+        self.base_url = http_base(base_url, self.worker, login=True)
+        self.client = httpx.Client(http2=True, follow_redirects=True, timeout=25.0,
+                                   **worker_http_options(self.worker, login=True))
         self.waterfall_id = str(uuid.uuid4())
         self.csrf_token: Optional[str] = None
 
     def initialize_session(self) -> None:
         """Step 1: Perform SSO redirect cycle to acquire datr and csrf cookies."""
-        url = f"https://auth.{self.base_url.split('://')[-1]}/aymh/?origin={self.base_url}"
+        url = auth_url(self.real_base_url, self.worker)
         resp = http_request(self.client, "get",url, headers=_BASE_HEADERS)
         if resp.status_code != 200:
-            # Fallback to direct landing GET
+            if self.worker.login:
+                raise RuntimeError(f"Worker SSO 初始化失败 ({resp.status_code})")
+            # Preserve the legacy direct landing GET only outside Worker mode.
             http_request(self.client, "get",f"{self.base_url}/", headers=_BASE_HEADERS)
 
     def _api_headers(self) -> Dict[str, str]:
@@ -59,8 +66,8 @@ class MuseProtocolLogin:
             "Accept": "*/*",
             "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
             "Content-Type": "application/json",
-            "Origin": self.base_url,
-            "Referer": f"{self.base_url}/?aymh_complete=1",
+            "Origin": self.real_base_url,
+            "Referer": f"{self.real_base_url}/?aymh_complete=1",
             "Sec-Ch-Ua": _BASE_HEADERS["Sec-Ch-Ua"],
             "Sec-Ch-Ua-Mobile": "?0",
             "Sec-Ch-Ua-Platform": '"Windows"',
@@ -128,24 +135,44 @@ class MuseProtocolLogin:
             )
             if r_comp.status_code == 200:
                 data = r_comp.json()
+            elif self.worker.login:
+                raise RuntimeError(f"Worker 注册确认失败 ({r_comp.status_code}): {r_comp.text}")
 
         return data
 
-    def extract_cookies(self) -> Dict[str, str]:
+    def extract_cookies(self) -> dict:
         """Extract all cookies for muse.ai as a concatenated header string."""
         cookies_dict = {}
+        records = []
         for cookie in self.client.cookies.jar:
-            if "muse.ai" in cookie.domain and cookie.value:
+            domain = cookie_domain(cookie.domain, self.worker)
+            if domain and cookie.value:
                 cookies_dict[cookie.name] = cookie.value
+                path = cookie.path
+                if self.worker.login:
+                    for prefix in ("/https/muse.ai", "/https/auth.muse.ai", "/https",
+                                   "/http/muse.ai", "/http/auth.muse.ai", "/http"):
+                        if path == prefix or path.startswith(prefix + "/"):
+                            path = path[len(prefix):] or "/"
+                            break
+                records.append({"name": cookie.name, "value": cookie.value,
+                                "domain": domain, "path": path,
+                                "secure": cookie.secure, "expires": cookie.expires})
 
         pairs = [f"{k}={v}" for k, v in cookies_dict.items()]
-        return {"cookie": "; ".join(pairs)}
+        result = {"cookie": "; ".join(pairs)}
+        if self.worker.login:
+            # Retain the legacy header format; domain-bearing records are always
+            # canonical Muse cookies, interchangeable with direct mode.
+            result["cookies"] = records
+        return result
 
 
 def run_protocol_login(
     email: Optional[str] = None,
     output_path: str = "cookies.json",
-) -> Dict[str, str]:
+    *, worker: WorkerConfig | None = None,
+) -> dict:
     """Interactive protocol login runner."""
     if not email:
         email = input("请输入登录邮箱: ").strip()
@@ -153,7 +180,7 @@ def run_protocol_login(
         raise ValueError("邮箱地址不能为空")
 
     print(f"[MuseLogin] 正在请求发送验证码至 {email}...")
-    auth = MuseProtocolLogin()
+    auth = MuseProtocolLogin(**({"worker": worker} if worker and worker.login else {}))
     auth.send_otp(email)
     print(f"[MuseLogin] 验证码已成功发送至 {email}，请查收邮件！")
 

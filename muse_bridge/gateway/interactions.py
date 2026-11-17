@@ -231,7 +231,8 @@ class ChatInteractions:
         if not re.fullmatch(r"[^\s@]+@[^\s@]+\.[^\s@]+", email):
             await self.reply(owner, "邮箱格式不对，请重新输入（发送 /取消 可取消）。", msg_id)
             return
-        auth = MuseProtocolLogin()
+        worker = self.adapter.muse_service.config.worker
+        auth = MuseProtocolLogin(**({"worker": worker} if worker.login else {}))
         item.context["auth"] = auth
         item.context["email"] = email
         item.state = "submitting"

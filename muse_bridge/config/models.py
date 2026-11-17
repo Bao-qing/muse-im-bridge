@@ -16,6 +16,7 @@ import json
 import os
 import urllib.request
 from typing import Any, ClassVar, Dict, List, Optional, Union
+from urllib.parse import urlsplit
 
 from . import constants
 
@@ -54,12 +55,49 @@ def _detect_egress_ip(proxy_url: Optional[str] = None, direct: bool = True) -> s
 class ApprovalConfig:
     mode: str = "manual"
     notify: bool = True
+    sync_interval_s: int = 180
 
     def __post_init__(self):
         if self.mode not in {"manual", "allow_all", "deny_all"}:
             raise ValueError("muse.approval.mode must be manual, allow_all, or deny_all")
         if not isinstance(self.notify, bool):
             raise ValueError("muse.approval.notify must be a boolean")
+        if type(self.sync_interval_s) is not int or self.sync_interval_s <= 0:
+            raise ValueError("muse.approval.sync_interval_s must be a positive integer")
+
+
+@dataclasses.dataclass
+class WorkerConfig:
+    base: str = "https://your-worker.example.com"
+    ws: bool = False
+    http: bool = False
+    login: bool = False
+    login_origin: str = "real"
+    ws_permessage_deflate: bool = True
+
+    def __post_init__(self):
+        for name in ("ws", "http", "login", "ws_permessage_deflate"):
+            if type(getattr(self, name)) is not bool:
+                raise ValueError(f"muse.worker.{name} must be a boolean")
+        if self.login_origin not in {"real", "worker"}:
+            raise ValueError("muse.worker.login_origin must be real or worker")
+        if not isinstance(self.base, str):
+            raise ValueError("muse.worker.base must be an HTTPS origin")
+        try:
+            parsed = urlsplit(self.base)
+            valid = (parsed.scheme == "https" and parsed.hostname and not parsed.username
+                     and not parsed.password and parsed.port in (None, 443)
+                     and parsed.path in ("", "/") and not parsed.query and not parsed.fragment)
+        except ValueError:
+            valid = False
+        if not valid:
+            # WS transport intentionally retains its fixed TLS port 443.
+            raise ValueError("muse.worker.base must be an HTTPS origin on port 443")
+        self.base = self.base.rstrip("/")
+
+    @property
+    def enabled(self) -> bool:
+        return self.ws or self.http or self.login
 
 
 @dataclasses.dataclass
@@ -74,6 +112,7 @@ class MuseConfig:
     proxy_url: Optional[str] = None
     direct: bool = constants.DEFAULT_MUSE_DIRECT
     approval: ApprovalConfig = dataclasses.field(default_factory=ApprovalConfig)
+    worker: WorkerConfig = dataclasses.field(default_factory=WorkerConfig)
 
 
 @dataclasses.dataclass
@@ -512,8 +551,14 @@ class ConfigLoader:
         approval_cfg = ApprovalConfig(
             mode=approval_raw.get("mode", "manual"),
             notify=approval_raw.get("notify", True),
+            sync_interval_s=approval_raw.get("sync_interval_s", 180),
         )
+        worker_raw = m_raw.get("worker", {})
+        if not isinstance(worker_raw, dict):
+            raise ValueError("muse.worker must be an object")
+        worker_cfg = WorkerConfig(**worker_raw)
         muse_cfg = MuseConfig(
+            worker=worker_cfg,
             approval=approval_cfg,
             mint_file=_get_val(m_raw, "mint_file", os.environ.get("MUSE_MINT_FILE") or ".mint.json"),
             cookies_file=_get_val(m_raw, "cookies_file", os.environ.get("MUSE_COOKIES_FILE") or "cookies.json"),
@@ -526,7 +571,10 @@ class ConfigLoader:
             direct=_get_val(m_raw, "direct", constants.DEFAULT_MUSE_DIRECT),
         )
 
-        if not muse_cfg.client_ip:
+        # Worker egress is not the bridge's egress. Never probe third parties in
+        # any Worker mode. Empty client_ip acceptance is pending live validation;
+        # set muse.client_ip explicitly to test a supplied value instead.
+        if not muse_cfg.client_ip and not muse_cfg.worker.enabled:
             detected = _detect_egress_ip(muse_cfg.proxy_url, muse_cfg.direct)
             if detected:
                 muse_cfg.client_ip = detected

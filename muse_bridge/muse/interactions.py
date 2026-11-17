@@ -4,10 +4,13 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import copy
 import hashlib
 import json
 import os
+import re
 import threading
+import time
 import uuid
 from urllib.parse import parse_qs, quote, urlparse
 
@@ -102,6 +105,18 @@ class MuseInteractions:
         self._refresh_lock = asyncio.Lock()
         self._notify_lock = asyncio.Lock()
         self._fetch_lock = threading.RLock()
+        # Never hold this state lock across network I/O. Newer events win over
+        # an older in-flight Sentinel read, including its failures.
+        self._state_lock = threading.RLock()
+        self._state_version = 0
+        self._stream_generation = 0
+        self._stream_seq = -1
+        self._stream_emitted_ms = -1
+        self._pending_snapshot = {}
+        self._last_fetch = None
+        self._reconcile_retry_at = 0.0
+        self._needs_reconcile = threading.Event()
+        self._wake_callback = None
         # Per-session approval rounds: ids in display order, kept until the
         # session's queue empties so positions read 1/2, 2/2 across decisions.
         self._queue_lock = threading.Lock()
@@ -482,11 +497,27 @@ class MuseInteractions:
         return options
 
     @staticmethod
+    def _approval_display_content(display):
+        """Normalize only the source annotation observed on push snapshots."""
+        if not isinstance(display, dict):
+            return display
+        purpose, base = display.get("purpose_summary"), display.get("short_explanation")
+        if isinstance(base, str) and base and isinstance(purpose, str) and purpose.startswith(base):
+            # The list endpoint returns the base explanation; the push endpoint
+            # may append this side-chat attribution. Keep every other display
+            # field and arbitrary purpose changes in the choice fingerprint.
+            suffix = purpose[len(base):]
+            if re.fullmatch(r'\. 此任务来自旁聊“[^\r\n]+”。', suffix):
+                return {**display, "purpose_summary": base}
+        return display
+
+    @staticmethod
     def approval_fingerprint(approval):
-        # Exclude timestamps/runtime trace; bind a choice to displayed content,
-        # full native choices, and the server's editable-message revision.
+        # Bind choices to request/display content and full native options, not
+        # the push-only source annotation or discovery of initial revision 0.
         data = {key: approval.get(key) for key in ("display", "payload", "payload_preview", "decision_options")}
-        data["message_revision"] = message_revision(approval)
+        data["display"] = MuseInteractions._approval_display_content(data["display"])
+        data["message_revision"] = message_revision(approval) or 0
         return hashlib.sha256(json.dumps(data, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
 
     def upsert_approval(self, row, detail=None):
@@ -512,6 +543,21 @@ class MuseInteractions:
         if item and (item.terminal or item.session_id != sid):
             return item
         item = item or self.manager.add("approval", session_id=sid, remote_id=remote_id, state="pending", ttl=0)
+        previous = item.context.get("approval") or {}
+        # Snapshot records can omit the version learned from a detail response.
+        # Absence is not a version reset; explicit changes still invalidate the
+        # displayed choice, and POST keeps the last known server revision.
+        known_revision = message_revision(previous)
+        if message_revision(full) is None and known_revision is not None:
+            full["message_revision"] = known_revision
+        old_display, new_display = previous.get("display"), full.get("display")
+        old_content = self._approval_display_content(old_display)
+        new_content = self._approval_display_content(new_display)
+        if (isinstance(old_display, dict) and isinstance(new_display, dict)
+                and old_content == new_content and old_display != old_content and new_display == new_content):
+            # A less enriched source must not erase the already displayed
+            # side-chat hint when all actual display content is identical.
+            full["display"] = {**new_display, "purpose_summary": old_display["purpose_summary"]}
         item.context["background_approval"] = background
         fingerprint = self.approval_fingerprint(full)
         if item.context.get("fingerprint") != fingerprint:
@@ -520,45 +566,165 @@ class MuseInteractions:
         item.state = "pending"
         return item
 
+    def _wake(self):
+        if self._wake_callback is not None:
+            self._wake_callback()
+
+    def invalidate_approval_state(self):
+        with self._state_lock:
+            self.manager.approvals_ready = False
+            self._state_version += 1
+            self._needs_reconcile.set()
+        self._wake()
+
+    def begin_approval_stream(self):
+        with self._state_lock:
+            self._stream_generation += 1
+            self._stream_seq = self._stream_emitted_ms = -1
+            self.invalidate_approval_state()
+            return self._stream_generation
+
+    def end_approval_stream(self, generation):
+        with self._state_lock:
+            if generation == self._stream_generation:
+                self._stream_generation += 1
+                self.invalidate_approval_state()
+
+    def check_local_gate(self, session_id):
+        """An in-memory read only; unknown state never causes a network send."""
+        with self._state_lock:
+            self.manager.managed_sessions.add(session_id)
+            if not self.manager.approvals_ready:
+                raise ApprovalBlocked("暂时无法确认审批状态，这条消息没有发送出去，请稍后重发。")
+            # A binding may be created after startup. Keep account-wide rows so
+            # a previously unmanaged session cannot miss its existing gate.
+            for row in self._pending_snapshot.values():
+                if self.approval_session(row) == session_id:
+                    self.upsert_approval(row)
+            return self.approval_queue(session_id)
+
+    @staticmethod
+    def _snapshot_lists(snapshot):
+        if not isinstance(snapshot, dict):
+            raise ValueError("Invalid approval snapshot")
+        pending = snapshot.get("pending_approvals", snapshot.get("pending"))
+        recent = snapshot.get("recent_approvals", snapshot.get("recent", []))
+        if not isinstance(pending, list) or not isinstance(recent, list):
+            raise ValueError("Invalid approval snapshot")
+        ids = set()
+        for row in pending + recent:
+            if (not isinstance(row, dict) or not isinstance(row.get("approval_id"), str)
+                    or not row["approval_id"] or row.get("status") not in
+                    {"pending", "approved", "denied", "timed_out"}):
+                raise ValueError("Invalid approval record")
+        for row in pending:
+            if row["approval_id"] in ids:
+                raise ValueError("Duplicate pending approval")
+            ids.add(row["approval_id"])
+        # Some Sentinel responses retain resolved rows in the pending array.
+        # Their explicit terminal status is authoritative, not their container.
+        recent = [*recent, *(row for row in pending if row["status"] != "pending")]
+        return [row for row in pending if row["status"] == "pending"], recent
+
+    def _commit_approval_snapshot(self, pending, recent):
+        """Caller holds the state lock. Never guess a missing row's decision."""
+        for row in pending + recent:
+            sid = self.approval_session(row)
+            if not isinstance(sid, str):
+                raise ValueError("Invalid approval session")
+            if row["status"] == "pending" and not sid and not self.is_background_approval(row):
+                raise ValueError("Unscoped pending approval")
+            self.approval_options(row)
+            self.approval_fingerprint(row)
+        self._pending_snapshot = {row["approval_id"]: copy.deepcopy(row) for row in pending}
+        active = set(self._pending_snapshot)
+        for row in pending:
+            self.upsert_approval(row)
+        for row in recent:
+            if row["approval_id"] not in active and row["status"] != "pending":
+                self.upsert_approval(row)
+        # The recent list is bounded. Missing != approved: retain that gate and
+        # ask the reconciliation worker for its detail, not the inbound sender.
+        if any(item.remote_id not in active for item in self.manager.pending_approvals()):
+            self._needs_reconcile.set()
+        self.manager.approvals_ready = True
+        self._state_version += 1
+
+    def accept_approval_event(self, event, generation):
+        if not isinstance(event, dict) or event.get("event") != "approvals.snapshot":
+            return False
+        with self._state_lock:
+            if generation != self._stream_generation:
+                return False
+            try:
+                payload = event.get("payload")
+                if (not isinstance(payload, dict) or type(payload.get("schema_version")) is not int
+                        or payload["schema_version"] != 1):
+                    raise ValueError("Unsupported approval snapshot")
+                seq, emitted = event.get("seq"), payload.get("emitted_at_ms")
+                if type(seq) is not int or seq < 0 or type(emitted) is not int or emitted < 0:
+                    raise ValueError("Invalid approval event ordering")
+                if seq <= self._stream_seq or emitted < self._stream_emitted_ms:
+                    return False
+                pending, recent = self._snapshot_lists(payload)
+                self._commit_approval_snapshot(pending, recent)
+                self._stream_seq, self._stream_emitted_ms = seq, emitted
+            except (ValueError, TypeError, AttributeError):
+                self.invalidate_approval_state()
+                logger.warning("Invalid approval snapshot; waiting for reconciliation.")
+                return False
+        self._wake()
+        return True
+
     def fetch_approvals(self):
         with self._fetch_lock:
+            with self._state_lock:
+                version = self._state_version
             try:
-                snapshot = self.request("GET", "/approvals")
-                pending = snapshot.get("pending_approvals", snapshot.get("pending"))
-                recent = snapshot.get("recent_approvals", snapshot.get("recent", []))
-                if not isinstance(pending, list) or not isinstance(recent, list):
-                    raise ValueError("Invalid approval snapshot")
-                active = set()
+                pending, recent = self._snapshot_lists(self.request("GET", "/approvals"))
+                with self._state_lock:
+                    if version != self._state_version:
+                        if self.manager.approvals_ready:
+                            self._last_fetch = time.monotonic()
+                        return self.manager.pending_approvals()
+                active = {row["approval_id"] for row in pending}
+                merged = []
                 for row in pending:
-                    if not isinstance(row, dict):
-                        raise ValueError("Invalid pending approval")
-                    remote_id = row.get("approval_id")
                     sid = self.approval_session(row)
                     if sid and sid not in self.manager.managed_sessions and not self.is_background_approval(row):
+                        merged.append(row)
                         continue
-                    if not isinstance(remote_id, str) or not remote_id:
-                        raise ValueError("Approval identifier missing")
-                    active.add(remote_id)
                     # Establish the gate even if the detail request fails.
-                    if sid and self.manager.by_remote("approval", remote_id) is None:
-                        self.upsert_approval(row)
-                    result = self.request("GET", f"/approvals/{quote(remote_id, safe='')}")
-                    detail = result.get("approval", result)
-                    item = self.upsert_approval(row, detail)
-                    if not sid and item is None and not self.approval_session(detail):
-                        raise ValueError("Unscoped pending approval")
-                for row in recent:
-                    # Recent pending rows can lag behind the active snapshot.
-                    if row.get("status") in {"approved", "denied", "timed_out"}:
-                        self.upsert_approval(row)
+                    with self._state_lock:
+                        if version == self._state_version and sid:
+                            self.upsert_approval(row)
+                    result = self.request("GET", f"/approvals/{quote(row['approval_id'], safe='')}")
+                    full = self.merge_approval(row, result.get("approval", result))
+                    if full.get("status") == "pending":
+                        merged.append(full)
+                    else:
+                        recent = [*recent, full]
                 for item in self.manager.pending_approvals():
                     if item.remote_id not in active:
                         result = self.request("GET", f"/approvals/{quote(item.remote_id, safe='')}")
-                        self.upsert_approval(result.get("approval", result))
-                self.manager.approvals_ready = True
+                        row = result.get("approval", result)
+                        if row.get("status") == "pending":
+                            merged.append(row)
+                        else:
+                            recent = [*recent, row]
+                # Validate even detail responses before changing local state.
+                self._snapshot_lists({"pending": merged, "recent": recent})
+                with self._state_lock:
+                    if version == self._state_version:
+                        self._commit_approval_snapshot(merged, recent)
+                    if self.manager.approvals_ready:
+                        self._last_fetch = time.monotonic()
+                self._wake()
                 return self.manager.pending_approvals()
             except Exception:
-                self.manager.approvals_ready = False
+                with self._state_lock:
+                    if version == self._state_version:
+                        self.invalidate_approval_state()
                 raise
 
     async def reconcile(self):
@@ -769,42 +935,93 @@ class MuseInteractions:
                         interaction_id=item.id, state=item.state)
             return f"{self._approval_title(item)}{option['label']}：状态：{self._state_label(item.state)}，服务端：{item.state}。"
 
-    async def run(self, notify, running):
-        """Use explicit sentinel reconciliation; snapshot stream origin is unverified."""
-        while running():
-            # If Muse credentials are not present (waiting for login / fallback mode),
-            # pause reconciliation quietly instead of spamming reconciliation errors.
-            if not await asyncio.to_thread(self.service.token_manager.has_credentials):
-                self.manager.approvals_ready = False
-                await asyncio.sleep(3)
-                continue
+    def reconciliation_due(self):
+        return (self._last_fetch is None or self._needs_reconcile.is_set()
+                or time.monotonic() - self._last_fetch >= self.service.config.approval.sync_interval_s)
 
+    async def _wait_for_update(self, changed):
+        # Notifications retry if no administrator is reachable. This wakeup is
+        # NOT the Sentinel polling interval: only reconciliation_due() fetches.
+        try:
+            await asyncio.wait_for(changed.wait(), timeout=3)
+        except asyncio.TimeoutError:
+            pass
+        changed.clear()
+
+    async def _notify_pending(self, notify, pending):
+        for item in pending:
+            policy = self.service.config.approval
+            if policy.mode != "manual" and not item.context.get("decision_uncertain"):
+                choice = "allow_once" if policy.mode == "allow_all" else "deny"
+                if any(o["decision"] == choice and not o.get("scope") for o in item.context["options"]):
+                    text = await self.submit_approval(item, choice, automatic=True)
+                    if policy.notify and item.terminal:
+                        item.context["auto_notification"] = text
+        # Keep results pending if no administrator is reachable yet.
+        for item in list(self.manager.items.values()):
+            text = item.context.get("auto_notification")
+            if text and self.service.config.approval.notify and await notify(item, text):
+                item.context.pop("auto_notification", None)
+        for head in self.queue_heads():
+            if self.queue_id(head) not in self._deciding:
+                await self.announce(head, notify)
+
+    async def _run_updates(self, notify, running, changed):
+        reconciliation = None
+        try:
+            while running():
+                if not await asyncio.to_thread(self.service.token_manager.has_credentials):
+                    if self.manager.approvals_ready:
+                        self.invalidate_approval_state()
+                    await asyncio.sleep(3)
+                    continue
+                # Reconcile in a separate task: a slow full snapshot must not
+                # delay notifications from a newer event on the owner thread.
+                if reconciliation is not None and reconciliation.done():
+                    try:
+                        reconciliation.result()
+                        self._reconcile_retry_at = 0.0
+                    except Exception as exc:
+                        self._reconcile_retry_at = time.monotonic() + 3
+                        logger.warning("Approval reconciliation unavailable; pending gates retained. error=%s", safe_error(exc))
+                    reconciliation = None
+                if (reconciliation is None and self.reconciliation_due()
+                        and time.monotonic() >= self._reconcile_retry_at):
+                    self._needs_reconcile.clear()
+                    reconciliation = asyncio.create_task(self.reconcile())
+                    reconciliation.add_done_callback(lambda _: changed.set())
+                try:
+                    if self.manager.approvals_ready:
+                        await self._notify_pending(notify, self.manager.pending_approvals())
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    # Notification failures do not revoke newer event authority.
+                    logger.warning("Approval notification unavailable. error=%s", safe_error(exc))
+                await self._wait_for_update(changed)
+        finally:
+            if reconciliation is not None:
+                # to_thread cancellation cannot cancel a synchronous RPC. Drain
+                # it before closing the protocol rather than leaking a worker.
+                with contextlib.suppress(Exception):
+                    await asyncio.shield(reconciliation)
+
+    async def run(self, notify, running):
+        """Stream-driven updates plus startup/recovery/periodic Sentinel reads."""
+        from .approval_stream import ApprovalEventStream
+
+        loop = asyncio.get_running_loop()
+        changed = asyncio.Event()
+        self._wake_callback = lambda: loop.call_soon_threadsafe(changed.set)
+        stream = ApprovalEventStream(self)
+        listener = asyncio.create_task(asyncio.to_thread(stream.run))
+        try:
+            await self._run_updates(notify, running, changed)
+        finally:
+            stream.stop.set()
+            # Do not cancel to_thread and abandon a live socket. The owner
+            # thread closes its client after its bounded read/connect returns.
             try:
-                pending = await self.reconcile()
-                for item in pending:
-                    policy = self.service.config.approval
-                    if policy.mode != "manual" and not item.context.get("decision_uncertain"):
-                        choice = "allow_once" if policy.mode == "allow_all" else "deny"
-                        if any(o["decision"] == choice and not o.get("scope") for o in item.context["options"]):
-                            text = await self.submit_approval(item, choice, automatic=True)
-                            if policy.notify and item.terminal:
-                                item.context["auto_notification"] = text
-                            continue
-                # Keep results pending if no administrator is reachable yet.
-                for item in list(self.manager.items.values()):
-                    text = item.context.get("auto_notification")
-                    if text and self.service.config.approval.notify and await notify(item, text):
-                        item.context.pop("auto_notification", None)
-                # One card per queue at a time; background work has its own queue.
-                for head in self.queue_heads():
-                    if self.queue_id(head) not in self._deciding:
-                        await self.announce(head, notify)
-            except asyncio.CancelledError:
-                raise
-            except LoginRequired:
-                self.manager.approvals_ready = False
-                logger.debug("Approval reconciliation paused: Muse login required.")
-            except Exception as e:
-                self.manager.approvals_ready = False
-                logger.warning("Approval reconciliation unavailable; pending gates retained. error=%s", safe_error(e))
-            await asyncio.sleep(3)
+                await asyncio.shield(listener)
+            finally:
+                self._wake_callback = None

@@ -43,6 +43,7 @@ def main(argv=None):
         run_protocol_login(
             email=args.email,
             output_path=args.output,
+            worker=config.muse.worker,
         )
     except KeyboardInterrupt:
         print("\n[MuseLogin] 用户取消登录。")
