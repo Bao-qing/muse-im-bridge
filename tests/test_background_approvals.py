@@ -117,7 +117,8 @@ class BackgroundCase(unittest.IsolatedAsyncioTestCase):
         for sid in ("s1", "s2", "worker-submission"):
             self.service.check_approval_gate(sid)
             self.assertEqual(self.p.approval_queue(sid), [])
-        self.assertIn("后台任务等待审批", self.p.format_approval(item))
+        self.assertIn(f"【后台审批 {item.id}】", self.p.format_approval(item))
+        self.assertNotIn("后台任务等待审批", self.p.format_approval(item))
         self.assertTrue(self.service.interactions.approvals_ready)
 
     def test_schedule_with_unmanaged_thread_still_enters_background_queue(self):
@@ -244,8 +245,8 @@ class BackgroundCase(unittest.IsolatedAsyncioTestCase):
                     self.assertEqual(self.remote.posts, [])
                     self.assertFalse(item.terminal)
         hint = self.p.format_approval(item)
-        self.assertIn("请引用本卡回复数字", hint)
-        self.assertIn("直接发送数字仍作为普通聊天转发", hint)
+        self.assertIn("必须引用本卡回复数字", hint)
+        self.assertNotIn("直接发送数字仍作为普通聊天转发", hint)
         self.assertNotIn("可直接回复数字审批", hint)
 
     async def test_private_quoted_choice_uses_background_queue(self):

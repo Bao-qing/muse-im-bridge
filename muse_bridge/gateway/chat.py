@@ -28,6 +28,7 @@ from ..core.message import Attachment, InboundMessage
 from ..core.interactions import interaction_owner
 from ..core.session_map import SessionMapper
 from ..muse.client.errors import LoginRequired, is_runtime_auth_error
+from ..muse.interactions import LOGIN_RELOGIN_NOTICE
 from ..muse.interactions import ApprovalBlocked
 from ..muse.service import MuseService
 from ..observability import get_logger, safe_error, trace_event
@@ -114,8 +115,8 @@ class ChatGateway(BaseAdapter):
         return isinstance(self.config, ChatConfig) and self.config.admin_only
 
     def _login_instruction(self) -> str:
-        return ("请管理员私聊发送 /登录 或 /登录 <邮箱>。" if self.access_requests is not None
-                else "请发送 /登录 或 /登录 <邮箱>。")
+        return ("请管理员在私聊中发送 /登录 或 /登录 <邮箱> 重新登录。" if self.access_requests is not None
+                else "请发送 /登录 或 /登录 <邮箱> 重新登录。")
 
     def interaction_owner(self, kind, target, user):
         return interaction_owner(kind, target, user, self.name, self.account_identity())
@@ -198,7 +199,7 @@ class ChatGateway(BaseAdapter):
         try:
             await self.send_notice(
                 admin_target,
-                "【系统告警】向 Muse 发送消息时检测到凭据失效（401 Unauthorized）。\n已自动进入登录回落流程，请直接在此私聊发送：\n/登录 <您的邮箱>\n即可获取验证码重新登录恢复服务",
+                "【系统告警】" + LOGIN_RELOGIN_NOTICE,
             )
         except Exception as e:
             logger.debug('Failed to notify admin for login: %s', safe_error(e))
@@ -252,7 +253,7 @@ class ChatGateway(BaseAdapter):
             self.exit_login_mode()
         needs_login = not available
         if needs_login and not content.startswith("/"):
-            text = "Muse 认证不可用，" + self._login_instruction()
+            text = "Muse 登录已失效，" + self._login_instruction()
             await self.send_reply(target_type, target_id, text, msg_id)
             return "handled"
 
@@ -300,7 +301,7 @@ class ChatGateway(BaseAdapter):
             await self.send_reply(
                 target_type,
                 target_id,
-                "权限不足：管理指令仅限管理员在私聊中执行（如需在群聊中使用，可在配置中设置 admin_only: false）。",
+                "权限不足：管理命令仅限管理员在私聊中使用。",
                 msg_id,
             )
             return
@@ -340,11 +341,11 @@ class ChatGateway(BaseAdapter):
         except Exception as e:
             if isinstance(e, LoginRequired):
                 self.enter_login_mode()
-                reply = "Muse Cookie 会话已失效，" + self._login_instruction()
+                reply = "Muse 登录已失效，" + self._login_instruction()
             else:
                 if is_runtime_auth_error(e) and client is not None:
                     await asyncio.to_thread(self.muse_service.token_manager.invalidate_mint, client.token, client.notary_token)
-                reply = "命令结果未确认，请稍后核对；不会自动重复执行。"
+                reply = "命令结果未能确认，请稍后核对，不会重复执行。"
         finally:
             if client:
                 try:
@@ -435,9 +436,9 @@ class ChatGateway(BaseAdapter):
                 self.enter_login_mode()
                 target = self.notification_target()
                 if target_type == "private" and can_manage:
-                    reply = "Muse 会话凭据已失效，请发送 /登录 或 /登录 <邮箱>。"
+                    reply = "Muse 登录已失效，请发送 /登录 或 /登录 <邮箱> 重新登录。"
                 else:
-                    reply = "Muse 会话凭据已失效，已通知管理员重新登录。"
+                    reply = "Muse 登录已失效，已通知管理员重新登录。"
                     if target and (target_type != "private" or target_id != target):
                         loop.call_soon(asyncio.create_task, self._notify_admin_login(target))
                 await self.send_reply(target_type, target_id, reply, msg_id)
@@ -460,11 +461,11 @@ class ChatGateway(BaseAdapter):
                 except Exception as recovery_error:
                     logger.error('Missing-session recovery unconfirmed: %s', safe_error(recovery_error))
                     await self.send_command_output(target_type, target_id,
-                        "会话重建后发送结果未确认；未自动重发，请稍后核对。", msg_id)
+                        "消息结果未能确认，没有重复发送，请稍后核对。", msg_id)
                     return "unknown"
             # Transport failures and unclassified errors never replay user input.
             logger.error('Failed to post message to Muse: %s', safe_error(e))
             await self.send_reply(target_type, target_id,
-                "连接暂不可用，消息结果未确认；未自动重发，请稍后核对。" if post_started
-                else "连接暂不可用，消息尚未发送，请稍后重试。", msg_id)
+                "连接暂时不可用，消息可能已发送，请稍后核对。" if post_started
+                else "连接暂时不可用，消息尚未发送，请稍后重试。", msg_id)
             return "unknown" if post_started else "retryable"

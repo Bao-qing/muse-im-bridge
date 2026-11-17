@@ -20,6 +20,11 @@ from ..observability import get_logger, safe_error, trace_event
 logger = get_logger(__name__)
 
 
+# The one admin-facing login notice, shared by the engine and both gateway
+# paths so the wording never drifts apart.
+LOGIN_RELOGIN_NOTICE = "Muse 登录已失效。请在此私聊发送：/登录 <您的邮箱>，按提示输入验证码即可恢复。"
+
+
 # Single-value captures use explicit protected fields, never names guessed from
 # a card title. Legacy create_password cards use the password field.
 SECRET_CAPTURE_FIELDS = {
@@ -659,11 +664,20 @@ class MuseInteractions:
                 item.context["notified"] = True
             return delivered
 
+    @staticmethod
+    def _approval_title(item):
+        return f"【后台审批 {item.id}】" if item.context.get("background_approval") else f"【审批 {item.id}】"
+
+    @staticmethod
+    def _state_label(state):
+        return {"approved": "已允许", "denied": "已拒绝", "expired": "已过期",
+                "timed_out": "已过期"}.get(state, state)
+
     def format_approval(self, item):
         a = item.context.get("approval") or {}
         d = a.get("display") or {}
         position, total, waiting = self.queue_position(item)
-        lines = [f"【审批 {item.id}】{position}/{total}",
+        lines = [f"{self._approval_title(item)}{position}/{total}",
                  d.get("summary_title") or a.get("approval_phrase") or "待审批操作",
                  d.get("purpose_summary") or a.get("short_explanation") or ""]
         document = d.get("request_preview_document") or {}
@@ -678,29 +692,29 @@ class MuseInteractions:
         options = item.context.get("options", [])
         lines.extend(f"选项 {n}｜{o['label']}" for n, o in enumerate(options, 1))
         if not options:
-            lines.append("服务端未提供可验证的原生选项，请在 Muse 网页处理；")
+            lines.append("此审批没有可选项，请在 Muse 网页中处理。")
         if item.context.get("background_approval"):
-            lines.append(f"请引用本卡回复数字，或使用 /审批 {item.id} <数字>；直接发送数字仍作为普通聊天转发")
+            lines.append(f"必须引用本卡回复数字，或使用 /审批 {item.id} <数字>")
             if waiting > 1:
-                lines.append(f"引用本卡回复「<数字> all」或 /审批 {item.id} <数字> 全部，对排队中的 {waiting} 项全部使用该选项")
+                lines.append(f"引用本卡回复「<数字> all」，或发送 /审批 {item.id} <数字> 全部，可一次处理排队中的 {waiting} 项。")
         else:
             lines.append(f"当前会话等待审批时可直接回复数字；其他聊天请引用本卡回复数字，或使用 /审批 {item.id} <数字>")
             if waiting > 1:
-                lines.append(f"当前会话回复「<数字> all」或 /审批 {item.id} <数字> 全部，对排队中的 {waiting} 项全部使用该选项")
-        lines.append("后台任务等待审批；不影响其他聊天" if item.context.get("background_approval")
-                     else "完成审批以继续聊天")
+                lines.append(f"直接回复「<数字> all」，或发送 /审批 {item.id} <数字> 全部，可一次处理排队中的 {waiting} 项。")
+        if not item.context.get("background_approval"):
+            lines.append("完成审批以继续聊天")
         return "\n".join(line for line in lines if line)
 
     async def submit_approval(self, item, choice, *, expected_fingerprint=None, automatic=False):
         lock = self._decision_locks.setdefault(item.remote_id, asyncio.Lock())
         async with lock:
             if item.terminal:
-                return f"此审批已结束，服务端状态：{item.state}；不会重复提交决定。"
+                return f"此审批已结束（{self._state_label(item.state)}），无需重复操作。"
             if item.context.get("decision_uncertain"):
                 result = await asyncio.to_thread(self.request, "GET", f"/approvals/{quote(item.remote_id, safe='')}")
                 self.upsert_approval(result.get("approval", result))
-                return ("审批已由远端确认结束。" if item.terminal else
-                        "上次提交结果仍不确定，不会重复发送决定；请在 Muse 网页核对。")
+                return ("此审批已结束。" if item.terminal else
+                        "上次的选择结果未能确认，不会重复提交，请在 Muse 网页核对。")
             shown = expected_fingerprint or item.context.get("fingerprint")
             old_options = item.context.get("options", [])
             if str(choice).isdigit():
@@ -710,19 +724,19 @@ class MuseInteractions:
                 matches = [o for o in old_options if o["decision"] == choice and not o.get("scope")]
                 option = matches[0] if len(matches) == 1 else None
             if option is None:
-                return "请选择当前审批卡实际提供的选项。\n" + self.format_approval(item)
+                return "请选择卡片上有的选项。\n" + self.format_approval(item)
             # The snapshot carries scoped option objects; detail may only carry
             # strings. Reconcile both before interpreting the displayed choice.
             await asyncio.to_thread(self.fetch_approvals)
             fresh = item.context["approval"]
             if item.terminal:
-                return f"审批已在其他客户端结束，服务端状态：{item.state}；未提交本次选择。"
+                return f"此审批已在其他设备上处理完（{self._state_label(item.state)}），本次选择未提交。"
             if fresh.get("status") != "pending":
                 raise ValueError("Approval state unconfirmed")
             if not automatic and item.context["fingerprint"] != shown:
-                return "审批内容或选项已变化，请按新卡重新选择。\n" + self.format_approval(item)
+                return "审批内容已变化，请按新卡重新选择。\n" + self.format_approval(item)
             if option not in item.context["options"]:
-                return "可用审批选项已变化，请重新选择。\n" + self.format_approval(item)
+                return "审批内容已变化，请按新卡重新选择。\n" + self.format_approval(item)
             body = {"decision": option["decision"], "notification_channel": "ui"}
             revision = message_revision(fresh)
             if revision is not None:
@@ -747,10 +761,10 @@ class MuseInteractions:
                 if not item.terminal:
                     item.state = "unknown"
                     item.context["decision_uncertain"] = True
-                    return "审批结果未确认，仍保持门禁；请先在 Muse 网页核对；"
+                    return "审批结果未能确认，请先在 Muse 网页核对。"
             trace_event("muse.interactions", "approval.resolved", session_id=item.session_id,
                         interaction_id=item.id, state=item.state)
-            return f"【审批 {item.id}】{option['label']}；服务端状态：{item.state}。"
+            return f"{self._approval_title(item)}{option['label']}：状态：{self._state_label(item.state)}，服务端：{item.state}。"
 
     async def run(self, notify, running):
         """Use explicit sentinel reconciliation; snapshot stream origin is unverified."""

@@ -213,7 +213,7 @@ class WeChatAdapter(ChatGateway):
             if line.startswith("/申请"):
                 continue
             if line.startswith("/登录 "):
-                line = "/登录 [邮箱] — 显式登录 Muse"
+                line = "/登录 [邮箱] — 登录 Muse"
             elif line.startswith("/凭证 "):
                 line = "/凭证 [编号] [保存|一次] — 填写凭证，也可引用凭证卡回复"
             lines.append(line)

@@ -96,11 +96,11 @@ class ChatInteractions:
         if bindings is None:
             return False
         if not is_admin:
-            await self.reply(owner, "审批仅限已配置的管理员操作。", msg_id)
+            await self.reply(owner, "审批仅限管理员操作。", msg_id)
             return True
         choice = APPROVAL_REPLY.fullmatch(content.strip())
         if len(bindings) != 1 or not choice:
-            await self.reply(owner, "请引用单张审批卡回复选项数字，或使用 /审批 编号 <数字>；未提交决定。", msg_id)
+            await self.reply(owner, "请引用一张审批卡回复数字，或发送 /审批 编号 <数字>。", msg_id)
             return True
         key, snapshot = bindings[0]
         number = choice.group(1) or choice.group(3)
@@ -143,14 +143,14 @@ class ChatInteractions:
                     await self.reply(owner, "登录仅限管理员私聊。", msg_id)
                     return True
                 if current and not current.terminal:
-                    await self.reply(owner, "请先 /取消 结束当前输入流程。", msg_id)
+                    await self.reply(owner, "请先发送 /取消 结束当前填写。", msg_id)
                     return True
                 item = self.manager.add("login", owner=owner, state="wait_email")
                 self.manager.activate(item, owner)
                 if args:
                     await self._send_otp(item, args, owner, msg_id)
                 else:
-                    await self.reply(owner, "【登录】请输入登录邮箱；/取消 取消。", msg_id)
+                    await self.reply(owner, "【登录】请输入登录邮箱（发送 /取消 可取消）。", msg_id)
                 return True
 
             active = current is not None and not current.terminal
@@ -160,16 +160,16 @@ class ChatInteractions:
                     if active:
                         self.manager.finish(current, "cancelled")
                     self.manager.release(owner)
-                    await self.reply(owner, "输入流程已结束，后续消息正常转发。", msg_id)
+                    await self.reply(owner, "已结束填写，可以继续聊天。", msg_id)
                 elif self.pending(session_id):
                     await self.show_approval(owner, session_id, msg_id)
                 else:
-                    await self.reply(owner, "没有活动输入流程；取消不会决定任何远端审批。", msg_id)
+                    await self.reply(owner, "当前没有进行中的填写。", msg_id)
                 return True
 
             if command == "/聊天":
                 if current and not current.terminal:
-                    await self.reply(owner, "请先 /取消 结束当前输入流程。", msg_id)
+                    await self.reply(owner, "请先发送 /取消 结束当前填写。", msg_id)
                 elif self.pending(session_id):
                     await self.show_approval(owner, session_id, msg_id)
                 else:
@@ -187,7 +187,7 @@ class ChatInteractions:
             if current and current.terminal:
                 self.manager.release(owner)
                 if current.state == "expired" and time.time() - current.expires_at < LATE_INPUT_GRACE_S:
-                    await self.reply(owner, "输入流程已过期，此消息未转发；之后的消息正常转发。", msg_id)
+                    await self.reply(owner, "填写已过期，这条消息没有发送，请重新发送。", msg_id)
                     return True
                 current = None
 
@@ -229,7 +229,7 @@ class ChatInteractions:
 
     async def _send_otp(self, item, email, owner, msg_id):
         if not re.fullmatch(r"[^\s@]+@[^\s@]+\.[^\s@]+", email):
-            await self.reply(owner, "请输入有效邮箱；/取消 取消。", msg_id)
+            await self.reply(owner, "邮箱格式不对，请重新输入（发送 /取消 可取消）。", msg_id)
             return
         auth = MuseProtocolLogin()
         item.context["auth"] = auth
@@ -242,15 +242,15 @@ class ChatInteractions:
             auth.client.close()
             item.context.pop("auth", None)
             item.state = "wait_email"
-            await self.reply(owner, "验证码发送失败，请重试邮箱或 /取消；未记录认证响应。", msg_id)
+            await self.reply(owner, "验证码发送失败，请确认邮箱后重试，或发送 /取消 退出。", msg_id)
             return
         item.state = "wait_otp"
         item.expires_at = time.time() + 300
-        await self.reply(owner, "【登录】验证码已发送，请输入六位数字；/取消 取消。", msg_id)
+        await self.reply(owner, "【登录】验证码已发送，请输入 6 位验证码（发送 /取消 可取消）。", msg_id)
 
     async def _confirm_otp(self, item, content, owner, msg_id):
         if not re.fullmatch(r"[0-9]{6}", content):
-            await self.reply(owner, "请回复六位数字验证码；/取消 取消。", msg_id)
+            await self.reply(owner, "请回复 6 位数字验证码（发送 /取消 可取消）。", msg_id)
             return
         item.state = "submitting"
         auth = item.context["auth"]
@@ -264,7 +264,7 @@ class ChatInteractions:
         except Exception as exc:
             logger.warning('confirm_otp unavailable: %s', safe_error(exc))
             item.state = "wait_otp"
-            await self.reply(owner, "验证码确认失败，请重试或 /取消；输入未转发到 Muse。", msg_id)
+            await self.reply(owner, "验证码确认失败，请重新输入，或发送 /取消 退出。", msg_id)
             return
         self.manager.finish(item)
         self.manager.release(owner)
@@ -274,15 +274,15 @@ class ChatInteractions:
         except LoginRequired as exc:
             logger.warning('confirm_otp unavailable: %s', safe_error(exc))
             self.adapter.enter_login_mode()
-            await self.reply(owner, "登录会话未生效，请重新 /登录；输入未转发到 Muse。", msg_id)
+            await self.reply(owner, "登录未成功，请重新发送 /登录。", msg_id)
             return
         except Exception as exc:
             logger.warning('confirm_otp unavailable: %s', safe_error(exc))
-            await self.reply(owner, "Cookie 已保存，连接暂未恢复；稍后会自动重试，无需重复登录。", msg_id)
+            await self.reply(owner, "已保存，连接正在恢复，稍后会自动重试，无需重复登录。", msg_id)
             return
         self.adapter.exit_login_mode()
         trace_event(f"{self.adapter.name}.interactions", "login.completed", interaction_id=item.id, state=item.state)
-        await self.reply(owner, "【登录成功】Cookie 与运行凭据已更新，后续消息正常转发。", msg_id)
+        await self.reply(owner, "【登录成功】登录已恢复，可以继续聊天。", msg_id)
 
     async def show_approval(self, owner, session_id, msg_id, *, all_sessions=False, prefix=""):
         """Show only the head of each queue; the rest wait their turn."""
@@ -309,7 +309,7 @@ class ChatInteractions:
         shown = (snapshot[1] if snapshot is not None else
                  head.context.get("queue_shown", {}).get(self.target(owner)) if head else None)
         if head and snapshot is not None and snapshot[0] != head.context.get("fingerprint"):
-            await self.display_approval(owner, head, msg_id, prefix="审批内容或选项已变化，请按新卡重新选择。\n\n")
+            await self.display_approval(owner, head, msg_id, prefix="审批内容已变化，请按新卡重新选择。\n\n")
             return
         if not shown or shown[0][0] != head.id:
             if head:
@@ -320,7 +320,7 @@ class ChatInteractions:
         options = head.context.get("options", [])
         index = int(choice) - 1 if choice.isdigit() else -1
         if not 0 <= index < len(options):
-            await self.display_approval(owner, head, msg_id, prefix="请选择当前审批卡实际提供的选项。\n\n")
+            await self.display_approval(owner, head, msg_id, prefix="请选择卡片上有的选项。\n\n")
             return
         wanted = options[index]
         label = wanted["label"]
@@ -335,7 +335,7 @@ class ChatInteractions:
                     (str(n) for n, o in enumerate(item.context.get("options", []), 1)
                      if o["decision"] == wanted["decision"] and o.get("scope") == wanted.get("scope")), None)
                 if number is None:
-                    results.append(f"{item.id}：无相同选项，保留待审批")
+                    results.append(f"{item.id}：没有相同的选项，仍待审批")
                     continue
                 try:
                     text = await self.adapter.muse_service.submit_approval(
@@ -352,7 +352,7 @@ class ChatInteractions:
 
     async def handle_approval(self, owner, command, args, session_id, msg_id, is_admin, *, snapshot=None):
         if not is_admin:
-            await self.reply(owner, "审批仅限已配置的管理员操作。", msg_id)
+            await self.reply(owner, "审批仅限管理员操作。", msg_id)
             return
         if not args:
             await self.show_approval(owner, session_id, msg_id, all_sessions=owner[0] == "private")
@@ -370,17 +370,17 @@ class ChatInteractions:
             return
         item = self.manager.items.get(parts[0].upper())
         if item is None or item.kind != "approval":
-            await self.reply(owner, "该审批不存在或已结束；消息未转发。", msg_id)
+            await self.reply(owner, "该审批不存在或已结束。", msg_id)
             return
         # Admin private chat is the explicit account-wide control surface.
         # A group may only act on its own currently bound Muse session.
         if owner[0] != "private" and (item.context.get("background_approval") or item.session_id != session_id):
-            await self.reply(owner, "此审批不属于当前群绑定的 Muse 会话。", msg_id)
+            await self.reply(owner, "此审批不属于当前群的会话。", msg_id)
             return
         if item.terminal:
             state = {"timed_out": "已过期", "expired": "已过期", "approved": "已允许",
                      "denied": "已拒绝"}.get(item.state, item.state)
-            await self.reply(owner, f"该审批已结束（{state}）；未重复提交，消息未转发。", msg_id)
+            await self.reply(owner, f"该审批已结束（{state}），无需重复操作。", msg_id)
             return
         choice = parts[1] if len(parts) > 1 else None
         if command == "/同意":
@@ -401,7 +401,7 @@ class ChatInteractions:
                 text = await self.adapter.muse_service.submit_approval(item, choice, expected_fingerprint=fingerprint)
             except Exception as exc:
                 logger.warning('handle_approval unavailable: %s', safe_error(exc))
-                text = "审批结果暂未确认，未放行、未补发任何消息，请重新查看审批。"
+                text = "审批结果未能确认，请重新查看审批。"
             if item.terminal:
                 await self.advance_queue(owner, queue_id, msg_id, text)
             else:
@@ -432,7 +432,7 @@ class ChatInteractions:
             return
         current = self.manager.current(owner)
         if current and not current.terminal and current is not item:
-            await self.reply(owner, "请先 /取消 结束当前填写。", msg_id)
+            await self.reply(owner, "请先发送 /取消 结束当前填写。", msg_id)
             return
         if item.context.get("auth_providers") or item.context.get("grant_request_type"):
             await self.reply(owner, "请在 Muse 网页完成此登录。", msg_id)
@@ -517,7 +517,7 @@ class ChatInteractions:
                 len(lines) == 2):
             if (item.context.get("submitted_digest") is not None
                     and lines[0].strip() != item.context.get("username")):
-                await self.reply(owner, "请用相同内容重试，或 /取消 取消。", msg_id, item=item)
+                await self.reply(owner, "请用相同内容重试（发送 /取消 可退出）。", msg_id, item=item)
                 return
             username = lines[0].strip()
             if not username:
@@ -540,7 +540,7 @@ class ChatInteractions:
     @staticmethod
     def credential_prompt(item):
         if credential_input_kind(item.context) == "key":
-            return "请发送单行密钥/授权凭据，无需填写账号；凭证才需要账号、密码两行。"
+            return "请发送密钥（一行即可），无需填写账号。"
         if item.state == "wait_code":
             return "请输入验证码。"
         if item.state == "wait_secret":
@@ -569,8 +569,8 @@ class ChatInteractions:
             logger.warning('capture unavailable: %s', safe_error(exc))
             if not item.terminal:
                 item.state = previous
-            text = ("密钥提交被拒绝，请检查后重新输入，或 /取消 取消。" if isinstance(exc, ConnectorKeyRejected)
-                    else "保存结果未确认，请用相同内容重试，或 /取消 取消。")
+            text = ("密钥不正确，请检查后重新输入（发送 /取消 可退出）。" if isinstance(exc, ConnectorKeyRejected)
+                    else "保存结果未能确认，请用相同内容重试（发送 /取消 可退出）。")
             await self.reply(owner, text, msg_id, item=item)
             return
         self.manager.finish(item)

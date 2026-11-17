@@ -37,7 +37,7 @@ from ..muse.client.render import (
 )
 from ..observability import get_logger, safe_error, trace_event
 from ..muse.service import MuseService
-from ..muse.interactions import credential_input_kind, credential_secret_label
+from ..muse.interactions import LOGIN_RELOGIN_NOTICE, credential_input_kind, credential_secret_label
 from .routes import RouteInfo, RouteManager
 
 logger = get_logger(__name__)
@@ -229,12 +229,12 @@ class OutboundDispatcher:
             return "请管理员私聊填写。"
         kind = credential_input_kind(credential.context)
         if kind == "key":
-            return "管理员可引用此消息，发送单行密钥/授权凭据，无需填写账号。"
+            return f"可引用此消息发送单行密钥，无需填写账号，或发送 /密钥 {credential.id}。"
         if kind == "code":
-            return "管理员可引用此消息，发送验证码。"
+            return f"可引用此消息发送验证码，或发送 /凭证 {credential.id} [保存|一次] 验证码。"
         if kind == "secret":
-            return f"管理员可引用此消息，发送{credential_secret_label(credential.context)}（支持整段多行内容，无需填写账号）。"
-        return "管理员可引用此消息，第一行发送账号，后续内容发送密码或密钥（支持多行）。"
+            return f"可引用此消息发送{credential_secret_label(credential.context)}（支持多行），或发送 /凭证 {credential.id} [保存|一次] 凭证。"
+        return f"可引用此消息发送账号和密码（支持多行），或发送 /凭证 {credential.id} [保存|一次] [凭证]。"
 
     def track_session(self, session_id: str, fresh: bool = False) -> None:
         """Called by the adapter right after creating or posting into ``session_id``.
@@ -435,7 +435,7 @@ class OutboundDispatcher:
             try:
                 await self._send_notice(
                     admin_target,
-                    "【系统提示】获取 Muse 消息时检测到凭据失效（401 Unauthorized）。\n已自动进入登录回落流程，请直接在此私聊发送：\n/登录 <您的邮箱>\n即可获取验证码重新登录恢复服务",
+                    "【系统提示】" + LOGIN_RELOGIN_NOTICE,
                 )
             except Exception as e:
                 logger.debug('Failed to notify admin for login: %s', safe_error(e))
@@ -977,13 +977,13 @@ class OutboundDispatcher:
                     if credential_input_kind(credential.context) == "key":
                         c = credential.context
                         clean_text = chr(10).join((
-                            f"【{c['title']}提示】{c['subtitle']}（需要输入单行秘钥/授权凭据）",
+                            f"【{c['title']}提示】{c['subtitle']}（需要输入单行密钥/授权凭据）",
                             f"【密钥 {credential.id}】", hint,
                             f"也可发送 /密钥 {credential.id}，再发送一行密钥。"))
                     else:
                         clean_text = chr(10).join((
                             f"【凭证 {credential.id}】{credential.context['page_url']}",
-                            hint, f"也可发送 \n/凭证 {credential.id} [保存/一次] [凭证]"))
+                            hint, f"也可发送 /凭证 {credential.id} [保存|一次]，再发送凭证内容。"))
                 elif credential:
                     clean_text = "密钥卡已结束。" if credential_input_kind(credential.context) == "key" else "凭证卡已结束。"
                 else:

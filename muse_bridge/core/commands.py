@@ -27,14 +27,14 @@ HELP_TEXT = (
     "/切换 <序号|id> — 切换会话\n"
     "/新建 — 新开会话\n"
     "/当前 — 当前会话\n"
-    "/登录 [邮箱] — 显式登录 Muse（管理员私聊专用）\n"
+    "/登录 [邮箱] — 登录 Muse（仅管理员私聊）\n"
     "/密钥 [编号] — 填写连接器单行密钥，也可引用密钥卡回复\n"
     "/凭证 [编号] [保存|一次] — 填写凭证，也可回复凭证卡\n"
     "账号和密码可分两行发送，保存后自动继续聊天\n"
-    "/审批 [编号] [选项数字] — 查看或选择 Muse 原生审批选项；多张审批依次排队\n"
+    "/审批 [编号] [选项数字] — 查看或处理 Muse 审批；多张时依次排队\n"
     "/审批 全部 <选项数字> — 当前审批队列全部使用该选项（也可回复“数字 全部”）\n"
-    "/取消 — 结束本地输入（不会取消远端审批）\n"
-    "/聊天 — 清除已结束的输入流程（通常无需使用）\n"
+    "/取消 — 退出当前填写流程\n"
+    "/聊天 — 返回聊天（结束残留的填写流程）\n"
     "/删除 <序号|id> — 删除会话（主会话不能删）\n"
     "/重命名 <序号|id> <新标题> — 改名\n"
     "/置顶 /取消置顶 <序号|id> — 置顶 / 取消置顶\n"
@@ -86,7 +86,7 @@ class CommandHandler:
     @staticmethod
     def resolve_session(arg: str, sessions: List[dict]) -> str:
         if not arg:
-            raise CommandError("请指定会话序号或 id")
+            raise CommandError("请指定会话序号或 id。")
         # Try 1-based index
         try:
             idx = int(arg)
@@ -105,7 +105,7 @@ class CommandHandler:
             return matches[0]
         if len(matches) > 1:
             raise CommandError(f"匹配到多个会话，请输入更长的 id 前缀：{', '.join(matches[:3])}")
-        raise CommandError(f"未找到匹配的会话：{arg}")
+        raise CommandError(f"未找到匹配的会话：{arg}。")
 
     @classmethod
     def execute(
@@ -127,14 +127,14 @@ class CommandHandler:
 
         if name == "new":
             new_id = str(uuid.uuid4())
-            return f"已开启新会话：{new_id}", new_id
+            return f"已开启新会话：{new_id}。", new_id
 
         if name == "current":
             main_tag = " [主会话]" if (main_session_id and active_session_id == main_session_id) else ""
-            return f"当前会话：{active_session_id}{main_tag}", active_session_id
+            return f"当前会话：{active_session_id}{main_tag}。", active_session_id
 
         if client is None:
-            raise CommandError("Muse 客户端未连接，无法执行此指令")
+            raise CommandError("Muse 未连接，无法执行此命令。")
 
         sessions = client.list_sessions()
 
@@ -163,31 +163,31 @@ class CommandHandler:
         sid = cls.resolve_session(args.split()[0] if args else "", sessions)
 
         if name == "switch":
-            return f"已切换至会话：{sid}", sid
+            return f"已切换至会话：{sid}。", sid
 
         if name == "delete":
             if main_session_id and sid == main_session_id:
-                raise CommandError("主会话不能删除")
+                raise CommandError("主会话不能删除。")
             client.delete_session(sid)
-            return f"已删除会话：{sid}", active_session_id
+            return f"已删除会话：{sid}。", active_session_id
             client.delete_session(sid)
-            return f"已删除会话：{sid}", active_session_id
+            return f"已删除会话：{sid}。", active_session_id
 
         if name == "pin":
             client.pin_session(sid)
-            return f"已置顶会话：{sid}", active_session_id
+            return f"已置顶会话：{sid}。", active_session_id
 
         if name == "unpin":
             client.unpin_session(sid)
-            return f"已取消置顶：{sid}", active_session_id
+            return f"已取消置顶：{sid}。", active_session_id
 
         if name == "archive":
             client.archive_session(sid)
-            return f"已归档会话：{sid}", active_session_id
+            return f"已归档会话：{sid}。", active_session_id
 
         if name == "unarchive":
             client.unarchive_session(sid)
-            return f"已取消归档：{sid}", active_session_id
+            return f"已取消归档：{sid}。", active_session_id
 
         if name == "rename":
             parts = args.split(None, 1)
@@ -195,6 +195,6 @@ class CommandHandler:
                 raise CommandError("用法：/重命名 <序号|id> <新标题>")
             new_title = parts[1].strip()
             client.rename_session(sid, new_title)
-            return f"会话已重命名为：{new_title}", active_session_id
+            return f"会话已重命名为：{new_title}。", active_session_id
 
         return HELP_TEXT, active_session_id

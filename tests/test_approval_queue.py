@@ -141,7 +141,7 @@ class QueueCase(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([r for r, _ in self.remote.posts], ["remote-a"])
         self.assertFalse(second.terminal)
         reply = self.texts()[-1]
-        self.assertIn(f"{second.id}：无相同选项，保留待审批", reply)
+        self.assertIn(f"{second.id}：没有相同的选项，仍待审批", reply)
         self.assertIn(f"【审批 {second.id}】", reply)
 
     async def test_all_covers_only_cards_queued_when_shown(self):
@@ -250,7 +250,7 @@ class QueueCase(unittest.IsolatedAsyncioTestCase):
         # New replies have different receipts; the old quote stays a tombstone.
         self.adapter.client.send_message.return_value = (200, {"id": "card-2"})
         self.assertTrue(await self.quoted("1"))
-        self.assertIn("服务端状态：approved", self.texts()[-1])
+        self.assertIn("状态：已允许，服务端：approved", self.texts()[-1])
         self.assertIn(second.id, self.texts()[-1])
         await self.quoted("1")
         self.assertIn("已结束", self.texts()[-1])
@@ -375,7 +375,7 @@ class QueueCase(unittest.IsolatedAsyncioTestCase):
                         "message": [{"type": "text", "data": {"text": text}}]})
                     self.assertEqual(len(self.remote.posts), 1)
                     self.assertIn("审批已全部完成", str(adapter.client.send_msg.call_args))
-                    self.assertIn("已完成" if mode == "batch" else "服务端状态：approved",
+                    self.assertIn("已完成" if mode == "batch" else "状态：已允许，服务端：approved",
                                   str(adapter.client.send_msg.call_args))
                     self.service.post_message.assert_not_called()
 
@@ -415,7 +415,7 @@ class QueueCase(unittest.IsolatedAsyncioTestCase):
         adapter.client.send_msg.return_value = {"message_id": 101}
         await adapter.handle_event(event)
         self.assertEqual(len(self.remote.posts), 1)
-        self.assertIn("服务端状态：approved", str(adapter.client.send_msg.call_args))
+        self.assertIn("状态：已允许，服务端：approved", str(adapter.client.send_msg.call_args))
         calls = adapter.client.send_msg.call_count
         await adapter.handle_event(event)  # Same incoming message is deduplicated.
         self.assertEqual(adapter.client.send_msg.call_count, calls)

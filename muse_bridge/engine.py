@@ -10,6 +10,7 @@ from .adapters.onebot import OneBotAdapter
 from .adapters.qq import QQAdapter
 from .config.models import AppConfig, ChatConfig
 from .gateway.chat import ChatGateway
+from .muse.interactions import LOGIN_RELOGIN_NOTICE
 from .muse.service import MuseService
 from .muse.token_manager import MuseTokenManager
 from .observability import get_logger, safe_error
@@ -135,7 +136,7 @@ class BridgeEngine:
         try:
             await adapter.send_notice(
                 admin_target,
-                "【系统提示】Muse 会话凭据未就绪或已失效，已进入登录回落流程。\n您可直接在此私聊发送：\n/登录 <您的邮箱>\n即可获取验证码完成在线认证",
+                "【系统提示】" + LOGIN_RELOGIN_NOTICE,
             )
             adapter.enter_login_mode(admin_target)
         except Exception as e:

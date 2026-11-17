@@ -242,7 +242,7 @@ class ConnectorChatCase(unittest.IsolatedAsyncioTestCase):
         data.update(type="connector", data={"connector_id": action["connectorId"], "url": action["url"]})
         await pusher._scan_and_dispatch([event], session_id="s1")
         item = self.service.interactions.by_remote("credential", "connector-card")
-        self.assertTrue(self.text().startswith("【Matlab Mcp提示】连接器（需要输入单行秘钥/授权凭据）"))
+        self.assertTrue(self.text().startswith("【Matlab Mcp提示】连接器（需要输入单行密钥/授权凭据）"))
         self.assertIn("/密钥 " + item.id, self.text())
         self.assertNotIn("网页端", self.text())
         self.assertIs(self.service.interactions.referenced_credential("private", "ADMIN", [("id", "KEY_CARD")]), item)

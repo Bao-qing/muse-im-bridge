@@ -143,9 +143,9 @@ class InteractionManager:
         with self._guard:
             current = self.current(owner)
             if current and not current.terminal and current.id != item.id:
-                raise ValueError("请先结束当前输入流程。")
+                raise ValueError("请先结束当前填写。")
             if item.owner is not None and item.owner != owner:
-                raise ValueError("此交互不属于当前用户。")
+                raise ValueError("这不是你的填写流程。")
             item.owner = owner
             self.focus[owner] = item.id
 
