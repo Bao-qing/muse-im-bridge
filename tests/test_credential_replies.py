@@ -215,7 +215,9 @@ class TestCredentialReplies(unittest.IsolatedAsyncioTestCase):
         card = self.card()
         self.delivered(card)
         router = self.adapter.interaction_router
-        refs = router.message_references({"message_scene": {"ext": ["msg_idx=OTHER", "ref_msg_idx=REFIDX_CARD=="]}})
+        refs = self.adapter.adapter.message_references(
+            {"message_scene": {"ext": ["msg_idx=OTHER", "ref_msg_idx=REFIDX_CARD=="]}})
+        self.assertEqual(router.message_references({"references": refs}), refs)
         self.assertEqual(refs, [("ref", "REFIDX_CARD==")])
         self.assertIs(self.service.interactions.referenced_credential("private", "ADMIN", refs), card)
         self.assertIsNone(self.service.interactions.referenced_credential("group", "G", refs))
@@ -255,7 +257,7 @@ class TestCredentialReplies(unittest.IsolatedAsyncioTestCase):
                 "private", "ADMIN", refs))
         router = self.adapter.interaction_router
         for value in (None, {}, 1, "ref_msg_idx=wrong"):
-            self.assertEqual(router.message_references({"message_scene": {"ext": value}}), [])
+            self.assertEqual(self.adapter.adapter.message_references({"message_scene": {"ext": value}}), [])
 
     async def test_success_still_respects_pending_approval(self):
         card = self.card()
@@ -294,16 +296,16 @@ class TestCredentialReplies(unittest.IsolatedAsyncioTestCase):
         pusher = self.adapter.outbound_pusher
         pusher.client = self.adapter.client
         self.adapter.client.send_message.return_value = (200, {"id": "SENT", "ext_info": {"ref_idx": "DELIVERED=="}})
-        self.assertTrue(await pusher._send_to_qq("group", "G", "card", [], [], [], credential=card))
+        self.assertTrue(await pusher._deliver("group", "G", "card", [], [], [], credential=card))
         self.assertIs(self.service.interactions.referenced_credential("group", "G", [("ref", "DELIVERED==")]), card)
         self.adapter.client.send_message.side_effect = [(403, {"code": 40034105}), (200, {"ext_info": {"ref_idx": "FALLBACK=="}})]
-        self.assertTrue(await pusher._send_to_qq("group", "G", "card", [], [], [], credential=card))
+        self.assertTrue(await pusher._deliver("group", "G", "fallback-card", [], [], [], credential=card))
         self.assertIs(self.service.interactions.referenced_credential("private", "ADMIN", [("ref", "FALLBACK==")]), card)
         self.assertIsNone(self.service.interactions.referenced_credential("group", "G", [("ref", "FALLBACK==")]))
         self.adapter.client.send_message.side_effect = None
         self.adapter.client.send_message.return_value = (500, {"id": "FAILED"})
         with contextlib.redirect_stdout(io.StringIO()):
-            self.assertFalse(await pusher._send_to_qq("group", "G", "card", [], [], [], credential=card))
+            self.assertFalse(await pusher._deliver("group", "G", "failed-card", [], [], [], credential=card))
         self.assertIsNone(self.service.interactions.referenced_credential("group", "G", [("id", "FAILED")]))
 
     async def test_failed_prompt_delivery_does_not_record_reference(self):

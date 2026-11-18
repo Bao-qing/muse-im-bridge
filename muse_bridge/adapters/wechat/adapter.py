@@ -8,14 +8,13 @@ import os
 import random
 import time
 
-from ...core.commands import HELP_TEXT
 from ...core.message import Attachment, InboundMessage, MessageSource
-from ...gateway.chat import ChatGateway
+from ..base import BaseAdapter
 from ...observability import get_logger, safe_error
 from .client import WeChatClient
 from .gateway import WeChatGateway
 from .media import WeChatMedia
-from .outbound import WeChatOutboundPusher
+from .outbound import WeChatSenderTransport
 from .sender import WeChatSender
 from .state import WeChatState, WeChatStateError, _id, _text
 
@@ -152,8 +151,8 @@ class IntakeRetryable(Exception):
     pass
 
 
-class WeChatAdapter(ChatGateway):
-    def __init__(self, config, muse_service, deduplicator=None, *, state=None, client=None):
+class WeChatAdapter(BaseAdapter):
+    def __init__(self, config, *, state=None, client=None):
         self.state = state or WeChatState(config.state_dir)
         if not self.state.credentials:
             raise WeChatStateError("WeChat is not logged in; run python main.py --wechat-login")
@@ -172,10 +171,12 @@ class WeChatAdapter(ChatGateway):
         self._typing_tasks = {}
         self._typing_sessions = {}
         self._typing_deadlines = {}
-        self._typing_turn_seqs = {}
         self._typing_tickets = {}
         self._typing_retry = {}
-        super().__init__(config, muse_service, deduplicator)
+        self.config = config
+        self.transport = WeChatSenderTransport(config, self.sender)
+        self._typing_inputs = {}
+        self._running = False
         self.gateway = WeChatGateway(self.client, self.state, self.handle_batch, config.polling_timeout_ms)
 
     @property
@@ -188,48 +189,24 @@ class WeChatAdapter(ChatGateway):
     def notification_target(self):
         return self.state.credentials["user_id"]
 
-    def can_recreate_session(self, error):
-        # No recovery POST: even an error response may follow an accepted input.
-        return False
+    @property
+    def is_enabled(self):
+        return bool(self.config.enabled)
 
-    def message_references(self, event):
-        refs = (event or {}).get("references")
-        return list(refs) if isinstance(refs, list) else []
+    async def deliver(self, envelope):
+        return await self.transport.deliver(envelope)
 
-    def create_outbound(self):
-        return WeChatOutboundPusher(
-            self.config, self.client, self.muse_service, self.deduplicator,
-            self.route_manager, self.session_mapper,
-            on_login_required=self.enter_login_mode, state=self.state, sender=self.sender,
-            on_turn_started=self._on_turn_started, on_turn_finished=self._on_turn_finished,
-            on_turns_cleared=self._on_turns_cleared)
+    def activity_started(self, target, token):
+        if self.config.typing_enabled:
+            self._typing_sessions[target] = token
+            self._ensure_typing(target, self._typing_inputs.get(target))
 
-    def render_command_output(self, text):
-        if text != HELP_TEXT:
-            return text
-        # Adapt only the shared help, never arbitrary Muse output or user text.
-        lines = []
-        for line in text.splitlines():
-            if line.startswith("/申请"):
-                continue
-            if line.startswith("/登录 "):
-                line = "/登录 [邮箱] — 登录 Muse"
-            elif line.startswith("/凭证 "):
-                line = "/凭证 [编号] [保存|一次] — 填写凭证，也可引用凭证卡回复"
-            lines.append(line)
-        return "\n".join(lines)
-
-    async def send_reply(self, target_type, target_id, text, msg_id=None):
-        if target_type != "private":
-            raise ValueError("WeChat only supports private chats")
-        purpose = "reply" if msg_id else "notification"
-        logical_id = f"input:{msg_id}:{hashlib.sha256(text.encode()).hexdigest()}" if msg_id else None
-        ok, sent_ids = await self.sender.send_messages(
-            target_id, self.render_command_output(text), purpose=purpose,
-            msg_id=msg_id, logical_id=logical_id)
-        if not ok:
-            raise RuntimeError("WeChat reply was not confirmed; inspect local status")
-        return {"id": sent_ids[-1]} if sent_ids else {}
+    async def activity(self, target, token, state):
+        if state == "started" and self.config.typing_enabled:
+            self._typing_sessions[target] = token
+            self._ensure_typing(target, self._typing_inputs.get(target))
+        elif state == "finished" and self._typing_sessions.get(target) == token:
+            await self._stop_typing(target)
 
     async def download_attachment(self, att, max_bytes):
         entry = self._media_descriptors.get(att.file_info)
@@ -268,21 +245,6 @@ class WeChatAdapter(ChatGateway):
                 for key in media:
                     self._media_descriptors.pop(key, None)
 
-    def _on_turn_started(self, session_id):
-        if session_id:
-            self._typing_turn_seqs[session_id] = self._typing_turn_seqs.get(session_id, 0) + 1
-
-    async def _on_turn_finished(self, session_id):
-        if not session_id:
-            return
-        users = [u for u, sid in list(self._typing_sessions.items()) if sid == session_id]
-        for user in users:
-            await self._stop_typing(user)
-
-    async def _on_turns_cleared(self):
-        for user in list(self._typing_tasks):
-            await self._stop_typing(user)
-
     def _ensure_typing(self, user, msg_id):
         self._typing_deadlines[user] = time.monotonic() + _TYPING_MAX_SECONDS
         existing = self._typing_tasks.get(user)
@@ -300,30 +262,13 @@ class WeChatAdapter(ChatGateway):
 
     async def _with_typing(self, message):
         user = message.source.sender_id
-        before_sid = self.session_mapper.current("private", user)
-        if not self.config.typing_enabled or message.text.startswith("/"):
-            try:
-                return await self.handle_inbound(message)
-            finally:
-                cmd = (message.text or "").strip().split(None, 1)[0].lower() if message.text else ""
-                after_sid = self.session_mapper.current("private", user)
-                if cmd in ("/stop", "/停止") or after_sid != before_sid:
-                    await self._stop_typing(user)
-        before_seqs = dict(self._typing_turn_seqs)
-        self._ensure_typing(user, message.id)
-        keep_typing = False
+        self._typing_inputs[user] = message.id
+        if self.config.typing_enabled and not message.text.startswith("/"):
+            self._ensure_typing(user, message.id)
         try:
-            result = await self.handle_inbound(message)
-            after_sid = self.session_mapper.current("private", user)
-            dispatched = (result == "handled" and after_sid
-                          and self._typing_turn_seqs.get(after_sid, 0) > before_seqs.get(after_sid, 0))
-            if dispatched:
-                self._typing_sessions[user] = after_sid
-                self._ensure_typing(user, message.id)
-                keep_typing = True
-            return result
+            return await self.emit(message)
         finally:
-            if not keep_typing:
+            if user not in self._typing_sessions:
                 await self._stop_typing(user)
 
     async def _typing_ticket(self, user, msg_id):
@@ -390,8 +335,7 @@ class WeChatAdapter(ChatGateway):
         if self._tasks:
             raise RuntimeError("WeChat adapter is already running")
         self._running = True
-        self._tasks = [asyncio.create_task(self.gateway.start()),
-                       asyncio.create_task(self.outbound_pusher.start())]
+        self._tasks = [asyncio.create_task(self.gateway.start())]
         try:
             await asyncio.gather(*self._tasks)
         finally:
@@ -400,7 +344,6 @@ class WeChatAdapter(ChatGateway):
     async def stop(self):
         self._running = False
         await self.gateway.stop()
-        await self.outbound_pusher.stop()
         current = asyncio.current_task()
         tasks = [t for t in self._tasks if t is not current]
         for task in tasks:

@@ -83,7 +83,12 @@ class QQGateway:
                                duration_ms=(time.perf_counter() - started) * 1000)
                 backoff = 1.0  # Reset backoff on successful connect
                 await self._session_loop()
-            except (QQWSClosed, asyncio.CancelledError) as e:
+            except asyncio.CancelledError:
+                # Cancellation is shutdown, not a reconnectable socket failure.
+                # Swallowing it prevents the parent gateway from ever stopping.
+                await self.stop()
+                raise
+            except QQWSClosed as e:
                 _trace_gateway("disconnect", connection_id, error=safe_error(e))
                 if not self._running:
                     break

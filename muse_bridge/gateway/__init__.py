@@ -1,7 +1,10 @@
-"""Platform-neutral layer between Muse and the chat adapters (QQ, OneBot, ...)."""
+"""Unified business gateway. Platform adapters implement ports, not gateway subclasses."""
 
-from .chat import ChatGateway
-from .outbound import OutboundDispatcher
-from .routes import RouteInfo, RouteManager
+__all__ = ["UnifiedGateway"]
 
-__all__ = ["ChatGateway", "OutboundDispatcher", "RouteInfo", "RouteManager"]
+
+def __getattr__(name):
+    if name == "UnifiedGateway":
+        from .runtime import UnifiedGateway
+        return UnifiedGateway
+    raise AttributeError(name)

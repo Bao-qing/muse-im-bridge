@@ -8,8 +8,7 @@ import time
 import unittest
 from unittest import mock
 
-from muse_bridge.adapters.qq.adapter import QQAdapter
-from muse_bridge.adapters.qq.outbound import QQOutboundPusher
+from gateway_helpers import QQAdapter, make_qq_outbound
 from muse_bridge.adapters.qq.route_manager import RouteManager
 from muse_bridge.config.models import AccessRequestsConfig, ConfigLoader, QQConfig
 from muse_bridge.core.session_map import SessionMapper, chat_key
@@ -271,7 +270,9 @@ def _pusher(tmp, **cfg_extra):
     dedup = mock.Mock()
     dedup.is_delivered.return_value = False
     dedup.is_processing.return_value = False
-    p = QQOutboundPusher(config=cfg, client=mock.Mock(), muse_service=mock.Mock(),
+    client = mock.Mock()
+    client.send_message.return_value = (200, {"id": "sent"})
+    p = make_qq_outbound(config=cfg, client=client, muse_service=mock.Mock(),
                          deduplicator=dedup, route_manager=RouteManager(state_file=None),
                          session_mapper=mapper)
     return p, mapper
@@ -359,9 +360,9 @@ class TestOutboundRouting(unittest.IsolatedAsyncioTestCase):
         with tempfile.TemporaryDirectory() as tmp:
             p, m = _pusher(tmp)
             a, _ = m.resolve("private", "USER_A")
-            p._send_to_qq = mock.AsyncMock(return_value=True)
+            p._deliver = mock.AsyncMock(wraps=p._deliver)
             await p._scan_and_dispatch([self._assistant("r1", "提醒")], a)
-            kw = p._send_to_qq.call_args.kwargs
+            kw = p._deliver.call_args.kwargs
             self.assertEqual((kw["target_type"], kw["target_id"]), ("private", "USER_A"))
 
     async def test_proactive_group_with_passive_route(self):
@@ -369,9 +370,9 @@ class TestOutboundRouting(unittest.IsolatedAsyncioTestCase):
             p, m = _pusher(tmp)
             a, _ = m.resolve("group", "GA")
             p.route_manager.register("u1", "group", "GA", "msg_id_123")
-            p._send_to_qq = mock.AsyncMock(return_value=True)
+            p._deliver = mock.AsyncMock(wraps=p._deliver)
             await p._scan_and_dispatch([self._assistant("r1_grp", "群提醒")], a)
-            kw = p._send_to_qq.call_args.kwargs
+            kw = p._deliver.call_args.kwargs
             self.assertEqual((kw["target_type"], kw["target_id"]), ("group", "GA"))
             self.assertEqual(kw["route"].msg_id, "msg_id_123")
 
@@ -382,34 +383,34 @@ class TestOutboundRouting(unittest.IsolatedAsyncioTestCase):
             mapper.bind("group", "REMAINING", "SHARED")
             p.route_manager.register("u-old", "group", "OLD_CHAT", "old-message")
             mapper.bind("group", "OLD_CHAT", "NEW")
-            p._send_to_qq = mock.AsyncMock(return_value=True)
+            p._deliver = mock.AsyncMock(wraps=p._deliver)
             history = [{"role": "user", "message_id": "u-old", "seq": 1},
                        self._assistant("late", "旧会话输出")]
             await p._scan_and_dispatch(history, "SHARED")
-            kw = p._send_to_qq.call_args.kwargs
+            kw = p._deliver.call_args.kwargs
             self.assertEqual(kw["target_id"], "REMAINING")
 
     async def test_unbound_session_never_falls_back_to_admin(self):
         with tempfile.TemporaryDirectory() as tmp:
             p, _ = _pusher(tmp)
-            p._send_to_qq = mock.AsyncMock(return_value=True)
+            p._deliver = mock.AsyncMock(wraps=p._deliver)
             await p._scan_and_dispatch([self._assistant("r3", "提醒")], "UNBOUND")
-            p._send_to_qq.assert_not_called()
+            p._deliver.assert_not_called()
             p.deduplicator.mark_processing.assert_not_called()
 
     async def test_unbound_push_disabled_is_dropped_even_with_admin(self):
         with tempfile.TemporaryDirectory() as tmp:
             p, _ = _pusher(tmp, unbound_push_to_admin=False)
-            p._send_to_qq = mock.AsyncMock(return_value=True)
+            p._deliver = mock.AsyncMock(wraps=p._deliver)
             await p._scan_and_dispatch([self._assistant("r6", "提醒")], "UNBOUND")
-            p._send_to_qq.assert_not_called()
+            p._deliver.assert_not_called()
 
     async def test_unbound_without_admin_is_dropped_with_warning(self):
         with tempfile.TemporaryDirectory() as tmp:
             p, _ = _pusher(tmp, admin_id=[])
-            p._send_to_qq = mock.AsyncMock(return_value=True)
+            p._deliver = mock.AsyncMock(wraps=p._deliver)
             await p._scan_and_dispatch([self._assistant("r5", "提醒")], "UNBOUND")
-            p._send_to_qq.assert_not_called()
+            p._deliver.assert_not_called()
             p.deduplicator.mark_processing.assert_not_called()
 
     async def test_group_rejection_falls_back_to_admin(self):
@@ -433,9 +434,9 @@ class TestOutboundRouting(unittest.IsolatedAsyncioTestCase):
                 {"role": "user", "message_id": "u1", "seq": 9},
                 self._assistant("r4", "答复", "e1"),
             ]
-            p._send_to_qq = mock.AsyncMock(return_value=True)
+            p._deliver = mock.AsyncMock(wraps=p._deliver)
             await p._scan_and_dispatch(hist, a)
-            kw = p._send_to_qq.call_args.kwargs
+            kw = p._deliver.call_args.kwargs
             self.assertEqual(kw["target_id"], "GA")
             self.assertIsNotNone(kw["route"])
 

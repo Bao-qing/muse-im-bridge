@@ -1,137 +1,159 @@
-"""OneBot outbound sender on the platform-neutral dispatcher.
-
-``OutboundDispatcher`` decides what to send and where; this module only
-delivers to NapCat: text chunks as ``text`` segments, images and videos as
-inline ``base64://`` segments, files through ``upload_*_file``. OneBot has
-no passive-reply window, so every item is a plain send. A group that refuses
-the bot (muted, kicked) falls back to the first admin's private chat, like
-QQ's refused active group message.
-"""
-
+"""OneBot platform-only delivery of text, native quotes and media."""
 from __future__ import annotations
 
 import asyncio
-from typing import Callable, List, Optional
+from contextlib import AsyncExitStack
 
+from ...core.delivery import DeliveryEnvelope, DeliveryReceipt, DeliveryResult, DeliveryStatus
 from ...core.message import chunk_text
-from ...gateway.outbound import OutboundDispatcher
-from ...gateway.routes import RouteInfo
-from ...observability import get_logger, safe_error
 from .client import OneBotAPIError, media_segment, text_segment
-
-logger = get_logger(__name__)
 
 GROUP_FALLBACK_PREFIX = "【群消息提醒】\n"
 
 
-class OneBotOutboundPusher(OutboundDispatcher):
-    platform = "onebot"
+class OneBotSender:
+    def __init__(self, config, client):
+        self.config, self.client = config, client
+        self._locks = {}
+        self._uncertain = {}
 
-    async def _send_notice(self, target_id: str, text: str) -> None:
-        await asyncio.to_thread(self.client.send_msg, "private", target_id, [text_segment(text)])
+    async def deliver(self, envelope: DeliveryEnvelope) -> DeliveryResult:
+        if not envelope.delivery_id or envelope.target_type not in {"private", "group"} or not envelope.target_id:
+            return DeliveryResult(DeliveryStatus.REJECTED, reason="Invalid OneBot delivery ID or target")
+        key = (envelope.delivery_id, envelope.target_type, envelope.target_id)
+        targets = {(envelope.target_type, envelope.target_id)}
+        if envelope.target_type == "group" and envelope.fallback_target:
+            targets.add(("private", envelope.fallback_target))
+        async with AsyncExitStack() as stack:
+            for target in sorted(targets):
+                await stack.enter_async_context(self._locks.setdefault(target, asyncio.Lock()))
+            if key in self._uncertain:
+                return self._uncertain[key]
+            self._uncertain[key] = DeliveryResult(DeliveryStatus.UNKNOWN, reason="OneBot delivery interrupted")
+            result = await self._deliver_locked(envelope)
+            if result.status == DeliveryStatus.UNKNOWN:
+                self._uncertain[key] = result
+            else:
+                self._uncertain.pop(key, None)
+            return result
 
-    async def _media_bytes(self, item: dict, cap: int, label: str) -> Optional[bytes]:
-        data = item.get("data")
-        if not data and item.get("url"):
-            try:
-                data = await asyncio.to_thread(self.client.download_bytes, item["url"], cap,
+    @staticmethod
+    def _is_rejection(error):
+        return type(error.retcode) is int and error.retcode != 0
+
+    async def _media_bytes(self, descriptor, cap, label):
+        data = descriptor.get("data")
+        try:
+            if not data and descriptor.get("url"):
+                data = await asyncio.to_thread(self.client.download_bytes, descriptor["url"], cap,
                                                self.config.download_timeout_s)
-            except Exception as e:
-                logger.error('Failed to download %s: %s', label, safe_error(e))
-                return None
-        if not data:
-            return None
+        except ValueError as exc:
+            if "上限" in str(exc) or "exceeded limit" in str(exc):
+                raise ValueError(f"OneBot {label} exceeds upload limit (>{cap} bytes)") from exc
+            raise
+        if not isinstance(data, (bytes, bytearray)) or not data:
+            raise ValueError(f"OneBot {label} preparation failed")
         if len(data) > cap:
-            logger.warning('%s exceeds limit (%s > %s)', label.capitalize(), len(data), cap)
-            return None
+            raise ValueError(f"OneBot {label} exceeds upload limit ({len(data)} > {cap} bytes)")
         return data
 
-    async def _deliver(
-        self,
-        target_type: str,
-        target_id: str,
-        text: str,
-        images: List[dict],
-        files: List[dict],
-        videos: List[dict],
-        route: Optional[RouteInfo] = None,
-        credential=None,
-        delivery=None,
-    ) -> bool:
-        admin_id = self.config.admin_target()
+    async def _deliver_locked(self, envelope):
+        receipts, failures = [], []
+        references = dict(envelope.quote.references) if envelope.quote else {}
+        ref_id = references.get("id")
+        has_native_quote = bool(references)
 
-        async def _send(op: Callable[[str, str], dict], fallback_op: Optional[Callable[[str, str], dict]] = None):
-            """Run ``op`` on the target; a refused group send retries privately to the admin."""
-            try:
-                return target_type, target_id, await asyncio.to_thread(op, target_type, target_id)
-            except OneBotAPIError as e:
-                if (target_type != "group" or not admin_id
-                        or self.quote_for(delivery, target_type, target_id) is not None):
-                    raise
-                logger.debug('Group send refused (%s); falling back to admin %s', safe_error(e), admin_id)
-                return "private", admin_id, await asyncio.to_thread(fallback_op or op, "private", admin_id)
-
-        def segments(t, i, segment):
-            reference = self.quote_for(delivery, t, i)
-            ref_id = next((value for kind, value in reference.references if kind == "id"), None) if reference else None
+        def segments(segment, fallback=False):
             if ref_id:
                 return [{"type": "reply", "data": {"id": ref_id}}, segment]
-            if delivery and delivery.reply_to_id:
-                return [text_segment(self.quote_text(delivery, t, i)), segment]
-            return [segment]
+            prefix = (GROUP_FALLBACK_PREFIX if fallback else "") + envelope.quote_fallback
+            return ([text_segment(prefix)] if prefix else []) + [segment]
 
-        all_delivered = True
-
-        # 1. Text chunks
-        for chunk in chunk_text(text, self.config.chunk_chars, self.config.max_chunks) if text else []:
+        async def send(operation, *, allow_fallback=True):
+            kind, target = envelope.target_type, envelope.target_id
             try:
-                sent_type, sent_id, body = await _send(
-                    lambda t, i, c=chunk: self.client.send_msg(t, i, segments(t, i, text_segment(c))),
-                    lambda t, i, c=chunk: self.client.send_msg(t, i, segments(t, i, text_segment(GROUP_FALLBACK_PREFIX + c))),
-                )
-            except Exception as e:
-                logger.error("Failed sending item to %s:%s: %s", target_type, target_id, safe_error(e))
-                all_delivered = False
-                continue
-            self.remember_delivery(delivery, sent_type, sent_id, body)
-            if credential is not None:
-                # Quoting this message later selects the credential (reply segment id).
-                self.muse_service.interactions.remember_credential_message(
-                    sent_type, sent_id, {"id": str((body or {}).get("message_id") or "")}, credential,
-                    target=self.interaction_target(sent_type, sent_id))
+                body = await asyncio.to_thread(operation, kind, target, False)
+            except OneBotAPIError as exc:
+                # _check also uses this error for malformed responses, which
+                # cannot establish that the non-idempotent operation was refused.
+                if not self._is_rejection(exc):
+                    return DeliveryStatus.UNKNOWN, kind, target, None, "OneBot response outcome unknown"
+                if (allow_fallback and kind == "group" and envelope.fallback_target
+                        and not has_native_quote):
+                    kind, target = "private", envelope.fallback_target
+                    try:
+                        body = await asyncio.to_thread(operation, kind, target, True)
+                    except OneBotAPIError as fallback_exc:
+                        status = (DeliveryStatus.REJECTED if self._is_rejection(fallback_exc)
+                                  else DeliveryStatus.UNKNOWN)
+                        return status, kind, target, None, "OneBot fallback not confirmed"
+                    except Exception:
+                        return DeliveryStatus.UNKNOWN, kind, target, None, "OneBot fallback outcome unknown"
+                else:
+                    return DeliveryStatus.REJECTED, kind, target, None, "OneBot send refused"
+            except Exception:
+                return DeliveryStatus.UNKNOWN, kind, target, None, "OneBot send outcome unknown"
+            return DeliveryStatus.CONFIRMED, kind, target, body, ""
 
-        # 2. Images and videos as inline segments
-        for kind, items, cap in (("image", images, self.config.max_image_bytes),
-                                 ("video", videos, self.config.max_video_upload_bytes)):
-            for item in items:
-                data = await self._media_bytes(item, cap, kind)
-                if data is None:
-                    continue
+        async def message(segment):
+            status, kind, target, body, reason = await send(
+                lambda t, i, fallback: self.client.send_msg(t, i, segments(segment, fallback)))
+            if status == DeliveryStatus.CONFIRMED:
+                receipts.append(DeliveryReceipt.from_body(kind, target, body))
+            else:
+                failures.append(reason)
+            return status
+
+        for chunk in chunk_text(envelope.text, self.config.chunk_chars, self.config.max_chunks) if envelope.text else []:
+            if await message(text_segment(chunk)) == DeliveryStatus.UNKNOWN:
+                return DeliveryResult(DeliveryStatus.UNKNOWN, receipts, failures[-1])
+
+        for label, items, cap in (("image", envelope.images, self.config.max_image_bytes),
+                                  ("video", envelope.videos, self.config.max_video_upload_bytes)):
+            for descriptor in items:
                 try:
-                    sent_type, sent_id, body = await _send(
-                        lambda t, i, d=data, k=kind: self.client.send_msg(t, i, segments(t, i, media_segment(k, d))))
-                    self.remember_delivery(delivery, sent_type, sent_id, body)
-                except Exception as e:
-                    logger.error('Failed to send %s: %s', kind, safe_error(e))
+                    data = await self._media_bytes(descriptor, cap, label)
+                except Exception as exc:
+                    msg = str(exc)
+                    failures.append(msg if "exceeds upload limit" in msg else f"OneBot {label} preparation failed")
+                    continue
+                if await message(media_segment(label, data)) == DeliveryStatus.UNKNOWN:
+                    return DeliveryResult(DeliveryStatus.UNKNOWN, receipts, failures[-1])
 
-        # 3. Files through the upload API
-        for item in files:
-            data = await self._media_bytes(item, self.config.max_file_bytes, "file")
-            if data is None:
-                continue
-            name = item.get("filename") or "file.dat"
+        for descriptor in envelope.files:
             try:
-                sent_type, sent_id, _ = await _send(
-                    lambda t, i, d=data, n=name: self.client.upload_file(t, i, d, n))
-                # OneBot upload_*_file has no chat message ID. A companion gives
-                # the file a native quote context and a replyable reference.
-                if delivery:
-                    body = await asyncio.to_thread(
-                        self.client.send_msg, sent_type, sent_id,
-                        segments(sent_type, sent_id, text_segment("【文件】" + name)))
-                    self.remember_delivery(delivery, sent_type, sent_id, body)
-            except Exception as e:
-                all_delivered = False
-                logger.error('Failed to upload file: %s', safe_error(e))
+                data = await self._media_bytes(descriptor, self.config.max_file_bytes, "file")
+                name = descriptor.get("filename") or "file.dat"
+            except Exception as exc:
+                msg = str(exc)
+                failures.append(msg if "exceeds upload limit" in msg else "OneBot file preparation failed")
+                continue
+            status, kind, target, body, reason = await send(
+                lambda t, i, fallback: self.client.upload_file(t, i, data, name))
+            if status != DeliveryStatus.CONFIRMED:
+                failures.append(reason)
+                if status == DeliveryStatus.UNKNOWN:
+                    return DeliveryResult(DeliveryStatus.UNKNOWN, receipts, reason)
+                continue
+            # upload_*_file is a real delivery even though it has no message ID.
+            receipts.append(DeliveryReceipt.from_body(kind, target, body))
+            # A companion supplies a native, replyable ID. If it fails, do not
+            # repeat the already-confirmed upload or move the companion elsewhere.
+            try:
+                body = await asyncio.to_thread(self.client.send_msg, kind, target,
+                                               segments(text_segment("【文件】" + name), kind != envelope.target_type))
+            except OneBotAPIError as exc:
+                if not self._is_rejection(exc):
+                    return DeliveryResult(DeliveryStatus.UNKNOWN, receipts, "OneBot file companion outcome unknown")
+                failures.append("OneBot file companion refused")
+            except Exception:
+                return DeliveryResult(DeliveryStatus.UNKNOWN, receipts, "OneBot file companion outcome unknown")
+            else:
+                receipts.append(DeliveryReceipt.from_body(kind, target, body))
 
-        return all_delivered
+        if failures:
+            return DeliveryResult(DeliveryStatus.PARTIAL if receipts else DeliveryStatus.REJECTED,
+                                  receipts, "; ".join(dict.fromkeys(failures)))
+        if not receipts:
+            return DeliveryResult(DeliveryStatus.REJECTED, reason="Empty OneBot delivery")
+        return DeliveryResult(DeliveryStatus.CONFIRMED, receipts)

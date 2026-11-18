@@ -355,8 +355,12 @@ def extract_workspace_files(event: dict):
     if path:
         ext = "." + path.rsplit(".", 1)[-1] if "." in path else ""
         name = label + ext if label and ext and not label.endswith(ext) else (label or path.rsplit("/", 1)[-1])
-        return [{"workspace_path": path, "filename": name,
-                 "content_type": mime}]
+        entry = {"workspace_path": path, "filename": name,
+                 "content_type": mime}
+        byte_len = f.get("byte_len")
+        if type(byte_len) is int and byte_len >= 0:
+            entry["byte_len"] = byte_len
+        return [entry]
     fb = payload.get("fallback_text") or ""
     m = re.search(r"!\[([^\]]*)\]\(sandbox://([^)]+)\)", fb)
     if m:
@@ -373,20 +377,38 @@ _VIDEO_EXTS = (".mp4", ".mov", ".webm", ".mkv", ".avi", ".m4v")
 
 
 def extract_workspace_videos(event: dict):
-    """Video descriptors for Muse file-store videos, mirroring
-    extract_workspace_files. The video presentation shape is NOT
-    yet captured from a live turn (no generated-video sample as
-    of 2026-10-26): accept payload.video_path (mirroring the
-    image shape), payload.data.file.path (mirroring the file
-    shape), and a sandbox:// markdown fallback, so whichever
-    shape Muse uses is covered. Returns [{workspace_path,
-    filename, content_type}]; the adapter reads bytes via
-    client.read_file, exactly like workspace images/files."""
+    """Video descriptors for Muse file-store videos.
+
+    Accepts live ``payload.data.videos`` entries (carrying ``path``, ``label``,
+    ``mime`` and ``byte_len``), ``payload.video_path``, ``payload.data.file``,
+    and a ``sandbox://`` markdown fallback.
+    """
     payload = event.get("payload") or {}
     if (event.get("event_name") != "delta.presentation"
             or payload.get("kind") != "video"):
         return []
     data = payload.get("data") or {}
+    raw_videos = data.get("videos")
+    if isinstance(raw_videos, list):
+        found = []
+        for item in raw_videos:
+            if not isinstance(item, dict) or item.get("missing") is True:
+                continue
+            vpath = _strip_sandbox(item.get("path") or "")
+            if not vpath:
+                continue
+            vlabel = item.get("label") or event.get("display_text") or ""
+            vmime = item.get("mime") or "video/mp4"
+            ext = "." + vpath.rsplit(".", 1)[-1] if "." in vpath else ""
+            name = (vlabel + ext if vlabel and ext and not vlabel.endswith(ext)
+                    else (vlabel or vpath.rsplit("/", 1)[-1]))
+            entry = {"workspace_path": vpath, "filename": name, "content_type": vmime}
+            byte_len = item.get("byte_len")
+            if type(byte_len) is int and byte_len >= 0:
+                entry["byte_len"] = byte_len
+            found.append(entry)
+        if found:
+            return found
     f = data.get("file") or {}
     path = _strip_sandbox(
         payload.get("video_path") or f.get("path") or "")
@@ -397,8 +419,12 @@ def extract_workspace_videos(event: dict):
         name = (label + ext if label and ext
                 and not label.endswith(ext)
                 else (label or path.rsplit("/", 1)[-1]))
-        return [{"workspace_path": path, "filename": name,
-                 "content_type": mime or "video/mp4"}]
+        entry = {"workspace_path": path, "filename": name,
+                 "content_type": mime or "video/mp4"}
+        byte_len = f.get("byte_len")
+        if type(byte_len) is int and byte_len >= 0:
+            entry["byte_len"] = byte_len
+        return [entry]
     fb = payload.get("fallback_text") or ""
     m = re.search(r"!\[([^\]]*)\]\(sandbox://([^)]+)\)", fb)
     if m:

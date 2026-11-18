@@ -25,8 +25,12 @@ muse_bridge/
 │   │   ├── token_manager.py  # 自动凭证推导与静默续期（cookies -> vm_id -> mint）
 │   │   └── service.py        # 会话交互、附件处理、工作区文件读写、主动事件流订阅
 │   ├── gateway/              # 与平台无关的 Gateway 层（对接 Muse）
-│   │   ├── chat.py           # ChatGateway：会话映射、斜杠命令、登录/凭证/审批输入、入站流水线
-│   │   ├── outbound.py       # OutboundDispatcher：订阅 Muse 事件、路由、审批卡投递（平台只实现 _deliver）
+│   │   ├── runtime.py        # UnifiedGateway：挂载适配器、账号隔离、串行入站与生命周期
+│   │   ├── inbound.py        # 所有平台共用的命令、交互与 Muse 提交流水线
+│   │   ├── chat.py           # 网关拥有的账号上下文与业务仓库，不是适配器基类
+│   │   ├── muse_events.py    # 单一 Muse 订阅协调器、会话并集、独立投递队列
+│   │   ├── delivery.py       # 因果路由、投递账本、真实平台回执关联
+│   │   ├── outbound.py       # Muse 历史处理、呈现渲染与订阅协议实现
 │   │   ├── interactions.py   # 登录、凭证、审批数字回复的输入路由
 │   │   ├── access.py         # 白名单申请与本地审批
 │   │   └── routes.py         # Muse 消息 ID -> 聊天目的地
@@ -36,13 +40,13 @@ muse_bridge/
 │   │   │   ├── adapter.py    # QQAdapter：解析 QQ 事件、被动/主动回复
 │   │   │   ├── client.py     # QQ OpenAPI 客户端（鉴权、发消息、上传富媒体）
 │   │   │   ├── gateway.py    # QQ WebSocket 事件源（心跳与事件分发）
-│   │   │   ├── outbound.py   # QQOutboundPusher：被动回复、主动配额、富媒体上传
+│   │   │   ├── outbound.py   # QQSender：被动序号、主动配额、富媒体上传与明确投递结果
 │   │   │   └── ws_transport.py # 兼容 QQ 101 Connection:close 的底层 WS 客户端
 │   │   └── onebot/           # OneBot v11 (NapCat) 适配器
-│   │       ├── adapter.py    # OneBotAdapter：消息段解析、群触发策略、自身/重复过滤
+│   │       ├── adapter.py    # OneBotAdapter：消息段解析、可信账号身份、自身消息过滤
 │   │       ├── client.py     # NapCat HTTP API 客户端（Array 消息段、retcode 校验）
 │   │       ├── gateway.py    # NapCat 正向 WebSocket 事件源（退避重连）
-│   │       └── outbound.py   # OneBotOutboundPusher：文本分段、base64 图片/视频、文件上传
+│   │       └── outbound.py   # OneBotSender：文本分段、原生引用、base64 媒体与文件上传
 │   └── engine.py             # BridgeEngine 协调调度引擎
 ├── tools/
 │   └── export_cookies.js     # 网页端 Cookie 一键导出辅助工具
@@ -54,6 +58,12 @@ muse_bridge/
 
 ## 核心设计与特性
 
+- **单一业务网关**：`BridgeEngine` 组装一个 `UnifiedGateway`，QQ、OneBot、微信适配器挂载其上，不再各自继承业务网关或运行 Muse 订阅。Muse 的 token、RPC 和交互协议仍由独立服务负责。
+- **严格入站顺序**：同一平台账号/聊天从附件下载前开始排队；已共享 Muse 会话的聊天还串行提交，避免后发文字和命令超车图片、视频。不使用全局大锁阻塞其他聊天。
+- **显式输入归属**：只有进入交互流程、明确命令或已验证卡片引用才能接收敏感输入。确认属于前台回合的凭证会阻塞该会话的普通提交；后台卡片不会抢占普通聊天。
+- **保守投递语义**：区分确认、明确拒绝、部分完成和结果未知；未知/部分结果保留账本，不整包重放。平台原生引用、业务因果路由和被动回复权限分别处理。
+
+架构边界、状态文件与升级/回退注意事项见 [统一网关说明](docs/unified-gateway.md)。
 
 ---
 

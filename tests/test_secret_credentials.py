@@ -243,7 +243,8 @@ class SecretReplyCase(unittest.IsolatedAsyncioTestCase):
         await pusher._scan_and_dispatch([event], session_id="s1")
         card = self.service.interactions.by_remote("credential", "secret-card")
         self.assertIsNotNone(card)
-        self.assertIn("无需填写账号", self.text())
+        self.assertIn("SSH 私钥（支持多行）", self.text())
+        self.assertNotIn("账号和密码", self.text())
         self.assertNotIn("网页端", self.text())
         self.assertIs(self.service.interactions.referenced_credential("private", "ADMIN", [("id", "DELIVERED_SECRET_CARD")]), card)
 

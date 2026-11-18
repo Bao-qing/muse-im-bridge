@@ -12,7 +12,7 @@ from unittest.mock import MagicMock, patch
 from muse_bridge.config.models import AccessRequestsConfig, ApprovalConfig, MuseConfig, QQConfig
 from muse_bridge.core.interactions import InteractionManager
 from muse_bridge.muse.service import MuseService
-from muse_bridge.adapters.qq.adapter import QQAdapter
+from gateway_helpers import QQAdapter
 
 
 class TestInteractionManager(unittest.TestCase):
@@ -96,7 +96,7 @@ class TestQQInteractions(unittest.IsolatedAsyncioTestCase):
 
         client.connect.side_effect = lambda: connection_threads.append(threading.get_ident())
         with patch.object(self.service, "create_client", side_effect=create_client):
-            with patch("muse_bridge.gateway.chat.CommandHandler.execute", return_value=("done", "s1")):
+            with patch("muse_bridge.gateway.inbound.CommandHandler.execute", return_value=("done", "s1")):
                 await self.send("/sessions")
         self.assertEqual(len(connection_threads), 2)
         self.assertNotIn(event_thread, connection_threads)
@@ -150,7 +150,7 @@ class TestQQInteractions(unittest.IsolatedAsyncioTestCase):
             await self.send("123456")
         self.assertTrue(item.terminal)
         self.assertTrue(self.adapter._in_login_fallback)
-        self.assertIn("重新 /登录", self.text())
+        self.assertIn("重新发送 /登录", self.text())
         self.assertNotIn("无需重复登录", self.text())
         self.service.post_message.assert_not_called()
 

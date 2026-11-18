@@ -679,6 +679,41 @@ class MuseClient:
                 return bytes(data)
         raise MuseError(f"/fs/read did not terminate for {path}")
 
+    def read_file_bounded(self, path, max_bytes, chunk_size=1048576):
+        """Read a workspace file up to ``max_bytes``.
+
+        Returns ``(data, exact_size, exceeded)``. Stops reading further chunks
+        as soon as ``len(data) > max_bytes`` so oversized videos do not stall
+        the subscription sync loop.
+        """
+        import base64 as _base64
+
+        data = bytearray()
+        offset = 0
+        for _ in range(100000):
+            result = self._fs_call("/fs/read", {
+                "path": path, "offset": offset, "len": chunk_size})
+            n = result.get("len") or 0
+            if n:
+                b64 = result.get("data_base64") or ""
+                try:
+                    chunk = _base64.b64decode(b64)
+                except Exception:
+                    raise MuseError(
+                        f"/fs/read returned malformed base64 for {path}")
+                if len(chunk) != n:
+                    raise MuseError(
+                        f"/fs/read length mismatch for {path}: "
+                        f"len={n} decoded={len(chunk)}")
+                data += chunk
+                offset += n
+            eof = n == 0 or bool(result.get("eof"))
+            if max_bytes is not None and len(data) > max_bytes:
+                return None, (len(data) if eof else None), True
+            if eof:
+                return bytes(data), len(data), False
+        raise MuseError(f"/fs/read did not terminate for {path}")
+
     def get_history(self, session_id, limit=40):
         """GET /chat/history. Returns the raw chat_events list."""
         path = (f"/chat/history?limit={limit}&transcript_mode=messages"

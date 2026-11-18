@@ -227,7 +227,7 @@ class TestWeChatParsing(unittest.TestCase):
 
 
 def make_adapter(root, state=None, *, muse=None):
-    from muse_bridge.adapters.wechat.adapter import WeChatAdapter
+    from gateway_helpers import WeChatAdapter
     from muse_bridge.config.models import MuseConfig, WeChatConfig
     from muse_bridge.core.interactions import InteractionManager
     state = state or saved_state(root)
@@ -238,6 +238,7 @@ def make_adapter(root, state=None, *, muse=None):
         muse.interaction_protocol.approval_queue.return_value = []
         muse.interaction_protocol.queue_heads.return_value = []
         muse.interaction_protocol.referenced_approvals.return_value = None
+        muse.interaction_protocol.display_snapshot.side_effect = lambda item: (item.context.get("fingerprint", ""), [])
         muse.token_manager.has_credentials.return_value = True
         muse.post_message.side_effect = lambda sid, text, *a, **kw: "mid-" + text
     client = mock.Mock(send_message=mock.AsyncMock(return_value={"ret": 0}), aclose=mock.AsyncMock())
@@ -400,8 +401,7 @@ class TestWeChatIntake(unittest.IsolatedAsyncioTestCase):
             await adapter.handle_batch([event("chat-1", text="hello", token="TB")])
             await asyncio.sleep(0)
             self.assertIn("owner", adapter._typing_tasks)
-            with mock.patch.object(adapter, "handle_inbound", new=mock.AsyncMock(return_value="handled")):
-                await adapter.handle_batch([event("stop-1", text="/停止", token="TC")])
+            await adapter.handle_batch([event("stop-1", text="/停止", token="TC")])
             self.assertNotIn("owner", adapter._typing_tasks)
             self.assertEqual([c.args[2] for c in client.send_typing.await_args_list], [1, 2])
 
@@ -504,10 +504,10 @@ class TestWeChatIntake(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(muse.post_message.call_count, 2)
             self.assertEqual(muse.post_message.call_args_list[0].args[0], muse.post_message.call_args_list[1].args[0])
             sid = muse.post_message.call_args.args[0]
-            with mock.patch.object(adapter.route_manager, "match_route") as route:
+            with mock.patch.object(adapter.route_manager, "match_route", return_value=None) as route:
                 target = adapter.outbound_pusher.resolve_delivery_target(sid, "wrong-mid", "unknown-execution")
             self.assertEqual(target, ("private", "owner", None, "proactive"))
-            route.assert_not_called()
+            route.assert_called_with("wrong-mid", "unknown-execution")
             self.assertEqual(adapter.state.message_status("owner", "A"), "handled")
 
     async def test_poll_batch_personal_messages_keep_order_and_cursor(self):
@@ -850,21 +850,23 @@ class TestWeChatMuseInteractions(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(client.send_message.call_args.args[0]["context_token"], "TO")
             self.assert_no_access_copy(client)
 
-    async def test_engine_start_uses_notification_target_without_admin_config(self):
-        from muse_bridge.engine import BridgeEngine
+    async def test_gateway_start_uses_notification_target_without_admin_config(self):
+        from muse_bridge.config.models import GatewayConfig
         with tempfile.TemporaryDirectory() as root:
             adapter, service, client = self.make(root)
             adapter.start = mock.AsyncMock()
             service.verify_connection = mock.Mock(return_value=False)
+            service.token_manager.has_credentials.return_value = False
             service.interaction_protocol.run = mock.AsyncMock()
-            engine = object.__new__(BridgeEngine)
-            engine.config = SimpleNamespace(gateway=SimpleNamespace(login_through_adapter="wechat"))
-            engine.adapters = [adapter]
-            engine.muse_service = service
-            with mock.patch.object(engine, "_notify_admin_login", new_callable=mock.AsyncMock) as notice:
-                await engine.start()
-                await asyncio.sleep(0)
-                notice.assert_awaited_once_with(adapter, "owner")
+            adapter.state.remember_message("owner", "startup", "TO")
+            gateway = adapter.runtime
+            gateway.config = GatewayConfig(login_through_adapter="wechat")
+            gateway._run_events = mock.AsyncMock()
+            with mock.patch.object(adapter.ctx, "send_notice", wraps=adapter.ctx.send_notice) as notice:
+                await gateway.start()
+                notice.assert_awaited_once()
+                self.assertEqual(notice.await_args.args[0], "owner")
+                self.assertEqual(client.send_message.call_args.args[0]["to_user_id"], "owner")
 
 
 if __name__ == "__main__":

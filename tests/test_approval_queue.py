@@ -7,9 +7,8 @@ import uuid
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
-from muse_bridge.adapters.onebot.adapter import OneBotAdapter
+from gateway_helpers import OneBotAdapter, QQAdapter
 from muse_bridge.config.models import OneBotConfig
-from muse_bridge.adapters.qq.adapter import QQAdapter
 from muse_bridge.config.models import AccessRequestsConfig, ConfigLoader, MuseConfig, QQConfig
 from muse_bridge.muse.service import MuseService
 
@@ -200,18 +199,19 @@ class QueueCase(unittest.IsolatedAsyncioTestCase):
         self.adapter.config.approvals_in_place = True
         queue = self.load(row("remote-a", 1000))
         pusher = self.adapter.outbound_pusher
-        pusher._send_to_qq = AsyncMock(return_value=True)
+        pusher._deliver = AsyncMock(wraps=pusher._deliver)
         await pusher.notify_interaction(queue[0], "card")
-        self.assertEqual([c.args[:2] for c in pusher._send_to_qq.await_args_list], [("group", "G")])
+        self.assertEqual([c.args[:2] for c in pusher._deliver.await_args_list], [("group", "G")])
 
     async def test_in_place_push_falls_back_to_admin_when_chat_fails(self):
         self.bind_group_only()
         self.adapter.config.approvals_in_place = True
         queue = self.load(row("remote-a", 1000))
         pusher = self.adapter.outbound_pusher
-        pusher._send_to_qq = AsyncMock(side_effect=lambda t, i, *a, **k: t == "private")
+        self.adapter.client.send_message.side_effect = [(403, {"code": 40034105}), (200, {"id": "admin-card"})]
+        pusher._deliver = AsyncMock(wraps=pusher._deliver)
         self.assertTrue(await pusher.notify_interaction(queue[0], "card"))
-        self.assertEqual([c.args[:2] for c in pusher._send_to_qq.await_args_list],
+        self.assertEqual([c.args[:2] for c in self.adapter.client.send_message.call_args_list],
                          [("group", "G"), ("private", "ADMIN")])
 
     async def test_copies_admin_when_in_place_disabled(self):
@@ -219,9 +219,9 @@ class QueueCase(unittest.IsolatedAsyncioTestCase):
         self.adapter.config.approvals_in_place = False
         queue = self.load(row("remote-a", 1000))
         pusher = self.adapter.outbound_pusher
-        pusher._send_to_qq = AsyncMock(return_value=True)
+        pusher._deliver = AsyncMock(wraps=pusher._deliver)
         await pusher.notify_interaction(queue[0], "card")
-        self.assertEqual([c.args[:2] for c in pusher._send_to_qq.await_args_list],
+        self.assertEqual([c.args[:2] for c in pusher._deliver.await_args_list],
                          [("group", "G"), ("private", "ADMIN")])
 
     async def test_push_skips_chat_that_already_shows_current_card(self):
@@ -229,15 +229,15 @@ class QueueCase(unittest.IsolatedAsyncioTestCase):
         await self.send("聊天")
         await self.send("1")  # Advances to remote-b in this chat.
         pusher = self.adapter.outbound_pusher
-        pusher._send_to_qq = AsyncMock(return_value=True)
+        pusher._deliver = AsyncMock(wraps=pusher._deliver)
         self.assertTrue(await pusher.notify_interaction(queue[1], "card"))
-        pusher._send_to_qq.assert_not_awaited()
+        pusher._deliver.assert_not_awaited()
 
     async def quoted(self, text, message_id="card-1", *, owner=None, session="s1", admin=True):
         owner = owner or ("private", "ADMIN", "ADMIN")
         return await self.adapter.interaction_router.handle(
             owner, text, uuid.uuid4().hex, admin, session,
-            event={"message_reference": {"message_id": message_id}})
+            event={"references": [("id", message_id)]})
 
     async def show_quoted_card(self, item):
         self.adapter.client.send_message.return_value = (200, {"id": "card-1"})
@@ -263,7 +263,7 @@ class QueueCase(unittest.IsolatedAsyncioTestCase):
         await self.show_quoted_card(item)
         self.remote.rows["remote-a"]["status"] = "timed_out"
         await self.quoted("1")
-        self.assertIn("其他客户端结束", self.texts()[-1])
+        self.assertIn("其他设备上处理完", self.texts()[-1])
         self.assertIn("审批已全部完成", self.texts()[-1])
         self.assertEqual(self.remote.posts, [])
 
@@ -290,7 +290,7 @@ class QueueCase(unittest.IsolatedAsyncioTestCase):
         await self.show_quoted_card(item)
         self.protocol.request.side_effect = TimeoutError("refresh failed")
         await self.quoted("1")
-        self.assertIn("结果暂未确认", self.texts()[-1])
+        self.assertIn("结果未能确认", self.texts()[-1])
         self.assertEqual(self.remote.posts, [])
         self.assertFalse(item.terminal)
 
@@ -390,12 +390,12 @@ class QueueCase(unittest.IsolatedAsyncioTestCase):
                         access_requests=AccessRequestsConfig(state_file=str(root / "access.json")),
                         session_map_file=str(root / "map.json"), delivered_file=str(root / "delivered.jsonl"),
                         push_state_file=str(root / "push.json"))
-                    adapter = OneBotAdapter(cfg, self.service)
+                    adapter = OneBotAdapter(cfg, self.service, self_id="99")
                     adapter.client = MagicMock()
                     adapter.client.send_msg.return_value = {"message_id": 100}
                     adapter.outbound_pusher.client = adapter.client
                     adapter.self_id = "99"
-                    adapter.outbound_pusher.bind_reference_account("99")
+                    adapter.host.identity_changed(adapter.adapter)
                     item, = self.load(row(f"{trigger}-{mode}", 1))
                     await adapter.notify_interaction(item, self.protocol.format_approval(item))
                     text = {"number": "1", "batch": "1 all", "command": f"/审批 {item.id} 1"}[mode]
@@ -416,7 +416,7 @@ class QueueCase(unittest.IsolatedAsyncioTestCase):
                 self.protocol.request.side_effect = TimeoutError("refresh failed")
                 text = f"/审批 {item.id} 1" if mode == "command" else "1 all"
                 await self.send(text)
-                self.assertIn("未确认", self.texts()[-1])
+                self.assertIn("未能确认" if mode == "command" else "暂未确认", self.texts()[-1])
                 self.assertEqual(self.remote.posts, [])
                 self.assertFalse(item.terminal)
                 self.service.interactions.finish(item, "cancelled")
@@ -429,12 +429,12 @@ class QueueCase(unittest.IsolatedAsyncioTestCase):
                            session_map_file=str(root / "ob-map.json"),
                            delivered_file=str(root / "ob-delivered.jsonl"),
                            push_state_file=str(root / "ob-push.json"))
-        adapter = OneBotAdapter(cfg, self.service)
+        adapter = OneBotAdapter(cfg, self.service, self_id="99")
         adapter.client = MagicMock()
         adapter.client.send_msg.return_value = {"message_id": 100}
         adapter.outbound_pusher.client = adapter.client
         adapter.self_id = "99"
-        adapter.outbound_pusher.bind_reference_account("99")
+        adapter.host.identity_changed(adapter.adapter)
         item, = self.load(row("remote-a", 1))
         await adapter.notify_interaction(item, self.protocol.format_approval(item))
         event = {"post_type": "message", "message_type": "group", "group_id": 7,

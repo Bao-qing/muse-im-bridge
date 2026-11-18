@@ -10,7 +10,8 @@ from pathlib import Path
 from unittest import mock
 
 from muse_bridge.adapters.onebot import adapter as ob_adapter
-from muse_bridge.adapters.onebot.adapter import OneBotAdapter, parse_segments
+from muse_bridge.adapters.onebot.adapter import parse_segments
+from gateway_helpers import OneBotAdapter
 from muse_bridge.adapters.onebot.client import OneBotAPIError, OneBotClient
 from muse_bridge.adapters.onebot.gateway import OneBotGateway, connect_url
 from muse_bridge.config.models import AccessRequestsConfig, ConfigLoader, OneBotConfig
@@ -191,7 +192,7 @@ def _make_adapter(tmp, **extra):
     muse.post_message = mock.Mock(side_effect=lambda sid, text, atts, thr: f"mid-{sid}-{text}")
     adapter = OneBotAdapter(config=cfg, muse_service=muse)
     adapter.self_id = SELF
-    adapter.outbound_pusher.bind_reference_account(SELF)
+    adapter.host.identity_changed(adapter.adapter)
     adapter.route_manager = RouteManager(state_file=None)
     adapter.outbound_pusher.route_manager = adapter.route_manager
     adapter.client = mock.Mock()
@@ -228,7 +229,7 @@ class TestOneBotInbound(unittest.IsolatedAsyncioTestCase):
             await adapter.handle_event(_private("A1", "/登录", 960))
             self.assertIn("请输入登录邮箱", _sent_texts(adapter)[-1])
             await adapter.handle_event(_private("A1", "/取消", 961))
-            self.assertIn("输入流程已结束", _sent_texts(adapter)[-1])
+            self.assertIn("已结束填写", _sent_texts(adapter)[-1])
 
     async def test_group_sender_info_default_and_disabled(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -307,7 +308,7 @@ class TestOneBotInbound(unittest.IsolatedAsyncioTestCase):
             adapter, muse = _make_adapter(tmp)
             muse.post_message.side_effect = RuntimeError("boom")
             await adapter.handle_event(_private(100, "hello", 1))
-            self.assertIn("结果未确认", _sent_texts(adapter)[-1])
+            self.assertIn("消息可能已发送", _sent_texts(adapter)[-1])
             self.assertNotIn("boom", _sent_texts(adapter)[-1])
             muse.post_message.assert_called_once()
 
@@ -387,7 +388,8 @@ class TestOneBotInbound(unittest.IsolatedAsyncioTestCase):
                         muse.post_message.reset_mock()
                         event = _group("G1", "A1", text, mid)
                         event["message"].insert(0, {"type": "reply", "data": {"id": "ordinary"}})
-                        self.assertFalse(adapter.interaction_router.is_credential_input(owner, text, event))
+                        self.assertFalse(adapter.interaction_router.is_credential_input(
+                            owner, text, {"references": parse_segments(event["message"], SELF)[3]}))
                         await adapter.handle_event(event)
                         muse.capture_credential.assert_not_called()
                         muse.post_message.assert_called_once()
@@ -412,8 +414,9 @@ class TestOneBotInbound(unittest.IsolatedAsyncioTestCase):
             item = muse.interactions.add("credential", session_id="s1")
             body = await adapter.send_reply("private", "A1", "请输入密码。")
             muse.interactions.remember_credential_message("private", "A1", body, item)
-            refs = adapter.interaction_router.message_references(
-                {"message": [{"type": "reply", "data": {"id": "777"}}, {"type": "text", "data": {"text": "pw"}}]})
+            refs = parse_segments(
+                [{"type": "reply", "data": {"id": "777"}}, {"type": "text", "data": {"text": "pw"}}], SELF)[3]
+            self.assertEqual(adapter.interaction_router.message_references({"references": refs}), refs)
             self.assertIs(muse.interactions.referenced_credential("private", "A1", refs), item)
 
 
@@ -426,7 +429,8 @@ class TestOneBotOutbound(unittest.IsolatedAsyncioTestCase):
                                        [{"data": b"doc", "filename": "d.txt"}], [])
             self.assertTrue(ok)
             segs = [c.args[2][0] for c in adapter.client.send_msg.call_args_list]
-            self.assertEqual([s["type"] for s in segs], ["text", "text", "image"])
+            self.assertEqual([s["type"] for s in segs], ["text", "text", "image", "text"])
+            self.assertIn("d.txt", segs[-1]["data"]["text"])
             self.assertEqual(segs[2]["data"]["file"], "base64://" + base64.b64encode(b"img").decode())
             adapter.client.upload_file.assert_called_once_with("group", "G1", b"doc", "d.txt")
 
@@ -438,7 +442,8 @@ class TestOneBotOutbound(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(ok)
             last = adapter.client.send_msg.call_args
             self.assertEqual(last.args[:2], ("private", "A1"))
-            self.assertEqual(last.args[2][0]["data"]["text"], "【群消息提醒】\nhello")
+            self.assertEqual(''.join(seg["data"]["text"] for seg in last.args[2]
+                                     if seg["type"] == "text"), "【群消息提醒】\nhello")
 
     async def test_transport_error_is_not_retried_elsewhere(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -467,43 +472,59 @@ if __name__ == "__main__":
     unittest.main()
 
 
-class TestEngineRouting(unittest.IsolatedAsyncioTestCase):
-    def _engine(self, qq_owns, onebot_owns, login_through="onebot"):
-        from muse_bridge.engine import BridgeEngine
-        from muse_bridge.adapters.qq.adapter import QQAdapter
-        engine = BridgeEngine.__new__(BridgeEngine)
-        engine.config = mock.MagicMock()
-        engine.config.gateway.login_through_adapter = login_through
-        qq = mock.MagicMock(spec=QQAdapter)
-        ob = mock.MagicMock(spec=OneBotAdapter)
-        for adapter, name, owns in ((qq, "qq", qq_owns), (ob, "onebot", onebot_owns)):
-            adapter.name = name
-            adapter.is_enabled = True
-            adapter.owns_session.return_value = owns
-            adapter.notify_interaction = mock.AsyncMock(return_value=True)
-            adapter.send_notice = mock.AsyncMock()
-        engine.adapters = [qq, ob]
-        return engine, qq, ob
+class TestGatewayRouting(unittest.IsolatedAsyncioTestCase):
+    def _gateway(self, qq_owns, onebot_owns, login_through="onebot"):
+        from gateway_helpers import QQAdapter
+        from muse_bridge.config.models import GatewayConfig, QQConfig
+        from muse_bridge.gateway.runtime import UnifiedGateway
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        service = mock.Mock()
+        gateway = UnifiedGateway(service, GatewayConfig(login_through_adapter=login_through))
+        mounted = []
+        for factory, cfg_cls, name, owns in ((QQAdapter, QQConfig, "qq", qq_owns),
+                                             (OneBotAdapter, OneBotConfig, "onebot", onebot_owns)):
+            auth = ({"app_id": "test-app", "app_secret": "test-secret"} if name == "qq"
+                    else {"base_url": "http://onebot.invalid"})
+            config = cfg_cls(enabled=True, admin_id=["A1"],
+                routes_file=str(Path(tmp.name) / (name + "-routes.json")),
+                session_map_file=str(Path(tmp.name) / (name + "-map.json")),
+                delivered_file=str(Path(tmp.name) / (name + "-delivered.jsonl")),
+                push_state_file=str(Path(tmp.name) / (name + "-push.json")),
+                access_requests=AccessRequestsConfig(state_file=str(Path(tmp.name) / (name + "-access.json"))), **auth)
+            adapter = factory(config, service, gateway=gateway)
+            adapter.client.send_message.return_value = (200, {"id": "notice"})
+            adapter.client.send_msg.return_value = {"message_id": 42}
+            if owns:
+                adapter.session_mapper.bind("private", "A1", "S")
+            adapter.ctx.notify_interaction = mock.AsyncMock(wraps=adapter.ctx.notify_interaction)
+            adapter.ctx.send_notice = mock.AsyncMock(wraps=adapter.ctx.send_notice)
+            mounted.append(adapter)
+        self.addCleanup(service.interactions.close)
+        return gateway, *mounted
 
     async def test_card_goes_only_to_the_adapter_owning_the_session(self):
-        engine, qq, ob = self._engine(qq_owns=False, onebot_owns=True)
-        item = mock.Mock(session_id="S")
-        self.assertTrue(await engine._notify_interaction(item, "card"))
+        gateway, qq, ob = self._gateway(qq_owns=False, onebot_owns=True)
+        item = gateway.muse_service.interactions.add("credential", session_id="S")
+        self.assertTrue(await gateway.notify_interaction(item, "card"))
         ob.notify_interaction.assert_awaited_once_with(item, "card")
         qq.notify_interaction.assert_not_awaited()
 
-    async def test_unowned_session_goes_to_every_adapter(self):
-        engine, qq, ob = self._engine(qq_owns=False, onebot_owns=False)
-        await engine._notify_interaction(mock.Mock(session_id="MAIN"), "card")
-        qq.notify_interaction.assert_awaited_once()
-        ob.notify_interaction.assert_awaited_once()
+    async def test_unowned_session_is_not_broadcast(self):
+        gateway, qq, ob = self._gateway(qq_owns=False, onebot_owns=False)
+        item = gateway.muse_service.interactions.add("credential", session_id="MAIN")
+        self.assertFalse(await gateway.notify_interaction(item, "card"))
+        qq.notify_interaction.assert_not_awaited()
+        ob.notify_interaction.assert_not_awaited()
+        qq.client.send_message.assert_not_called()
+        ob.client.send_msg.assert_not_called()
 
     async def test_login_notice_uses_the_configured_adapter(self):
-        engine, qq, ob = self._engine(False, False, login_through="onebot")
-        self.assertIs(engine._login_adapter(), ob)
-        with mock.patch("muse_bridge.engine.asyncio.sleep", new=mock.AsyncMock()):
-            await engine._notify_admin_login(ob, "A1")
+        gateway, qq, ob = self._gateway(False, False, login_through="onebot")
+        await gateway.login_required()
         ob.send_notice.assert_awaited_once()
         self.assertEqual(ob.send_notice.await_args.args[0], "A1")
-        ob.enter_login_mode.assert_called_once_with("A1")
+        self.assertTrue(ob.ctx._in_login_fallback)
+        self.assertTrue(qq.ctx._in_login_fallback)
+        ob.client.send_msg.assert_called_once()
         qq.send_notice.assert_not_awaited()

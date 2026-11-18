@@ -8,7 +8,8 @@ import time
 import unittest
 from unittest import mock
 
-from muse_bridge.adapters.qq.outbound import QQOutboundPusher
+from gateway_helpers import make_qq_outbound
+from muse_bridge.gateway.delivery import GatewayOutbound
 from muse_bridge.adapters.qq.route_manager import RouteManager
 from muse_bridge.config.models import QQConfig
 from muse_bridge.core.session_map import SessionMapper
@@ -167,7 +168,7 @@ class TestOutboundEventDriven(unittest.IsolatedAsyncioTestCase):
         client = mock.Mock()
         client.send_message.return_value = (200, b"ok")
 
-        pusher = QQOutboundPusher(
+        pusher = make_qq_outbound(
             config=cfg,
             client=client,
             muse_service=muse_service,
@@ -212,21 +213,21 @@ class TestOutboundEventDriven(unittest.IsolatedAsyncioTestCase):
     def test_classify_push_event(self):
         # Sync triggers
         ev_done = {"event": "delta.message_done", "payload": {"session_id": "s1", "status": "completed"}}
-        self.assertEqual(QQOutboundPusher._classify_push_event(ev_done), ("s1", "sync"))
+        self.assertEqual(GatewayOutbound._classify_push_event(ev_done), ("s1", "sync"))
 
         ev_pres = {"event": "delta.presentation", "payload": {"session_id": "s1", "kind": "image"}}
-        self.assertEqual(QQOutboundPusher._classify_push_event(ev_pres), ("s1", "sync"))
+        self.assertEqual(GatewayOutbound._classify_push_event(ev_pres), ("s1", "sync"))
 
         ev_task = {"event": "task.status", "payload": {"session_id": "s1", "status": "completed"}}
-        self.assertEqual(QQOutboundPusher._classify_push_event(ev_task), ("s1", "sync"))
+        self.assertEqual(GatewayOutbound._classify_push_event(ev_task), ("s1", "sync"))
 
         # Stream triggers (keep hot, but don't force immediate sync)
         ev_append = {"event": "delta.text_append", "payload": {"session_id": "s1", "text": "a"}}
-        self.assertEqual(QQOutboundPusher._classify_push_event(ev_append), ("s1", "stream"))
+        self.assertEqual(GatewayOutbound._classify_push_event(ev_append), ("s1", "stream"))
 
         # Ignored
         ev_interrupted = {"event": "delta.message_done", "payload": {"session_id": "s1", "status": "interrupted"}}
-        self.assertEqual(QQOutboundPusher._classify_push_event(ev_interrupted), ("s1", None))
+        self.assertEqual(GatewayOutbound._classify_push_event(ev_interrupted), ("s1", None))
 
     async def test_lazy_session_404_handled_gracefully(self):
         pusher, mapper, muse_service, qq_client = self._make_pusher()
@@ -344,7 +345,7 @@ class TestOutboundEventDriven(unittest.IsolatedAsyncioTestCase):
         service.create_client.side_effect = [first, second]
         pusher._notify_login_required = mock.AsyncMock()
         pusher._running = True
-        with mock.patch("muse_bridge.adapters.qq.outbound.asyncio.sleep", new=mock.AsyncMock()):
+        with mock.patch("muse_bridge.gateway.outbound.asyncio.sleep", new=mock.AsyncMock()):
             await asyncio.wait_for(pusher._run_loop(), 3)
         service.token_manager.invalidate_mint.assert_called_once_with(first.token, first.notary_token)
         service.token_manager.invalidate.assert_not_called()
@@ -368,7 +369,7 @@ class TestOutboundEventDriven(unittest.IsolatedAsyncioTestCase):
             "state": {"data": {"selectedText": "帮我启动机器测通"}},
         }
         res_opt = render_widget_to_text(widget_option)
-        self.assertIn("【请选择】：", res_opt)
+        self.assertIn("【请选择】", res_opt)
         self.assertIn("1. 帮我启动机器测通 (已选)", res_opt)
         self.assertIn("2. 先别启动，保持暂停", res_opt)
 
@@ -380,7 +381,7 @@ class TestOutboundEventDriven(unittest.IsolatedAsyncioTestCase):
         }
         rendered_text = render_assistant_event(ev_msg)
         self.assertIn("保清，请做选择：", rendered_text)
-        self.assertIn("【请选择】：", rendered_text)
+        self.assertIn("【请选择】", rendered_text)
 
         # 2. Browser task presentation card
         ev_browser = {
@@ -472,7 +473,10 @@ class TestOutboundEventDriven(unittest.IsolatedAsyncioTestCase):
     async def test_reconnect_stops_after_max_retries(self):
         from muse_bridge.muse.client.errors import HandshakeError
 
-        pusher, _, service, _ = self._make_pusher(bind_sid="GLOBAL", reconnect_max_retries=2)
+        outbound, _, service, _ = self._make_pusher(bind_sid="GLOBAL", reconnect_max_retries=2)
+        from muse_bridge.gateway.muse_events import MuseEventPump
+        pusher = MuseEventPump(outbound.context.gateway)
+        outbound.context.gateway.events = pusher
         client = mock.MagicMock()
         client.connect.side_effect = HandshakeError("gateway handshake failed", status=502)
         service.create_client.return_value = client
@@ -493,7 +497,10 @@ class TestOutboundEventDriven(unittest.IsolatedAsyncioTestCase):
     async def test_reconnect_counter_resets_after_healthy_cycle(self):
         from muse_bridge.muse.client.errors import HandshakeError
 
-        pusher, _, service, _ = self._make_pusher(bind_sid="GLOBAL", reconnect_max_retries=1)
+        outbound, _, service, _ = self._make_pusher(bind_sid="GLOBAL", reconnect_max_retries=1)
+        from muse_bridge.gateway.muse_events import MuseEventPump
+        pusher = MuseEventPump(outbound.context.gateway)
+        outbound.context.gateway.events = pusher
         failing = mock.MagicMock()
         failing.connect.side_effect = HandshakeError("gateway handshake failed", status=502)
 

@@ -1,13 +1,8 @@
-"""OneBot v11 (NapCat) adapter on the chat gateway.
+"""OneBot v11 (NapCat) platform driver mounted on UnifiedGateway.
 
-Coordinates:
-- OneBotGateway (forward WebSocket events) -> ``InboundMessage`` ->
-  ``ChatGateway.handle_inbound``: the same sessions, commands, approvals and
-  whitelist as QQ.
-- OneBotOutboundPusher (Muse event stream -> send_*_msg / upload_*_file).
-- OneBotClient (HTTP API, Array segments, retcode checked).
-
-Ids are QQ numbers; they are handled as strings everywhere above this module.
+Owns forward WebSocket intake, actual account identity, segment/media parsing
+and OneBotSender. Business policy, sessions and Muse subscriptions live in the
+host. QQ numeric IDs are normalized as strings above this boundary.
 """
 
 from __future__ import annotations
@@ -19,16 +14,13 @@ import re
 from typing import Dict, List, Optional, Tuple
 
 from ...config.models import OneBotConfig
-from ...core.deduplicator import MessageDeduplicator
+from ...core.identity import valid_id
 from ...core.message import Attachment, InboundMessage, MessageSource
-from ...gateway.access import valid_id
-from ...gateway.chat import ChatGateway
-from ...muse.service import MuseService
+from ..base import BaseAdapter
 from ...observability import get_logger, safe_error
-from .client import OneBotClient, text_segment
+from .client import OneBotClient
 from .gateway import OneBotGateway
-from .outbound import OneBotOutboundPusher
-from .qzone import QzoneFeedWorker
+from .outbound import OneBotSender
 
 logger = get_logger(__name__)
 
@@ -96,16 +88,12 @@ def parse_segments(message, self_id: Optional[str], *, strip_text: bool = True) 
     return text.strip() if strip_text else text, mentioned, attachments, references
 
 
-class OneBotAdapter(ChatGateway):
-    def __init__(
-        self,
-        config: OneBotConfig,
-        muse_service: MuseService,
-        deduplicator: Optional[MessageDeduplicator] = None,
-    ):
+class OneBotAdapter(BaseAdapter):
+    def __init__(self, config: OneBotConfig, *, client=None):
         self.config = config
-        self.client = OneBotClient(base_url=config.base_url, access_token=config.access_token)
-        super().__init__(config, muse_service, deduplicator)
+        self.client = client or OneBotClient(base_url=config.base_url, access_token=config.access_token)
+        self.sender = OneBotSender(config, self.client)
+        self._running = False
         self.gateway = OneBotGateway(
             ws_url=config.ws_url or _default_ws_url(config.base_url),
             access_token=config.access_token,
@@ -114,23 +102,11 @@ class OneBotAdapter(ChatGateway):
         self.self_id: Optional[str] = None
         # file_id -> group id of a received group file (get_group_file_url needs it).
         self._file_groups: Dict[str, str] = {}
-        self.qzone_feed = QzoneFeedWorker(config.qzone_feed, self.client, muse_service,
-                                           max_image_bytes=config.max_image_bytes)
-        self._qzone_task: Optional[asyncio.Task] = None
+    def account_identity(self):
+        return self.self_id or ""
 
-    def create_outbound(self) -> OneBotOutboundPusher:
-        return OneBotOutboundPusher(
-            config=self.config,
-            client=self.client,
-            muse_service=self.muse_service,
-            deduplicator=self.deduplicator,
-            route_manager=self.route_manager,
-            session_mapper=self.session_mapper,
-            on_login_required=self.enter_login_mode,
-        )
-
-    def access_identity(self) -> str:
-        return "onebot"
+    async def deliver(self, envelope):
+        return await self.sender.deliver(envelope)
 
     @property
     def name(self) -> str:
@@ -140,45 +116,25 @@ class OneBotAdapter(ChatGateway):
     def is_enabled(self) -> bool:
         return bool(self.config.enabled and self.config.base_url)
 
-    async def start(self) -> None:
-        if not self.is_enabled:
-            return
-        self._running = True
-        logger.info('Starting OneBot Adapter (%s)...', self.config.base_url)
+    async def prepare(self):
         try:
             info = await asyncio.to_thread(self.client.get_login_info)
             if info.get("user_id"):
                 self.self_id = str(info["user_id"])
-                self.outbound_pusher.bind_reference_account(self.self_id)
-                logger.info('OneBot account %s (%s)', self.self_id, info.get("nickname") or "")
-        except Exception as e:
-            # Events carry self_id too; the WS lifecycle event fills it in.
-            logger.warning('OneBot get_login_info unavailable: %s', safe_error(e))
-        tasks = [
-            asyncio.create_task(self.gateway.start()),
-            asyncio.create_task(self.outbound_pusher.start()),
-        ]
-        if self.config.qzone_feed.enabled:
-            self._qzone_task = asyncio.create_task(self.qzone_feed.run())
-            tasks.append(self._qzone_task)
-        await asyncio.gather(*tasks, return_exceptions=True)
+                if self.host:
+                    self.host.identity_changed(self)
+        except Exception as exc:
+            logger.warning("OneBot identity pending: %s", safe_error(exc))
 
-    async def stop(self) -> None:
+    async def start(self):
+        if not self.is_enabled:
+            return
+        self._running = True
+        await self.gateway.start()
+
+    async def stop(self):
         self._running = False
-        await self.qzone_feed.stop()
         await self.gateway.stop()
-        await self.outbound_pusher.stop()
-        if self._qzone_task is not None:
-            await self._qzone_task
-            self._qzone_task = None
-
-    # ------------------------------------------------------------------
-    # Sending
-    # ------------------------------------------------------------------
-    async def send_reply(self, target_type, target_id, text, msg_id=None) -> dict:
-        data = await asyncio.to_thread(self.client.send_msg, target_type, target_id, [text_segment(text)])
-        # Same shape as QQ's sent body: a later reply segment quotes this id.
-        return {"id": str(data.get("message_id") or "")}
 
     async def download_attachment(self, att: Attachment, max_bytes: int) -> bytes:
         url = att.url
@@ -203,14 +159,6 @@ class OneBotAdapter(ChatGateway):
     # ------------------------------------------------------------------
     # Parsing
     # ------------------------------------------------------------------
-    def triggers(self, kind: str, text: str, mentioned: bool) -> bool:
-        """Whether a message reaches the gateway (group_trigger applies to groups only)."""
-        if kind != "group" or self.config.group_trigger == "all":
-            return True
-        if text.startswith("/"):
-            return True
-        return self.config.group_trigger == "at" and mentioned
-
     async def handle_event(self, event: dict) -> None:
         if event.get("post_type") != "message":
             return
@@ -218,14 +166,11 @@ class OneBotAdapter(ChatGateway):
         if kind not in ("private", "group"):
             return
         msg_id = str(event.get("message_id") or "")
-        if msg_id and self.deduplicator.is_duplicate_gateway_msg(msg_id):
-            logger.debug('Duplicate OneBot message ignored: %s', msg_id)
-            return
-
         self_id = str(event["self_id"]) if event.get("self_id") else self.self_id or self.gateway.self_id
         if self_id:
             self.self_id = self_id
-            self.outbound_pusher.bind_reference_account(self_id)
+            if self.host:
+                self.host.identity_changed(self)
         user = str(event.get("user_id") or "")
         if self_id and user == self_id:
             return
@@ -234,13 +179,6 @@ class OneBotAdapter(ChatGateway):
             return
 
         text, mentioned, attachments, references = parse_segments(event.get("message"), self_id, strip_text=False)
-        credential_input = self.interaction_router.is_credential_input((kind, target, user), text, event)
-        if not credential_input:
-            text = text.strip()
-        session_id = self.session_mapper.current(kind, target) or ""
-        known_quote = self.outbound_pusher.reference_store.resolve_channel(session_id, kind, target, references)
-        if not credential_input and not known_quote and not self.triggers(kind, text, mentioned):
-            return
         for att in attachments:
             if att.file_info and kind == "group":
                 self._file_groups[att.file_info] = target
@@ -248,13 +186,14 @@ class OneBotAdapter(ChatGateway):
                     self._file_groups.pop(next(iter(self._file_groups)))
         sender = event.get("sender")
         sender = sender if isinstance(sender, dict) else {}
-        await self.handle_inbound(InboundMessage(
+        await self.emit(InboundMessage(
             id=msg_id,
             source=MessageSource(platform="onebot", chat_type=kind, target_id=target,
-                                 sender_id=user, raw_event=event,
+                                 sender_id=user,
                                  sender_name=sender.get("nickname") or "",
                                  sender_card=sender.get("card") or ""),
             text=text,
             attachments=attachments,
             references=references,
+            mentioned=mentioned,
         ))
