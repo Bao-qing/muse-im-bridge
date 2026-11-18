@@ -13,8 +13,8 @@ import httpx
 from muse_bridge.adapters.telegram import TelegramAdapter
 from muse_bridge.adapters.telegram.client import TelegramAPIError
 from muse_bridge.config.models import AccessRequestsConfig, ConfigLoader, MuseConfig, TelegramConfig
-from muse_bridge.core.delivery import DeliveryEnvelope, DeliveryStatus, NativeQuote
-from muse_bridge.core.message import Attachment
+from muse_bridge.core.delivery import DeliveryEnvelope, DeliveryStatus, NativeQuote, ReactionEnvelope
+from muse_bridge.core.message import Attachment, InboundReaction, MessageSource
 from muse_bridge.gateway.runtime import UnifiedGateway
 from muse_bridge.muse.service import MuseService
 
@@ -43,6 +43,17 @@ def update(uid, mid, text=None, *, chat_id=USER_ID, sender=USER_ID, **fields):
     if text is not None:
         message["text"] = text
     return {"update_id": uid, "message": message}
+
+
+def reaction_update(uid, old, new, *, chat_id=USER_ID, **fields):
+    return {"update_id": uid, "message_reaction": {
+        "message_id": 42, "date": 1234,
+        "chat": {"id": chat_id, "type": "private" if chat_id > 0 else "supergroup"},
+        "user": {"id": USER_ID, "is_bot": False},
+        "old_reaction": [{"type": "emoji", "emoji": emoji} for emoji in old],
+        "new_reaction": [{"type": "emoji", "emoji": emoji} for emoji in new],
+        **fields,
+    }}
 
 
 class TelegramConfigTests(unittest.TestCase):
@@ -154,7 +165,55 @@ class TelegramAdapterTests(unittest.IsolatedAsyncioTestCase):
         await restarted.prepare()
         await restarted._poller.poll_once()
         host.accept.assert_not_awaited()
-        self.assertEqual(self.requests[-1], ("getUpdates", {"timeout": 30, "allowed_updates": ["message"], "offset": 24}))
+        self.assertEqual(self.requests[-1], ("getUpdates", {
+            "timeout": 30, "allowed_updates": ["message", "message_reaction"], "offset": 24,
+        }))
+
+    async def test_old_gateway_ignores_reaction_then_processes_chat(self):
+        adapter, _, svc = await self.mounted()
+        self.updates = [reaction_update(1, [], ["👍"]), update(2, 5, "ordinary chat")]
+        self.assertTrue(await adapter._poller.poll_once())
+        self.assertEqual(adapter._poller._state["offset"], 3)
+        svc.post_message.assert_called_once()
+        self.assertEqual(svc.post_message.call_args.args[1], "ordinary chat")
+
+    async def test_reaction_handoff_preserves_add_replace_and_clear(self):
+        adapter = self.adapter()
+        host = MagicMock()
+        host.accept = AsyncMock()
+        host.accept_reaction = AsyncMock(return_value="handled")
+        adapter.mount(host)
+        await adapter.prepare()
+        self.updates = [reaction_update(3, ["❤️"], []), reaction_update(1, [], ["👍"]),
+                        reaction_update(2, ["👍"], ["❤️"]), reaction_update(4, [], ["👍"], chat_id=GROUP_ID)]
+        self.assertTrue(await adapter._poller.poll_once())
+        host.accept.assert_not_awaited()
+        self.assertEqual([call.args for call in host.accept_reaction.await_args_list], [
+            (adapter, InboundReaction(str(uid), MessageSource("telegram", kind, str(target), str(USER_ID)),
+                                      ("id", f"{target}:42"), old, new, 1234))
+            for uid, kind, target, old, new in (
+                (1, "private", USER_ID, (), ("👍",)), (2, "private", USER_ID, ("👍",), ("❤️",)),
+                (3, "private", USER_ID, ("❤️",), ()), (4, "group", GROUP_ID, (), ("👍",)),
+            )
+        ])
+        self.assertEqual(adapter._poller._state["offset"], 5)
+
+    async def test_malformed_or_unsupported_reactions_do_not_clear_state(self):
+        adapter = self.adapter()
+        host = MagicMock()
+        host.accept_reaction = AsyncMock()
+        adapter.mount(host)
+        await adapter.prepare()
+        for overrides in (
+            {"new_reaction": None}, {"new_reaction": [{"type": "paid"}]},
+            {"new_reaction": [{"type": "custom_emoji", "custom_emoji_id": "42"}]},
+            {"new_reaction": [{"type": "emoji", "emoji": ""}]}, {"old_reaction": None},
+            {"actor_chat": {"id": GROUP_ID}}, {"user": None}, {"user": {"id": USER_ID, "is_bot": True}},
+            {"message_id": 0},
+        ):
+            with self.subTest(overrides=overrides):
+                self.assertEqual(await adapter._handle_update(reaction_update(1, ["👍"], [], **overrides)), "ignored")
+        host.accept_reaction.assert_not_awaited()
 
     async def test_group_mentions_foreign_commands_and_topic_events(self):
         adapter, ctx, svc = await self.mounted(group_sender_info=False)
@@ -264,7 +323,9 @@ class TelegramAdapterTests(unittest.IsolatedAsyncioTestCase):
                 env = DeliveryEnvelope(next(iter(route)), "private", str(USER_ID), "plain reply",
                                        purpose="reply", **route)
                 self.assertTrue((await adapter.deliver(env)).confirmed)
-                self.assertEqual(self.requests[-1], ("sendMessage", {"chat_id": USER_ID, "text": "plain reply"}))
+                self.assertEqual(self.requests[-1], ("sendMessage", {
+                    "chat_id": USER_ID, "text": "plain reply", "parse_mode": "MarkdownV2",
+                }))
 
     async def test_sender_rejection_and_unknown_keep_prior_receipts(self):
         adapter = self.adapter(chunk_chars=5)
@@ -300,6 +361,93 @@ class TelegramAdapterTests(unittest.IsolatedAsyncioTestCase):
         self.responses["sendPhoto"] = [ok({"message_id": 5, "chat": {"id": USER_ID}})]
         self.assertTrue((await adapter.deliver(env)).confirmed)
         self.assertIn(b'"message_id": 42', self.requests[-1][1])
+
+    async def test_native_reaction_sets_or_clears_without_sending_messages(self):
+        adapter = self.adapter()
+        self.responses["setMessageReaction"] = [ok(True), ok(True)]
+        for delivery_id, reactions in (("add", ("👍",)), ("clear", ())):
+            env = ReactionEnvelope(delivery_id, "private", str(USER_ID), ("id", "123:42"), reactions)
+            result = await adapter.deliver_reaction(env)
+            self.assertTrue(result.confirmed)
+            self.assertEqual(result.receipts, [])
+        self.assertEqual(self.requests, [
+            ("setMessageReaction", {"chat_id": USER_ID, "message_id": 42,
+                                    "reaction": [{"type": "emoji", "emoji": "👍"}]}),
+            ("setMessageReaction", {"chat_id": USER_ID, "message_id": 42, "reaction": []}),
+        ])
+
+    async def test_native_reaction_rejects_invalid_targets_or_states(self):
+        adapter = self.adapter()
+        for ref, reactions in (("-100100:42", ("👍",)), ("123:0", ("👍",)),
+                               ("123:42", ("👍", "❤️")), ("123:42", ("",))):
+            env = ReactionEnvelope("bad", "private", str(USER_ID), ("id", ref), reactions)
+            self.assertEqual((await adapter.deliver_reaction(env)).status, DeliveryStatus.REJECTED)
+        self.assertEqual(self.requests, [])
+
+    async def test_native_reaction_failure_never_falls_back_or_retries_unknown(self):
+        adapter = self.adapter()
+        self.responses["setMessageReaction"] = [reject(400), ok(False), httpx.ReadTimeout(TOKEN)]
+        for key, status in (("reject", DeliveryStatus.REJECTED), ("false", DeliveryStatus.UNKNOWN),
+                            ("timeout", DeliveryStatus.UNKNOWN)):
+            env = ReactionEnvelope(key, "private", str(USER_ID), ("id", "123:42"), ("👍",))
+            result = await adapter.deliver_reaction(env)
+            self.assertEqual(result.status, status)
+            self.assertNotIn(TOKEN, result.reason)
+            if status == DeliveryStatus.UNKNOWN:
+                self.assertEqual(await adapter.deliver_reaction(env), result)
+        self.assertEqual([method for method, _ in self.requests], ["setMessageReaction"] * 3)
+
+    async def test_markdownv2_sends_original_text_and_respects_plain_text(self):
+        adapter = self.adapter()
+        text = r"🦊 *bold* _italic_ `a.b` [link](https://example.invalid/)\!"
+        for delivery_id, extras, expected in (
+            ("formatted", {}, {"parse_mode": "MarkdownV2", "text": text}),
+            ("plain", {"plain_text": True}, {"text": text}),
+            ("literal-quote", {"quote_fallback": "【引用】*literal*\n"}, {"text": "【引用】*literal*\n" + text}),
+        ):
+            env = DeliveryEnvelope(delivery_id, "private", str(USER_ID), text, **extras)
+            self.assertTrue((await adapter.deliver(env)).confirmed)
+            self.assertEqual(self.requests[-1], ("sendMessage", {"chat_id": USER_ID, **expected}))
+
+    async def test_markdownv2_parser_rejection_falls_back_only_for_current_segment(self):
+        adapter = self.adapter(chunk_chars=8)
+        env = DeliveryEnvelope("chunks", "private", str(USER_ID), "*first*!*second*?",
+                               quote=NativeQuote((("id", "123:42"),)))
+        self.responses["sendMessage"] = [
+            ok({"message_id": 1, "chat": {"id": USER_ID}}),
+            reject(400, description="Bad Request: can't parse entities: invalid Markdown"),
+        ]
+        result = await adapter.deliver(env)
+        self.assertTrue(result.confirmed)
+        self.assertEqual(len(result.receipts), 3)
+        sends = [params for _, params in self.requests]
+        self.assertEqual([params["text"] for params in sends], ["*first*!", "*second*", "*second*", "?"])
+        self.assertEqual([params.get("parse_mode") for params in sends], ["MarkdownV2", "MarkdownV2", None, "MarkdownV2"])
+        self.assertEqual(sends[0]["reply_parameters"]["message_id"], 42)
+        self.assertTrue(all("reply_parameters" not in params for params in sends[1:]))
+
+    async def test_markdownv2_other_failures_do_not_retry_as_plain_text(self):
+        adapter = self.adapter()
+        for key, failure, status in (
+            ("bad-chat", reject(400, description="Bad Request: chat not found"), DeliveryStatus.REJECTED),
+            ("rate-limit", reject(429), DeliveryStatus.REJECTED),
+            ("ambiguous", httpx.ReadTimeout(TOKEN), DeliveryStatus.UNKNOWN),
+        ):
+            self.responses["sendMessage"] = [failure]
+            before = len(self.requests)
+            env = DeliveryEnvelope(key, "private", str(USER_ID), "*text*")
+            self.assertEqual((await adapter.deliver(env)).status, status)
+            self.assertEqual(len(self.requests), before + 1)
+
+    async def test_markdownv2_truncation_notice_keeps_chunk_limits(self):
+        adapter = self.adapter(chunk_chars=12, max_chunks=2)
+        env = DeliveryEnvelope("short", "private", str(USER_ID), "*" * 80)
+        self.assertTrue((await adapter.deliver(env)).confirmed)
+        sends = [params for _, params in self.requests]
+        self.assertEqual(len(sends), 2)
+        self.assertTrue(all(len(params["text"]) <= 12 for params in sends))
+        self.assertTrue(sends[-1]["text"].endswith("[内容已截断]"))
+        self.assertNotIn("parse_mode", sends[-1])
 
     async def test_ambiguous_api_error_does_not_expose_response_body(self):
         adapter = self.adapter()
