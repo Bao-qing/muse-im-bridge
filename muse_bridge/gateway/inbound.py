@@ -86,15 +86,6 @@ class InboundPipeline:
             await self._run_command(ctx, parsed, target_type, target_id, msg_id, can_manage)
             return "handled"
 
-        waiting = [i for i in ctx.muse_service.interactions.items.values()
-                   if i.kind == "credential" and not i.terminal and i.session_id == session_id
-                   and i.context.get("foreground_blocking") and not i.context.get("background_credential")]
-        if waiting:
-            cards = "\n".join(f"/凭证 {i.id}" for i in waiting)
-            await ctx.send_reply(target_type, target_id,
-                "当前会话等待填写凭证，消息尚未发送。请引用凭证卡填写，或发送：\n" + cards, msg_id)
-            return "handled"
-
         # Muse understands its native English commands, not their Chinese labels.
         parts = content.split(None, 1)
         if parts and parts[0].startswith("/"):

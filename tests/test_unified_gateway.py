@@ -123,58 +123,96 @@ class UnifiedGatewayCase(unittest.IsolatedAsyncioTestCase):
         self.assertNotEqual(ca.session_mapper.current("private", "u"), cb.session_mapper.current("private", "u"))
         self.assertEqual(self.service.post_message.call_count, 2)
 
-    async def test_foreground_credential_blocks_chat_without_capturing_it(self):
-        driver, ctx = self.driver()
-        ctx.session_mapper.bind("private", "u", "session")
-        self.service.interactions.add("credential", session_id="session", remote_id="card", context={"foreground_blocking": True})
-        await driver.emit(self.message(text="ordinary input, not a secret"))
-        self.service.post_message.assert_not_called()
-        self.assertIn("等待填写凭证", driver.sent[-1].text)
-        self.assertIsNone(self.service.interactions.current(ctx.interaction_owner("private", "u", "u")))
-
-    async def test_background_credential_does_not_acquire_input(self):
-        driver, ctx = self.driver()
-        ctx.session_mapper.bind("private", "u", "session")
-        self.service.interactions.add("credential", session_id="session", remote_id="background", context={"background_credential": True})
-        await driver.emit(self.message(text="42"))
-        self.service.post_message.assert_called_once()
-        self.assertEqual(self.service.post_message.call_args.args[1], "42")
-
-    async def test_background_approval_push_does_not_acquire_input(self):
-        driver, ctx = self.driver()
-        item = self.service.interactions.add("approval", remote_id="background", context={"background_approval": True})
-        await driver.emit(self.message(text="42"))
-        self.service.post_message.assert_called_once()
-        self.assertIsNone(self.service.interactions.current(ctx.interaction_owner("private", "u", "u")))
-
-    async def test_credential_card_requires_positive_foreground_evidence(self):
-        from unittest.mock import patch
+    async def test_credential_and_connector_key_cards_never_block_unquoted_chat(self):
         from urllib.parse import urlencode
-        from muse_bridge.gateway.outbound import OutboundDispatcher
 
         driver, ctx = self.driver()
         ctx.session_mapper.bind("private", "u", "session")
-        fields = {"page_url": "https://example.invalid/", "password_label": "SSH key",
-                  "capture_authorization": "fictional-authorization"}
-        card = {"event_name": "delta.presentation", "message_id": "card-mid", "seq": 2,
-                "payload": {"presentation_id": "card-id", "data": {"type": "credentials_vault",
-                    "data": {"capture": "private_key", **fields,
-                             "url": "https://muse.ai/connect/browser-credentials#" + urlencode(fields)}}}}
-        with patch.object(OutboundDispatcher, "_scan_and_dispatch", new=AsyncMock()):
-            await ctx.outbound_pusher._scan_and_dispatch([card], "session")
-            item = self.service.interactions.by_remote("credential", "card-id")
-            self.assertFalse(item.context.get("foreground_blocking"))
-            ctx.route_manager.register("user-mid", "private", "u", "input-mid")
-            history = [{"role": "user", "message_id": "user-mid", "seq": 1}, card]
-            await ctx.outbound_pusher._scan_and_dispatch(history, "session")
-            self.assertTrue(item.context.get("foreground_blocking"))
-            # Explicit scheduler evidence overrides the earlier causal route.
-            card["payload"]["scope_type"] = "schedule"
-            await ctx.outbound_pusher._scan_and_dispatch(history, "session")
-            self.assertTrue(item.context.get("background_credential"))
-            self.assertFalse(item.context.get("foreground_blocking"))
-        await driver.emit(self.message(text="ordinary background chat"))
-        self.service.post_message.assert_called_once()
+        fields = {"page_url": "https://example.invalid/login", "username_label": "账号",
+                  "password_label": "密码", "capture_authorization": "fictional-authorization"}
+        cred_event = {
+            "role": "assistant",
+            "event_name": "delta.presentation",
+            "message_id": "cred-mid",
+            "seq": 2,
+            "payload": {
+                "presentation_id": "cred-card-id",
+                "data": {
+                    "type": "credentials_vault",
+                    "data": {
+                        "capture": "sign_in",
+                        **fields,
+                        "url": "https://muse.ai/connect/browser-credentials#" + urlencode(fields),
+                    },
+                },
+            },
+        }
+        key_item = self.service.interactions.add(
+            "credential",
+            session_id="session",
+            remote_id="key-card-id",
+            context={"capture": "connector_key", "title": "MCP", "subtitle": "https://mcp.example.invalid/mcp"},
+        )
+        await ctx.outbound_pusher._scan_and_dispatch([cred_event], "session")
+        cred_item = self.service.interactions.by_remote("credential", "cred-card-id")
+        self.assertIsNotNone(cred_item)
+        self.assertEqual(len(driver.sent), 1)
+        cred_receipt_id = "receipt-1"
+        ctx.muse_service.interactions.remember_credential_message(
+            "private", "u", {"id": cred_receipt_id}, cred_item,
+            target=ctx.outbound_pusher.interaction_target("private", "u"),
+        )
+        ctx.muse_service.interactions.remember_credential_message(
+            "private", "u", {"id": "receipt-key"}, key_item,
+            target=ctx.outbound_pusher.interaction_target("private", "u"),
+        )
+
+        # Unquoted single-line, numeric, and two-line messages all go straight to Muse without blocking.
+        for idx, text in enumerate(("ordinary chat", "123456", "alice\nnot-a-secret"), start=1):
+            await driver.emit(self.message(mid=f"plain-{idx}", text=text))
+        self.assertEqual(
+            [c.args[1] for c in self.service.post_message.call_args_list],
+            ["ordinary chat", "123456", "alice\nnot-a-secret"],
+        )
+        self.assertIsNone(self.service.interactions.current(ctx.interaction_owner("private", "u", "u")))
+
+        # Quoting the credential card routes to capture_credential instead of Muse chat.
+        with unittest.mock.patch.object(self.service.interaction_protocol, "capture_credential") as cap_cred:
+            quoted_cred = InboundMessage(
+                "quote-cred", MessageSource("qq", "private", "u", "u"),
+                "alice\nfictional-pass", [], references=[("id", cred_receipt_id)],
+            )
+            await driver.emit(quoted_cred)
+            cap_cred.assert_called_once_with(cred_item, "fictional-pass")
+        self.assertEqual(self.service.post_message.call_count, 3)
+
+        # Quoting the connector key card routes to register_connector_key instead of Muse chat.
+        with unittest.mock.patch.object(self.service.interaction_protocol, "register_connector_key") as cap_key:
+            quoted_key = InboundMessage(
+                "quote-key", MessageSource("qq", "private", "u", "u"),
+                "sk-fictional-key", [], references=[("id", "receipt-key")],
+            )
+            await driver.emit(quoted_key)
+            cap_key.assert_called_once_with(key_item, "sk-fictional-key")
+        self.assertEqual(self.service.post_message.call_count, 3)
+
+    async def test_foreground_approval_blocks_session_while_background_approval_does_not(self):
+        driver, ctx = self.driver()
+        ctx.session_mapper.bind("private", "u", "session")
+        # Background approval never blocks unquoted chat.
+        self.service.interactions.add("approval", remote_id="bg-app", context={"background_approval": True})
+        await driver.emit(self.message(mid="bg-chat", text="42"))
+        self.assertEqual(self.service.post_message.call_count, 1)
+        self.assertIsNone(self.service.interactions.current(ctx.interaction_owner("private", "u", "u")))
+
+        # Foreground approval on this session blocks ordinary chat until decided.
+        fg = self.service.interactions.add(
+            "approval", session_id="session", remote_id="fg-app",
+            context={"fingerprint": "fp-fg", "options": [{"label": "允许一次", "decision": "allow"}]},
+        )
+        await driver.emit(self.message(mid="fg-blocked", text="hello while fg approval pending"))
+        self.assertEqual(self.service.post_message.call_count, 1)
+        self.assertIn(fg.id, driver.sent[-1].text)
 
     async def test_unconfirmed_delivery_is_logged_with_reason_not_content(self):
         driver, ctx = self.driver()

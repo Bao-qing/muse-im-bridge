@@ -143,10 +143,7 @@ class GatewayOutbound(OutboundDispatcher):
         return f"可引用此消息发送{label}，或发送 /凭证 {item.id}。"
 
     async def _scan_and_dispatch(self, hist, session_id=None):
-        # Available cards do not own input. A foreground gate requires positive
-        # server evidence or a causal route from a submitted foreground turn.
         last_user = None
-        protocol = self.muse_service.interaction_protocol
         suppressed = False
         for event in sorted(hist, key=lambda e: e.get("seq") or 0):
             if event.get("role") == "user":
@@ -157,22 +154,6 @@ class GatewayOutbound(OutboundDispatcher):
                 if source is not None and source is not self.context and event.get("message_id"):
                     self._seen_ids.add(event["message_id"])
                     suppressed = True
-            if (event.get("event_name") or event.get("event")) != "delta.presentation":
-                continue
-            card = protocol.register_credential(event, session_id) if session_id else None
-            if card is None or card.terminal:
-                continue
-            payload = event.get("payload") or {}
-            background = protocol.is_background_approval(event) or protocol.is_background_approval(payload)
-            if background:
-                card.context["background_credential"] = True
-                card.context.pop("foreground_blocking", None)
-            elif not card.context.get("background_credential"):
-                root = (payload.get("metadata") or {}).get("root_message_execution_id")
-                source = self.context.gateway.route_owner(session_id, last_user, root)
-                attention = (payload.get("presentation") or {}).get("attention_mode")
-                if source is not None or attention == "foreground":
-                    card.context["foreground_blocking"] = True
         if suppressed:
             self._save_state()
         await super()._scan_and_dispatch(hist, session_id)
