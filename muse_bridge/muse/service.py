@@ -301,3 +301,14 @@ class MuseService:
         with self.create_client() as client:
             client.connect()
             return client.list_sessions()
+
+    def toggle_reaction(self, message_id: str, emoji: str) -> List[str]:
+        """Toggle one emoji reaction on a Muse message and return the resulting list."""
+        try:
+            with self.create_client() as client:
+                client.connect()
+                return client.toggle_reaction(message_id, emoji)
+        except Exception as e:
+            if is_runtime_auth_error(e) and "client" in locals():
+                self.token_manager.invalidate_mint(client.token, client.notary_token)
+            raise

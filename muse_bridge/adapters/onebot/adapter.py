@@ -15,7 +15,7 @@ import time
 from typing import Dict, List, Optional, Tuple
 
 from ...config.models import OneBotConfig
-from ...core.delivery import DeliveryResult, DeliveryStatus, FeedEnvelope
+from ...core.delivery import DeliveryResult, DeliveryStatus, FeedEnvelope, ReactionEnvelope, reaction_as_delivery
 from ...core.identity import valid_id
 from ...core.message import Attachment, InboundMessage, MessageSource
 from ..base import BaseAdapter
@@ -116,6 +116,9 @@ class OneBotAdapter(BaseAdapter):
 
     async def deliver(self, envelope):
         return await self.sender.deliver(envelope)
+
+    async def deliver_reaction(self, envelope: ReactionEnvelope) -> DeliveryResult:
+        return await self.deliver(reaction_as_delivery(envelope))
 
     def activity_started(self, target: str, token: str, *, kind: str = "private") -> None:
         if kind != "private" or not self.config.typing_enabled or not target:

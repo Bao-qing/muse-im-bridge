@@ -478,7 +478,7 @@ Telegram 默认关闭，仅支持官方 Bot API **长轮询**，不需要公网�
 - 测普通群时，在 `whitelist` 加入 Telegram **带负号的群 ID**（值为允许的数字用户 ID 列表，或明确写 `"*"` 放行全群）。`at` 处理可见的 `@bot`、针对本 bot 的命令或已关联的引用；Telegram Privacy Mode 可能不提交普通群消息，由平台决定，桥接配置不会扩大可见范围。暂不处理频道、论坛话题或消息编辑。
 - 支持纯文本、图片、文件、视频和原生回复引用。媒体受 Bot API 与本项目配置中较低的限制；图片、文件或视频附件需有可用文件内容。轮询状态保存在 `routes_file` 旁并按 bot ID 隔离；确定未提交的消息可重试，崩溃时结果不明的消息不会重放。
 - 机器人通过 `muse_bridge/adapters/telegram/markdown.py` 将常见 Markdown（`**粗体**`、`*斜体*`、`~~删除线~~`、`||剧透||`、行内代码、代码块、链接、标题、引用、列表和表格）解析为 Telegram `text + entities`（UTF-16 偏移）发送，不需要额外依赖或字符转义。网关要求纯文本时不解析；纯文本引用兜底保持字面内容。若某段仍被 Telegram 拒绝实体格式，仅该段改用纯文本重发。
-- 适配器已订阅用户的 `message_reaction`，也能按明确指令调用 `setMessageReaction` 设置或清除普通 emoji。当前网关尚未接线，收到的反应会丢弃，不会同步至 Muse；Muse 发出的反应暂时仍按现有方式显示为表情通知。
+- 适配器与网关已打通双向 reaction：用户在 Telegram 给当前会话的消息点 emoji 反应，会经 `POST /reactions/toggle` 同步给 Muse（不回弹重复通知）；Muse 下发的反应会通过 `setMessageReaction` 原生贴在对应的 Telegram 消息上（其余渠道仍以引用原消息的纯文本通知方式发送）。
 
 ## 微信 iLink 适配器
 

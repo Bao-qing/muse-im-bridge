@@ -734,6 +734,32 @@ class MuseClient:
         except Exception:
             pass
 
+    def toggle_reaction(self, message_id: str, emoji: str) -> list[str]:
+        """POST /reactions/toggle. Returns the updated reactions list on the message."""
+        if not isinstance(message_id, str) or not message_id.strip():
+            raise ValueError("message_id must be a nonempty string")
+        if not isinstance(emoji, str) or not emoji.strip():
+            raise ValueError("emoji must be a nonempty string")
+        body = json.dumps({"message_id": message_id, "emoji": emoji}, ensure_ascii=False).encode()
+        raw = self.request("POST", "/reactions/toggle", body, timeout=30)
+        try:
+            obj = json.loads(raw.decode("utf-8", "replace"))
+            container = obj.get("result") if isinstance(obj.get("result"), dict) else obj
+            items = container["reactions"]
+            if not isinstance(items, list):
+                raise TypeError("reactions must be a list")
+        except Exception as e:
+            raise MuseError(f"reactions.toggle parse failed: {e}") from e
+        aliases = {"hatch:facebook_thumbs_up_v1": "👍", "hatch:heart_v1": "🫶"}
+        out = []
+        for entry in items:
+            val = entry.get("emoji") if isinstance(entry, dict) else entry
+            if isinstance(val, str):
+                val = aliases.get(val, val)
+                if 0 < len(val) <= 64 and val not in out:
+                    out.append(val)
+        return out
+
     def list_sessions(self, include_peer_sidechats=True):
         """GET /api/session/list. Returns the raw sessions list."""
         path = "/api/session/list"

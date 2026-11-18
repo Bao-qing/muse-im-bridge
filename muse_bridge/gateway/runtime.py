@@ -156,6 +156,34 @@ class UnifiedGateway:
                 ctx.deduplicator._gateway_seen_ids.pop(dedup_key, None)
             return result
 
+    async def accept_reaction(self, adapter, event):
+        self.identity_changed(adapter)
+        ctx = self.contexts.get(adapter)
+        if ctx is None:
+            return "retryable"
+        if event.source.platform != adapter.name:
+            raise ValueError("Inbound platform does not match the mounted driver")
+        key = ChannelKey(ctx.identity, event.source.chat_type, event.source.target_id)
+        lock = self._channel_locks.setdefault(key, asyncio.Lock())
+        async with lock:
+            if self.contexts.get(adapter) is not ctx:
+                return "retryable"
+            dedup_key = f"reaction:{key.kind}:{key.target}:{event.event_id}"
+            if event.event_id and ctx.deduplicator.is_duplicate_gateway_msg(dedup_key):
+                return "handled"
+            sid = ctx.session_mapper.current(key.kind, key.target)
+            try:
+                if sid:
+                    async with self.session_lock(sid):
+                        result = await self.pipeline.handle_reaction(ctx, event)
+                else:
+                    result = await self.pipeline.handle_reaction(ctx, event)
+            except asyncio.CancelledError:
+                raise
+            if result == "retryable":
+                ctx.deduplicator._gateway_seen_ids.pop(dedup_key, None)
+            return result
+
     def route_owner(self, sid, mid, root):
         # Causal origins outlive short-lived passive routes and current bindings.
         # A retired origin is a suppression tombstone, never an invitation to

@@ -6,7 +6,7 @@ import json
 
 from ..config.models import ChatConfig
 from ..core.commands import CHINESE_COMMANDS, GATEWAY_COMMANDS, CommandError, CommandHandler
-from ..core.message import InboundMessage
+from ..core.message import InboundMessage, InboundReaction
 from ..muse.client.errors import LoginRequired, is_runtime_auth_error
 from ..muse.interactions import ApprovalBlocked
 from ..observability import get_logger, safe_error, trace_event
@@ -117,6 +117,58 @@ class InboundPipeline:
                 sid = ctx.session_mapper.current(target_type, target_id)
                 if sid:
                     await ctx.adapter.activity(target_id, sid, "finished", kind=target_type)
+
+    async def handle_reaction(self, ctx, event: InboundReaction) -> str:
+        """Synchronize an inbound platform reaction to the referenced Muse message."""
+        kind = event.source.chat_type
+        target = event.source.target_id
+        user = event.source.sender_id
+        if ctx.access_requests is not None and not ctx.access_requests.allows(kind, target, user):
+            logger.debug("Ignored %s reaction: sender not in whitelist", kind)
+            return "ignored"
+        session_id = ctx.session_mapper.current(kind, target) or ""
+        if not session_id:
+            return "ignored"
+        if not event.message_ref or len(event.message_ref) != 2 or not event.message_ref[1]:
+            return "ignored"
+        reference = ctx.outbound_pusher.reference_store.resolve_channel(
+            session_id, kind, target, [event.message_ref]
+        )
+        if reference is None or not reference.muse_id:
+            return "ignored"
+        added = tuple(e for e in event.new_reactions if e not in event.old_reactions)
+        removed = tuple(e for e in event.old_reactions if e not in event.new_reactions)
+        if not added and not removed:
+            return "ignored"
+        if not await asyncio.to_thread(ctx.muse_service.token_manager.has_credentials):
+            return "ignored"
+        muse_mid = reference.muse_id
+        async with ctx.outbound_pusher.reaction_lock(session_id, muse_mid):
+            await ctx.outbound_pusher.ensure_baseline(session_id)
+            state = ctx.outbound_pusher.reference_store.reaction_state(session_id, muse_mid)
+            prev_seq, current = state if state is not None else (0, [])
+            changed = False
+            try:
+                for emoji in removed:
+                    if emoji in current:
+                        current = await asyncio.to_thread(ctx.muse_service.toggle_reaction, muse_mid, emoji)
+                        ctx.outbound_pusher.reference_store.set_reaction_state(session_id, muse_mid, prev_seq, current)
+                        changed = True
+                for emoji in added:
+                    if emoji not in current:
+                        current = await asyncio.to_thread(ctx.muse_service.toggle_reaction, muse_mid, emoji)
+                        ctx.outbound_pusher.reference_store.set_reaction_state(session_id, muse_mid, prev_seq, current)
+                        changed = True
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.warning("Inbound reaction sync failed: %s", safe_error(exc))
+                return "unknown"
+        if not changed:
+            return "ignored"
+        trace_event(f"{ctx.name}.adapter", "reaction.synced", session_id=session_id,
+                    message_id=muse_mid, target_type=kind, target_id=target)
+        return "handled"
 
     async def _run_command(self, ctx, parsed, target_type, target_id, msg_id, can_manage) -> None:
         cmd_name, cmd_args = parsed
