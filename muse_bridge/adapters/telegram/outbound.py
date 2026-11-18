@@ -6,6 +6,7 @@ import re
 
 from ...core.delivery import DeliveryEnvelope, DeliveryReceipt, DeliveryResult, DeliveryStatus, ReactionEnvelope
 from .client import PHOTO_CAP, UPLOAD_CAP, TelegramAPIError
+from .markdown import chunk_formatted, parse_markdown, utf16_len
 
 
 _ID = re.compile(r"-?[1-9][0-9]{0,15}")
@@ -100,11 +101,13 @@ class TelegramSender:
                 try:
                     body = await self.client.call(method, params, files=files)
                 except TelegramAPIError as exc:
-                    if params.get("parse_mode") != "MarkdownV2" or not exc.rejected or not exc.invalid_markdown:
+                    if (("parse_mode" not in params and "entities" not in params)
+                            or not exc.rejected or not exc.invalid_markdown):
                         raise
-                    # Telegram explicitly refused this segment before sending it.
+                    # Telegram explicitly refused this segment's formatting before sending it.
                     # Retry the same text without formatting; never replay other segments.
-                    params.pop("parse_mode")
+                    params.pop("parse_mode", None)
+                    params.pop("entities", None)
                     body = await self.client.call(method, params, files=files)
             except TelegramAPIError as exc:
                 return failure(str(exc), uncertain=not exc.rejected)
@@ -115,20 +118,21 @@ class TelegramSender:
             receipts.append(DeliveryReceipt(envelope.target_type, target, (("id", message_key(target, mid)),)))
             return None
 
-        text = prefix + envelope.text
-        use_markdown = not envelope.plain_text and not prefix
         limit = max(1, min(4096, self.config.chunk_chars))
         count = max(1, self.config.max_chunks)
-        truncated = len(text) > limit * count
-        if truncated:
-            notice = "\n\n[内容已截断]"[:limit]
-            text = text[:limit * count - len(notice)] + notice
-        for start in range(0, len(text), limit):
-            end = start + limit
-            params = {"text": text[start:end]}
-            if use_markdown and not (truncated and end >= len(text)):
-                params["parse_mode"] = "MarkdownV2"
-            error = await send("sendMessage", params)
+        if envelope.plain_text:
+            chunks = chunk_formatted(prefix + envelope.text, [], limit, count)
+        else:
+            body_text, body_entities = parse_markdown(envelope.text)
+            if prefix:
+                shift = utf16_len(prefix)
+                body_entities = [{**entity, "offset": entity["offset"] + shift} for entity in body_entities]
+            chunks = chunk_formatted(prefix + body_text, body_entities, limit, count)
+        for chunk_text, chunk_entities in chunks:
+            extra = {"text": chunk_text}
+            if chunk_entities:
+                extra["entities"] = chunk_entities
+            error = await send("sendMessage", extra)
             if error is not None:
                 return error
 

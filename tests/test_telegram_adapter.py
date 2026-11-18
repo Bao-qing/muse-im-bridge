@@ -12,6 +12,7 @@ import httpx
 
 from muse_bridge.adapters.telegram import TelegramAdapter
 from muse_bridge.adapters.telegram.client import TelegramAPIError
+from muse_bridge.adapters.telegram.markdown import chunk_formatted, parse_markdown, utf16_len
 from muse_bridge.config.models import AccessRequestsConfig, ConfigLoader, MuseConfig, TelegramConfig
 from muse_bridge.core.delivery import DeliveryEnvelope, DeliveryStatus, NativeQuote, ReactionEnvelope
 from muse_bridge.core.message import Attachment, InboundReaction, MessageSource
@@ -83,6 +84,92 @@ class TelegramConfigTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "valid bot_token") as cm:
             TelegramConfig(enabled=True, bot_token="not-a-token-secret")
         self.assertNotIn("not-a-token-secret", str(cm.exception))
+
+
+class TelegramMarkdownTests(unittest.TestCase):
+    def test_utf16_headings_code_blocks_links_and_nesting_rules(self):
+        md = (
+            "# **标题**\n\n"
+            "🦊 **加粗** *斜体* ~~删除~~ ||隐藏||\n\n"
+            "标识符 foo_bar_baz 与 **含 `code` 的粗体** 和 ***粗斜***\n\n"
+            "[*链接*](https://example.invalid/a_(b)) 与 [危险](javascript:alert(1))\n\n"
+            "```python\n**not bold**\n```\n\n"
+            "> 引用 *内联* 与 `行内代码` [link](https://example.invalid/)"
+        )
+        plain, entities = parse_markdown(md)
+        self.assertIn("🦊 加粗 斜体 删除 隐藏", plain)
+        self.assertIn("foo_bar_baz", plain)
+        self.assertNotIn("javascript:", [e.get("url", "") for e in entities])
+        self.assertIn("[危险](javascript:alert(1))", plain)
+
+        def slice_u16(entity):
+            raw = plain.encode("utf-16-le")
+            return raw[entity["offset"] * 2 : (entity["offset"] + entity["length"]) * 2].decode("utf-16-le")
+
+        by_type = {}
+        for e in entities:
+            by_type.setdefault(e["type"], []).append((slice_u16(e), e))
+
+        # Heading should emit a single bold entity (no duplicate bold inside bold)
+        self.assertEqual([text for text, _ in by_type["bold"]].count("标题"), 1)
+        self.assertIn("加粗", [text for text, _ in by_type["bold"]])
+        self.assertIn("含 ", [text for text, _ in by_type["bold"]])
+        self.assertIn(" 的粗体", [text for text, _ in by_type["bold"]])
+        self.assertIn("粗斜", [text for text, _ in by_type["bold"]])
+        self.assertIn("粗斜", [text for text, _ in by_type["italic"]])
+        self.assertEqual([text for text, _ in by_type["strikethrough"]], ["删除"])
+        self.assertEqual([text for text, _ in by_type["spoiler"]], ["隐藏"])
+        self.assertEqual([text for text, _ in by_type["code"]], ["code"])
+        self.assertEqual(by_type["pre"][0][0], "**not bold**")
+        self.assertEqual(by_type["pre"][0][1]["language"], "python")
+        self.assertEqual(by_type["text_link"][0][0], "链接")
+        self.assertEqual(by_type["text_link"][0][1]["url"], "https://example.invalid/a_(b)")
+        self.assertEqual(by_type["blockquote"][0][0], "引用 内联 与 行内代码 link (https://example.invalid/)")
+
+        # Verify Telegram nesting rule: bold/italic/etc. never overlap code or pre
+        code_ranges = [(e["offset"], e["offset"] + e["length"]) for e in entities if e["type"] in {"code", "pre"}]
+        for e in entities:
+            if e["type"] in {"bold", "italic", "strikethrough", "spoiler", "text_link"}:
+                s, t = e["offset"], e["offset"] + e["length"]
+                for cs, ct in code_ranges:
+                    self.assertTrue(t <= cs or s >= ct, f"{e} overlaps code/pre {(cs, ct)}")
+
+        # Verify blockquote never contains code, pre, or text_link
+        for bq in [e for e in entities if e["type"] == "blockquote"]:
+            bs, bt = bq["offset"], bq["offset"] + bq["length"]
+            for e in entities:
+                if e["type"] in {"code", "pre", "text_link"}:
+                    s, t = e["offset"], e["offset"] + e["length"]
+                    self.assertTrue(t <= bs or s >= bt, f"{e} nested inside blockquote")
+
+    def test_tables_lists_and_unmatched_delimiters(self):
+        md = (
+            "| 名称 | 值 |\n"
+            "| --- | --- |\n"
+            "| `k` | **v** |\n\n"
+            "- [x] 完成\n"
+            "- [ ] 待办\n"
+            "  - 子项 *斜*\n"
+            "1. 第一\n\n"
+            "**含单个 * 的粗体** 与 2 * 3 = 6"
+        )
+        plain, entities = parse_markdown(md)
+        self.assertIn("名称 | 值\nk | v", plain)
+        self.assertIn("☑ 完成\n☐ 待办\n  • 子项 斜\n1. 第一", plain)
+        self.assertIn("含单个 * 的粗体 与 2 * 3 = 6", plain)
+
+    def test_chunk_formatted_preserves_surrogates_and_rebased_entities(self):
+        plain, entities = parse_markdown("🦊 **加粗段一**\n**加粗段二**")
+        chunks = chunk_formatted(plain, entities, limit=9, max_chunks=4)
+        self.assertEqual([t for t, _ in chunks], ["🦊 加粗段一", "加粗段二"])
+        self.assertEqual(chunks[0][1], [{"type": "bold", "offset": 3, "length": 4}])
+        self.assertEqual(chunks[1][1], [{"type": "bold", "offset": 0, "length": 4}])
+        for chunk_text, chunk_entities in chunks:
+            u16_cap = utf16_len(chunk_text)
+            for e in chunk_entities:
+                self.assertGreaterEqual(e["offset"], 0)
+                self.assertGreater(e["length"], 0)
+                self.assertLessEqual(e["offset"] + e["length"], u16_cap)
 
 
 class TelegramAdapterTests(unittest.IsolatedAsyncioTestCase):
@@ -324,7 +411,7 @@ class TelegramAdapterTests(unittest.IsolatedAsyncioTestCase):
                                        purpose="reply", **route)
                 self.assertTrue((await adapter.deliver(env)).confirmed)
                 self.assertEqual(self.requests[-1], ("sendMessage", {
-                    "chat_id": USER_ID, "text": "plain reply", "parse_mode": "MarkdownV2",
+                    "chat_id": USER_ID, "text": "plain reply",
                 }))
 
     async def test_sender_rejection_and_unknown_keep_prior_receipts(self):
@@ -397,36 +484,56 @@ class TelegramAdapterTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(await adapter.deliver_reaction(env), result)
         self.assertEqual([method for method, _ in self.requests], ["setMessageReaction"] * 3)
 
-    async def test_markdownv2_sends_original_text_and_respects_plain_text(self):
+    async def test_markdown_renders_muse_text_and_respects_plain_text(self):
         adapter = self.adapter()
-        text = r"🦊 *bold* _italic_ `a.b` [link](https://example.invalid/)\!"
-        for delivery_id, extras, expected in (
-            ("formatted", {}, {"parse_mode": "MarkdownV2", "text": text}),
-            ("plain", {"plain_text": True}, {"text": text}),
-            ("literal-quote", {"quote_fallback": "【引用】*literal*\n"}, {"text": "【引用】*literal*\n" + text}),
-        ):
-            env = DeliveryEnvelope(delivery_id, "private", str(USER_ID), text, **extras)
-            self.assertTrue((await adapter.deliver(env)).confirmed)
-            self.assertEqual(self.requests[-1], ("sendMessage", {"chat_id": USER_ID, **expected}))
+        text = "**粗体** *斜体*\n\n- 列表 1\n- 列表 2\n\n`代码`\n\n> 引用"
+        expected_plain = "粗体 斜体\n\n• 列表 1\n• 列表 2\n\n代码\n\n引用"
+        expected_entities = [
+            {"type": "bold", "offset": 0, "length": 2},
+            {"type": "italic", "offset": 3, "length": 2},
+            {"type": "code", "offset": 22, "length": 2},
+            {"type": "blockquote", "offset": 26, "length": 2},
+        ]
+        env = DeliveryEnvelope("formatted", "private", str(USER_ID), text)
+        self.assertTrue((await adapter.deliver(env)).confirmed)
+        self.assertEqual(self.requests[-1], ("sendMessage", {
+            "chat_id": USER_ID, "text": expected_plain, "entities": expected_entities,
+        }))
 
-    async def test_markdownv2_parser_rejection_falls_back_only_for_current_segment(self):
+        plain_env = DeliveryEnvelope("plain", "private", str(USER_ID), text, plain_text=True)
+        self.assertTrue((await adapter.deliver(plain_env)).confirmed)
+        self.assertEqual(self.requests[-1], ("sendMessage", {"chat_id": USER_ID, "text": text}))
+
+        prefix = "【引用】*literal*\n"
+        quote_env = DeliveryEnvelope("literal-quote", "private", str(USER_ID), text, quote_fallback=prefix)
+        self.assertTrue((await adapter.deliver(quote_env)).confirmed)
+        shift = utf16_len(prefix)
+        shifted_entities = [{**e, "offset": e["offset"] + shift} for e in expected_entities]
+        self.assertEqual(self.requests[-1], ("sendMessage", {
+            "chat_id": USER_ID, "text": prefix + expected_plain, "entities": shifted_entities,
+        }))
+
+    async def test_markdown_entity_rejection_falls_back_only_for_current_segment(self):
         adapter = self.adapter(chunk_chars=8)
-        env = DeliveryEnvelope("chunks", "private", str(USER_ID), "*first*!*second*?",
+        env = DeliveryEnvelope("chunks", "private", str(USER_ID), "**first**!\n**second**!\n**third**?",
                                quote=NativeQuote((("id", "123:42"),)))
         self.responses["sendMessage"] = [
             ok({"message_id": 1, "chat": {"id": USER_ID}}),
-            reject(400, description="Bad Request: can't parse entities: invalid Markdown"),
+            reject(400, description="Bad Request: can't parse entities: invalid entity"),
         ]
         result = await adapter.deliver(env)
         self.assertTrue(result.confirmed)
         self.assertEqual(len(result.receipts), 3)
         sends = [params for _, params in self.requests]
-        self.assertEqual([params["text"] for params in sends], ["*first*!", "*second*", "*second*", "?"])
-        self.assertEqual([params.get("parse_mode") for params in sends], ["MarkdownV2", "MarkdownV2", None, "MarkdownV2"])
+        self.assertEqual([params["text"] for params in sends], ["first!", "second!", "second!", "third?"])
+        self.assertTrue("entities" in sends[0])
+        self.assertTrue("entities" in sends[1])
+        self.assertNotIn("entities", sends[2])
+        self.assertTrue("entities" in sends[3])
         self.assertEqual(sends[0]["reply_parameters"]["message_id"], 42)
         self.assertTrue(all("reply_parameters" not in params for params in sends[1:]))
 
-    async def test_markdownv2_other_failures_do_not_retry_as_plain_text(self):
+    async def test_markdown_other_failures_do_not_retry_as_plain_text(self):
         adapter = self.adapter()
         for key, failure, status in (
             ("bad-chat", reject(400, description="Bad Request: chat not found"), DeliveryStatus.REJECTED),
@@ -435,19 +542,19 @@ class TelegramAdapterTests(unittest.IsolatedAsyncioTestCase):
         ):
             self.responses["sendMessage"] = [failure]
             before = len(self.requests)
-            env = DeliveryEnvelope(key, "private", str(USER_ID), "*text*")
+            env = DeliveryEnvelope(key, "private", str(USER_ID), "**text**")
             self.assertEqual((await adapter.deliver(env)).status, status)
             self.assertEqual(len(self.requests), before + 1)
 
-    async def test_markdownv2_truncation_notice_keeps_chunk_limits(self):
+    async def test_markdown_truncation_notice_keeps_chunk_limits(self):
         adapter = self.adapter(chunk_chars=12, max_chunks=2)
-        env = DeliveryEnvelope("short", "private", str(USER_ID), "*" * 80)
+        env = DeliveryEnvelope("short", "private", str(USER_ID), "**" + "a" * 80 + "**")
         self.assertTrue((await adapter.deliver(env)).confirmed)
         sends = [params for _, params in self.requests]
         self.assertEqual(len(sends), 2)
         self.assertTrue(all(len(params["text"]) <= 12 for params in sends))
         self.assertTrue(sends[-1]["text"].endswith("[内容已截断]"))
-        self.assertNotIn("parse_mode", sends[-1])
+        self.assertEqual(sends[-1]["entities"], [{"type": "bold", "offset": 0, "length": 3}])
 
     async def test_ambiguous_api_error_does_not_expose_response_body(self):
         adapter = self.adapter()
