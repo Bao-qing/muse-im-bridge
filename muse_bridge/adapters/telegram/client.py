@@ -55,9 +55,12 @@ class TelegramClient:
                 hints = body.get("parameters")
                 delay = hints.get("retry_after") if isinstance(hints, dict) else None
                 description = body.get("description")
-                invalid_markdown = (method == "sendMessage" and status == 400
-                                    and isinstance(description, str)
-                                    and description.lower().startswith("bad request: can't parse entities:"))
+                desc_lower = description.lower() if isinstance(description, str) else ""
+                invalid_markdown = (method == "sendMessage" and status == 400 and (
+                    desc_lower.startswith("bad request: can't parse entities:")
+                    or "entity" in desc_lower
+                    or "entities" in desc_lower
+                ))
                 raise TelegramAPIError(method, status=status, rejected=True,
                                        retry_after=delay if type(delay) is int and delay > 0 else 0,
                                        invalid_markdown=invalid_markdown)
