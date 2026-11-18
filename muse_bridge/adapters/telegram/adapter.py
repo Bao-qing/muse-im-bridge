@@ -4,7 +4,8 @@ from __future__ import annotations
 import asyncio
 from pathlib import Path
 
-from ...core.message import Attachment, InboundMessage, MessageSource
+from ...core.delivery import DeliveryResult, ReactionEnvelope
+from ...core.message import Attachment, InboundMessage, InboundReaction, MessageSource
 from ...observability import get_logger
 from ..base import BaseAdapter
 from .client import TelegramAPIError, TelegramClient
@@ -77,6 +78,19 @@ def _attachments(message):
                              file_info=file_id)
 
 
+def _emoji_reactions(value):
+    if not isinstance(value, list):
+        return None
+    emojis = []
+    for reaction in value:
+        reaction = _object(reaction)
+        emoji = reaction.get("emoji")
+        if reaction.get("type") != "emoji" or not isinstance(emoji, str) or not emoji.strip():
+            return None
+        emojis.append(emoji)
+    return tuple(emojis)
+
+
 class TelegramAdapter(BaseAdapter):
     def __init__(self, config, *, transport=None):
         self.config = config
@@ -146,7 +160,29 @@ class TelegramAdapter(BaseAdapter):
             await asyncio.gather(task, return_exceptions=True)
         await self.client.close()
 
+    async def _handle_reaction(self, update_id, event):
+        chat, user = _object(event.get("chat")), _object(event.get("user"))
+        kind = {"private": "private", "group": "group", "supergroup": "group"}.get(chat.get("type"))
+        mid, target, sender = event.get("message_id"), chat.get("id"), user.get("id")
+        if (type(update_id) is not int or update_id <= 0 or type(mid) is not int or mid <= 0
+                or type(target) is not int or type(sender) is not int or sender <= 0
+                or user.get("is_bot") is not False or sender == self._bot_id or not kind or event.get("actor_chat")
+                or (kind == "private" and target != sender) or (kind == "group" and target >= 0)):
+            return "ignored"
+        old = _emoji_reactions(event.get("old_reaction"))
+        new = _emoji_reactions(event.get("new_reaction"))
+        if old is None or new is None:
+            return "ignored"
+        date = event.get("date")
+        return await self.emit_reaction(InboundReaction(
+            event_id=str(update_id), source=MessageSource(self.name, kind, str(target), str(sender)),
+            message_ref=("id", message_key(target, mid)), old_reactions=old, new_reactions=new,
+            timestamp=date if type(date) is int else 0,
+        ))
+
     async def _handle_update(self, update):
+        if "message_reaction" in update:
+            return await self._handle_reaction(update.get("update_id"), _object(update["message_reaction"]))
         message = _object(update.get("message"))
         chat, user = _object(message.get("chat")), _object(message.get("from"))
         kind = {"private": "private", "group": "group", "supergroup": "group"}.get(chat.get("type"))
@@ -184,3 +220,6 @@ class TelegramAdapter(BaseAdapter):
 
     async def deliver(self, envelope):
         return await self.sender.deliver(envelope)
+
+    async def deliver_reaction(self, envelope: ReactionEnvelope) -> DeliveryResult:
+        return await self.sender.deliver_reaction(envelope)

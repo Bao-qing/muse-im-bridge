@@ -37,6 +37,15 @@ class DeliveryEnvelope:
     fallback_target: str | None = None  # explicitly authorized by gateway policy
 
 
+@dataclass(frozen=True)
+class ReactionEnvelope:
+    delivery_id: str
+    target_type: str
+    target_id: str
+    message_ref: tuple[str, str]
+    reactions: tuple[str, ...]  # Complete desired state, including empty to clear.
+
+
 @dataclass
 class FeedEnvelope:
     post_id: str

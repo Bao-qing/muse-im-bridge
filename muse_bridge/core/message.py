@@ -51,6 +51,16 @@ class InboundMessage:
     mentioned: bool = False
 
 
+@dataclasses.dataclass(frozen=True)
+class InboundReaction:
+    event_id: str
+    source: MessageSource
+    message_ref: tuple[str, str]
+    old_reactions: tuple[str, ...]
+    new_reactions: tuple[str, ...]
+    timestamp: float = 0.0
+
+
 @dataclasses.dataclass
 class OutboundMessage:
     text: str = ""

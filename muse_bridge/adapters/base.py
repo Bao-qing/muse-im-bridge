@@ -4,13 +4,17 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from typing import Protocol
 
-from ..core.delivery import DeliveryEnvelope, DeliveryResult, DeliveryStatus, FeedEnvelope
-from ..core.message import Attachment, InboundMessage
+from ..core.delivery import DeliveryEnvelope, DeliveryResult, DeliveryStatus, FeedEnvelope, ReactionEnvelope
+from ..core.message import Attachment, InboundMessage, InboundReaction
 
 
 class AdapterHost(Protocol):
     async def accept(self, adapter: BaseAdapter, message: InboundMessage) -> str: ...
     def identity_changed(self, adapter: BaseAdapter) -> None: ...
+
+
+class ReactionHost(Protocol):
+    async def accept_reaction(self, adapter: BaseAdapter, event: InboundReaction) -> str: ...
 
 
 class BaseAdapter(ABC):
@@ -25,6 +29,13 @@ class BaseAdapter(ABC):
         if self.host is None:
             raise RuntimeError("Adapter must be mounted before receiving messages")
         return await self.host.accept(self, message)
+
+    async def emit_reaction(self, event: InboundReaction) -> str:
+        """Hand off a reaction independently of the ordinary message pipeline."""
+        if self.host is None:
+            raise RuntimeError("Adapter must be mounted before receiving reactions")
+        accept = getattr(self.host, "accept_reaction", None)
+        return await accept(self, event) if callable(accept) else "ignored"
 
     @property
     @abstractmethod
@@ -54,6 +65,9 @@ class BaseAdapter(ABC):
 
     @abstractmethod
     async def deliver(self, envelope: DeliveryEnvelope) -> DeliveryResult: ...
+
+    async def deliver_reaction(self, envelope: ReactionEnvelope) -> DeliveryResult:
+        return DeliveryResult(DeliveryStatus.REJECTED, reason="Native reactions not supported")
 
     def supports_native_feed(self) -> bool:
         """Whether this platform provides a dedicated feed/timeline surface."""

@@ -477,6 +477,8 @@ Telegram 默认关闭，仅支持官方 Bot API **长轮询**，不需要公网�
 - 同一个 Bot Token 只能由一个 `getUpdates` 实例持有，且不能同时配置 webhook。本程序不会自动移除 webhook 或清空积压更新。`proxy_url` 留空表示直连 `api.telegram.org`，不会读取系统代理环境变量；需要代理时填 HTTP(S) 代理地址，例如 `http://127.0.0.1:7890`。`poll_timeout_s` 默认 30 秒。
 - 测普通群时，在 `whitelist` 加入 Telegram **带负号的群 ID**（值为允许的数字用户 ID 列表，或明确写 `"*"` 放行全群）。`at` 处理可见的 `@bot`、针对本 bot 的命令或已关联的引用；Telegram Privacy Mode 可能不提交普通群消息，由平台决定，桥接配置不会扩大可见范围。暂不处理频道、论坛话题或消息编辑。
 - 支持纯文本、图片、文件、视频和原生回复引用。媒体受 Bot API 与本项目配置中较低的限制；图片、文件或视频附件需有可用文件内容。轮询状态保存在 `routes_file` 旁并按 bot ID 隔离；确定未提交的消息可重试，崩溃时结果不明的消息不会重放。
+- 机器人按 Telegram 原生 `MarkdownV2` 渲染可格式化的正文，不转换 Muse 的 Markdown 语法。比如 Telegram 用 `*粗体*`、`_斜体_`，部分标点必须转义。网关要求纯文本时不启用 Markdown；Telegram 明确拒绝解析的分段会原样改用纯文本发送，不重发已成功的分段。
+- 适配器已订阅用户的 `message_reaction`，也能按明确指令调用 `setMessageReaction` 设置或清除普通 emoji。当前网关尚未接线，收到的反应会丢弃，不会同步至 Muse；Muse 发出的反应暂时仍按现有方式显示为表情通知。
 
 ## 微信 iLink 适配器
 

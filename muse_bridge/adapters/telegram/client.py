@@ -15,12 +15,14 @@ _FILE_PATH = re.compile(r"[A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)*", re.ASCII)
 
 
 class TelegramAPIError(RuntimeError):
-    def __init__(self, method: str, *, status: int = 0, rejected: bool = False, retry_after: int = 0):
+    def __init__(self, method: str, *, status: int = 0, rejected: bool = False,
+                 retry_after: int = 0, invalid_markdown: bool = False):
         super().__init__(f"Telegram {method} {'rejected' if rejected else 'not confirmed'}"
                          + (f" (HTTP {status})" if status else ""))
         self.status = status
         self.rejected = rejected
         self.retry_after = retry_after
+        self.invalid_markdown = invalid_markdown
 
 
 class TelegramClient:
@@ -52,12 +54,17 @@ class TelegramClient:
                     and type(body.get("error_code")) is int and body["error_code"] == status):
                 hints = body.get("parameters")
                 delay = hints.get("retry_after") if isinstance(hints, dict) else None
+                description = body.get("description")
+                invalid_markdown = (method == "sendMessage" and status == 400
+                                    and isinstance(description, str)
+                                    and description.lower().startswith("bad request: can't parse entities:"))
                 raise TelegramAPIError(method, status=status, rejected=True,
-                                       retry_after=delay if type(delay) is int and delay > 0 else 0)
+                                       retry_after=delay if type(delay) is int and delay > 0 else 0,
+                                       invalid_markdown=invalid_markdown)
         raise TelegramAPIError(method, status=status)
 
     async def updates(self, offset: int | None, poll_timeout: int) -> list[dict]:
-        params = {"timeout": poll_timeout, "allowed_updates": ["message"]}
+        params = {"timeout": poll_timeout, "allowed_updates": ["message", "message_reaction"]}
         if offset is not None:
             params["offset"] = offset
         updates = await self.call("getUpdates", params,
