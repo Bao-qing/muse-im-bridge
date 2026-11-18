@@ -1,7 +1,5 @@
-"""Composition root: one business gateway, mounted platform drivers and optional jobs."""
+"""Composition root: one business gateway and mounted platform drivers."""
 from __future__ import annotations
-
-import asyncio
 
 from .adapters.onebot import OneBotAdapter
 from .adapters.qq import QQAdapter
@@ -26,20 +24,12 @@ class BridgeEngine:
         if config.wechat.enabled:
             from .adapters.wechat.adapter import WeChatAdapter
             self.adapters.append(self.gateway.mount(WeChatAdapter(config.wechat)))
-        self.jobs = []
-        if config.onebot.enabled and config.onebot.qzone_feed.enabled:
-            from .adapters.onebot.qzone import QzoneFeedWorker
-            adapter = next(a for a in self.adapters if a.name == "onebot")
-            self.jobs.append(QzoneFeedWorker(config.onebot.qzone_feed, adapter.client,
-                                            self.muse_service, max_image_bytes=config.onebot.max_image_bytes))
         self._running = False
-        self._job_tasks = []
 
     async def start(self):
         if not any(a.is_enabled for a in self.adapters):
             return
         self._running = True
-        self._job_tasks = [asyncio.create_task(job.run()) for job in self.jobs]
         try:
             await self.gateway.start()
         finally:
@@ -48,8 +38,3 @@ class BridgeEngine:
     async def stop(self):
         self._running = False
         await self.gateway.stop()
-        await asyncio.gather(*(job.stop() for job in self.jobs), return_exceptions=True)
-        for task in self._job_tasks:
-            task.cancel()
-        await asyncio.gather(*self._job_tasks, return_exceptions=True)
-        self._job_tasks = []

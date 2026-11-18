@@ -4,7 +4,7 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from typing import Protocol
 
-from ..core.delivery import DeliveryEnvelope, DeliveryResult
+from ..core.delivery import DeliveryEnvelope, DeliveryResult, DeliveryStatus, FeedEnvelope
 from ..core.message import Attachment, InboundMessage
 
 
@@ -54,6 +54,14 @@ class BaseAdapter(ABC):
 
     @abstractmethod
     async def deliver(self, envelope: DeliveryEnvelope) -> DeliveryResult: ...
+
+    def supports_native_feed(self) -> bool:
+        """Whether this platform provides a dedicated feed/timeline surface."""
+        return False
+
+    async def publish_feed(self, feed: FeedEnvelope) -> DeliveryResult:
+        """Publish a resolved feed post to the platform's native feed surface."""
+        return DeliveryResult(DeliveryStatus.REJECTED, reason="Native feed surface not supported")
 
     def activity_started(self, target: str, token: str) -> None:
         """Record activity synchronously before the intake awaitable returns."""

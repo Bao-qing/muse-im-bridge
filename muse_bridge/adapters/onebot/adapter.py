@@ -14,11 +14,12 @@ import re
 from typing import Dict, List, Optional, Tuple
 
 from ...config.models import OneBotConfig
+from ...core.delivery import DeliveryResult, DeliveryStatus, FeedEnvelope
 from ...core.identity import valid_id
 from ...core.message import Attachment, InboundMessage, MessageSource
 from ..base import BaseAdapter
 from ...observability import get_logger, safe_error
-from .client import OneBotClient
+from .client import OneBotAPIError, OneBotClient
 from .gateway import OneBotGateway
 from .outbound import OneBotSender
 
@@ -107,6 +108,25 @@ class OneBotAdapter(BaseAdapter):
 
     async def deliver(self, envelope):
         return await self.sender.deliver(envelope)
+
+    def supports_native_feed(self) -> bool:
+        return True
+
+    async def publish_feed(self, feed: FeedEnvelope) -> DeliveryResult:
+        try:
+            await asyncio.to_thread(
+                self.client.send_qzone_msg,
+                feed.text,
+                images=feed.images,
+                ugc_right=self.config.qzone_feed.ugc_right,
+            )
+        except OneBotAPIError as exc:
+            if type(exc.retcode) is int and exc.retcode != 0:
+                return DeliveryResult(DeliveryStatus.REJECTED, reason="OneBot Qzone refused")
+            return DeliveryResult(DeliveryStatus.UNKNOWN, reason="OneBot Qzone response outcome unknown")
+        except Exception:
+            return DeliveryResult(DeliveryStatus.UNKNOWN, reason="OneBot Qzone outcome unknown")
+        return DeliveryResult(DeliveryStatus.CONFIRMED)
 
     @property
     def name(self) -> str:

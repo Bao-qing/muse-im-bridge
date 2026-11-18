@@ -29,6 +29,7 @@ muse_bridge/
 │   │   ├── inbound.py        # 所有平台共用的命令、交互与 Muse 提交流水线
 │   │   ├── chat.py           # 网关拥有的账号上下文与业务仓库，不是适配器基类
 │   │   ├── muse_events.py    # 单一 Muse 订阅协调器、会话并集、独立投递队列
+│   │   ├── feed.py           # Muse 个人动态统一轮询、限流、预留账本与跨平台分发
 │   │   ├── delivery.py       # 因果路由、投递账本、真实平台回执关联
 │   │   ├── outbound.py       # Muse 历史处理、呈现渲染与订阅协议实现
 │   │   ├── interactions.py   # 登录、凭证、审批数字回复的输入路由
@@ -424,9 +425,11 @@ OneBot 与 QQ 走同一个 Gateway 层（`muse_bridge/gateway/`），会话隔�
 - **白名单**：与 QQ 同格式，QQ 号、群号写成字符串或数字均可；为空时拒绝所有聊天（旧版 OneBot 原型为空即放行，已改）。旧写法 `"groups": [群号]` 等价于这些群 `"*"`。
 - **审批卡与登录**：聊天审批卡只推送到拥有该会话的适配器，未绑定会话不广播管理员；后台审批统一按 `gateway.background_approval_push` 选择一个管理员私聊收件箱。`gateway.login_through_adapter` 设为 `"onebot"` 时，凭据失效的登录提醒发给 OneBot 管理员。
 
-### Muse 动态同步到 QQ 空间（可选）
+### Muse 动态同步（统一网关协调，支持 QQ 空间或私聊推送）
 
-需要 OneBot 后端支持 SnowLuma 的扩展动作 [`send_qzone_msg`](https://snowluma.github.io/zh/docs/api/qzone/send_qzone_msg)；**这不是 OneBot v11 标准接口，不保证普通 NapCat 版本支持**。只实现发表，不读取、点赞、评论或删除空间内容。客户端方法 `OneBotClient.send_qzone_msg(content, images=[...])` 支持纯文本及图文，图片源支持 HTTP(S)、`file://`、`base64://`，返回经校验的 `tid` / `time`。
+动态轮询、时间窗口、滚动配额与先落盘预留后发送的幂等账本统一由 `UnifiedGateway` 的 `GatewayFeedCoordinator` 管理：
+- **统一配置（推荐）**：可在 `gateway.feed` 中按平台配置投递模式（`"native"` 发往平台原生动态广场如 OneBot QQ 空间；`"chat"` 渲染为图文消息发往该平台管理员/扫码用户私聊；`"auto"` 有原生广场走原生，否则走私聊），多平台同时启用时上游 `GET /api/feed` 每轮只拉取一次，各渠道账本相互独立。
+- **OneBot 原有配置兼容**：`adapters.onebot.qzone_feed` 继续保留并完全兼容原有 `data/onebot_qzone_feed.local.json` 状态文件。原生 QQ 空间发表需要 OneBot 后端支持 SnowLuma 扩展动作 [`send_qzone_msg`](https://snowluma.github.io/zh/docs/api/qzone/send_qzone_msg)；**这不是 OneBot v11 标准接口，不保证普通 NapCat 版本支持**。只实现发表，不读取、点赞、评论或删除空间内容。客户端方法 `OneBotClient.send_qzone_msg(content, images=[...])` 支持纯文本及图文，图片源支持 HTTP(S)、`file://`、`base64://`，返回经校验的 `tid` / `time`。
 
 在 `adapters.onebot` 下增加以下配置，或在配置编辑器的 OneBot 分类选择 **15**。自动同步默认关闭；启用后会把当前登录 Muse 账号的个人动态正文、标题和图片发布到当前 OneBot 登录账号的空间，内容可能包含私人信息，请先检查可见范围。
 

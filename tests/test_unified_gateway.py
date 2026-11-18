@@ -545,14 +545,15 @@ class UnifiedGatewayCase(unittest.IsolatedAsyncioTestCase):
 
     def test_platform_modules_do_not_import_business_services(self):
         root = Path(__file__).resolve().parents[1] / "muse_bridge" / "adapters"
-        for platform in ("qq", "onebot", "wechat"):
-            for name in ("adapter.py", "outbound.py"):
-                tree = ast.parse((root / platform / name).read_text(encoding="utf-8"))
-                for node in ast.walk(tree):
-                    if isinstance(node, ast.ImportFrom):
-                        module = node.module or ""
-                        self.assertNotIn("gateway.chat", module)
-                        self.assertNotIn("gateway.outbound", module)
-                        self.assertNotIn("muse.service", module)
-                        self.assertNotIn("core.session_map", module)
-                        self.assertNotIn("core.interactions", module)
+        for py_file in root.rglob("*.py"):
+            tree = ast.parse(py_file.read_text(encoding="utf-8"))
+            for node in ast.walk(tree):
+                if isinstance(node, ast.ImportFrom):
+                    module = node.module or ""
+                    self.assertNotIn("gateway.chat", module)
+                    self.assertNotIn("gateway.outbound", module)
+                    self.assertNotIn("gateway.feed", module)
+                    self.assertNotIn("muse.", module)
+                    self.assertNotEqual("muse", module)
+                    self.assertNotIn("core.session_map", module)
+                    self.assertNotIn("core.interactions", module)

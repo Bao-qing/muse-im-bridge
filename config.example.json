@@ -91,7 +91,20 @@
   },
   "gateway": {
     "login_through_adapter": "qq",
-    "background_approval_push": ""
+    "background_approval_push": "",
+    "feed": {
+      "enabled": false,
+      "targets": {
+        "onebot": "native"
+      },
+      "poll_interval_s": 300,
+      "max_age_s": 3600,
+      "scan_limit": 50,
+      "max_per_scan": 3,
+      "min_publish_interval_s": 60,
+      "publish_window_s": 3600,
+      "max_per_window": 5
+    }
   },
   "logging": {
     "level": "INFO",

@@ -382,11 +382,49 @@ class WeChatConfig(ConversationConfig):
 
 
 @dataclasses.dataclass
+class GatewayFeedConfig:
+    """Gateway-owned Muse feed publishing across mounted adapters."""
+
+    enabled: bool = False
+    targets: Dict[str, str] = dataclasses.field(default_factory=dict)
+    poll_interval_s: int = 300
+    max_age_s: int = 3600
+    scan_limit: int = 50
+    max_per_scan: int = 3
+    min_publish_interval_s: int = 60
+    publish_window_s: int = 3600
+    max_per_window: int = 5
+
+    def __post_init__(self):
+        if type(self.enabled) is not bool:
+            raise ValueError("gateway.feed.enabled must be a boolean")
+        if not isinstance(self.targets, dict):
+            raise ValueError("gateway.feed.targets must be an object")
+        normalized: Dict[str, str] = {}
+        for key, mode in self.targets.items():
+            if key not in {"qq", "onebot", "wechat"}:
+                raise ValueError("gateway.feed.targets keys must be qq, onebot, or wechat")
+            if mode not in {"auto", "native", "chat"}:
+                raise ValueError("gateway.feed.targets values must be auto, native, or chat")
+            normalized[key] = mode
+        self.targets = normalized
+        for name in ("poll_interval_s", "max_age_s", "scan_limit", "max_per_scan",
+                     "min_publish_interval_s", "publish_window_s", "max_per_window"):
+            if type(getattr(self, name)) is not int or getattr(self, name) <= 0:
+                raise ValueError(f"gateway.feed.{name} must be a positive integer")
+        if self.scan_limit > 100 or self.max_per_scan > self.scan_limit:
+            raise ValueError("gateway.feed requires max_per_scan <= scan_limit <= 100")
+
+
+@dataclasses.dataclass
 class GatewayConfig:
     login_through_adapter: str = ""
     background_approval_push: str = ""
+    feed: GatewayFeedConfig = dataclasses.field(default_factory=GatewayFeedConfig)
 
     def __post_init__(self):
+        if not isinstance(self.feed, GatewayFeedConfig):
+            raise ValueError("gateway.feed must be a GatewayFeedConfig")
         value = self.background_approval_push
         if not isinstance(value, str):
             raise ValueError("gateway.background_approval_push must be a string")
@@ -680,9 +718,14 @@ class ConfigLoader:
         gw_raw = raw_data.get("gateway", {})
         if not isinstance(gw_raw, dict):
             raise ValueError("gateway must be an object")
+        gw_feed_raw = gw_raw.get("feed", {})
+        gw_feed_fields = {f.name for f in dataclasses.fields(GatewayFeedConfig)}
+        if not isinstance(gw_feed_raw, dict) or gw_feed_raw.keys() - gw_feed_fields:
+            raise ValueError("gateway.feed must be an object with known fields")
         gw_cfg = GatewayConfig(
             login_through_adapter=str(gw_raw.get("login_through_adapter", "")),
             background_approval_push=gw_raw.get("background_approval_push", ""),
+            feed=GatewayFeedConfig(**gw_feed_raw),
         )
 
         # 5. Logging config. An explicit level wins over legacy debug flags.

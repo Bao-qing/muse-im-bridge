@@ -16,7 +16,7 @@ UnifiedGateway ── InboundPipeline ── MuseService
         platform Sender ── DeliveryResult + native receipts
 ```
 
-`BridgeEngine` 只负责组装和启停，另行组装可选 QQ 空间任务。业务状态由网关拥有：账号上下文是仓库分片，不是独立网关，也不能启动 Muse 订阅。适配器不持有 Muse 服务、SessionMapper 或交互管理器，不继承业务类。
+`BridgeEngine` 只负责组装和启停。业务状态与上游轮询（包括 Muse 动态同步 `GatewayFeedCoordinator`）全部由网关拥有：账号上下文是仓库分片，不是独立网关，也不能启动 Muse 订阅。适配器不持有 Muse 服务、SessionMapper 或交互管理器，不继承业务类。
 
 MuseService 保留 token、RPC、附件上传、工作区文件和登录/凭证/审批协议。单一订阅协调器不是一条物理连接：账户级审批协议仍可使用独立连接。
 
@@ -26,6 +26,7 @@ MuseService 保留 token、RPC、附件上传、工作区文件和登录/凭证/
 - `account_identity()` / `prepare()`：可信实际账号身份；OneBot 不能把 API 地址当登录账号。
 - `download_attachment(...)`：平台鉴权、媒体描述符解密/下载，受类型大小上限约束。
 - `deliver(envelope)`：只发送网关已解析的目标和内容，返回状态与实际收件人/原生 ID。
+- `supports_native_feed()` / `publish_feed(feed)`：可选的平台原生动态广场投递（如 OneBot QQ 空间）；无原生广场或配置为 `chat` 模式时，由网关统一渲染并经 `deliver` 推送到该账号的 `notification_target()`。
 - `activity_started` / `activity(..., 'finished')`：平台输入状态，token 对适配器不透明。
 
 QQSender 拥有被动序号和主动配额，序号在请求前持久化。OneBotSender 编码原生消息段和引用。WeChatSenderTransport 使用原有分段投递账本，明确区分本次输入 token 快照与异步输出的最新 token。

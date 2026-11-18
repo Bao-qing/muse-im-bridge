@@ -1,5 +1,6 @@
-"""Offline safety and scheduling contracts for the opt-in Qzone feed worker."""
+"""Offline safety, scheduling and multi-platform routing contracts for gateway feed publishing."""
 import asyncio
+import base64
 import dataclasses
 import json
 from pathlib import Path
@@ -7,35 +8,61 @@ import tempfile
 import unittest
 from unittest import mock
 
-from muse_bridge.adapters.onebot.qzone import QzoneFeedWorker
-from muse_bridge.config.models import ConfigLoader, QzoneFeedConfig
+from muse_bridge.adapters.onebot.adapter import OneBotAdapter
+from muse_bridge.adapters.onebot.client import OneBotAPIError
+from muse_bridge.adapters.qq.adapter import QQAdapter
+from muse_bridge.config.models import (
+    AccessRequestsConfig, ConfigLoader, GatewayConfig, GatewayFeedConfig,
+    MuseConfig, OneBotConfig, QQConfig, QzoneFeedConfig,
+)
+from muse_bridge.core.interactions import InteractionManager
+from muse_bridge.gateway.feed import GatewayFeedCoordinator
+from muse_bridge.gateway.runtime import UnifiedGateway
 from muse_bridge.muse.feed import FeedPage, FeedPost
 
 
-class TestQzoneFeedWorker(unittest.IsolatedAsyncioTestCase):
+class TestGatewayFeedCoordinator(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
-        self.path = Path(self.temp.name) / "state.json"
+        self.root = Path(self.temp.name)
+        self.path = self.root / "state.json"
         self.now = 10000.0
         self.config = QzoneFeedConfig(enabled=True, state_file=str(self.path))
         self.client = mock.Mock()
         self.client.get_login_info.return_value = {"user_id": 123}
         self.service = mock.Mock()
+        self.service.config = MuseConfig(session_id="", cookies_file=str(self.root / "cookies.json"))
+        self.service.interactions = InteractionManager()
         self.service.list_feed.return_value = FeedPage("source", [])
         self.service.prepare_feed_images.side_effect = lambda post, limit: post.images
         self.worker = self.make_worker()
 
-    def make_worker(self):
-        worker = QzoneFeedWorker(self.config, self.client, self.service,
-                                 clock=lambda: self.now)
+    def make_worker(self, *, gateway_config=None):
+        ob_dir = self.root / "ob"
+        ob_cfg = OneBotConfig(
+            enabled=True,
+            base_url="http://127.0.0.1:3000",
+            admin_id=["999"],
+            qzone_feed=self.config,
+            routes_file=str(ob_dir / "routes.json"),
+            session_map_file=str(ob_dir / "sessions.json"),
+            push_state_file=str(ob_dir / "push.json"),
+            delivered_file=str(ob_dir / "delivered.jsonl"),
+            access_requests=AccessRequestsConfig(state_file=str(ob_dir / "access.json")),
+        )
+        gateway = UnifiedGateway(self.service, gateway_config)
+        adapter = OneBotAdapter(ob_cfg, client=self.client)
+        gateway.mount(adapter)
+        coordinator = GatewayFeedCoordinator(gateway, clock=lambda: self.now)
+        gateway.feed = coordinator
 
         async def advance(seconds):
             self.now += seconds
             return True
 
-        worker._wait = mock.AsyncMock(side_effect=advance)
-        return worker
+        coordinator._wait = mock.AsyncMock(side_effect=advance)
+        return coordinator
 
     def posts(self, *posts):
         self.service.list_feed.return_value = FeedPage("source", list(posts))
@@ -48,8 +75,8 @@ class TestQzoneFeedWorker(unittest.IsolatedAsyncioTestCase):
 
     async def test_disabled_has_no_calls_or_state_io(self):
         self.config.enabled = False
-        with mock.patch.object(self.worker, "_load") as load, \
-                mock.patch.object(self.worker, "_save") as save:
+        with mock.patch.object(GatewayFeedCoordinator, "_load") as load, \
+                mock.patch.object(GatewayFeedCoordinator, "_save") as save:
             self.assertEqual(await self.worker.scan_once(), 0)
             await self.worker.run()
         self.client.assert_not_called()
@@ -61,7 +88,20 @@ class TestQzoneFeedWorker(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(self.path.exists())
 
     async def test_startup_scans_immediately_and_shutdown_interrupts_poll(self):
-        worker = QzoneFeedWorker(self.config, self.client, self.service)
+        ob_dir = self.root / "startup-ob"
+        ob_cfg = OneBotConfig(
+            enabled=True,
+            base_url="http://127.0.0.1:3000",
+            qzone_feed=self.config,
+            routes_file=str(ob_dir / "routes.json"),
+            session_map_file=str(ob_dir / "sessions.json"),
+            push_state_file=str(ob_dir / "push.json"),
+            delivered_file=str(ob_dir / "delivered.jsonl"),
+            access_requests=AccessRequestsConfig(state_file=str(ob_dir / "access.json")),
+        )
+        gateway = UnifiedGateway(self.service)
+        gateway.mount(OneBotAdapter(ob_cfg, client=self.client))
+        worker = gateway.feed
         entered_wait = asyncio.Event()
         original_wait = worker._wait
 
@@ -154,19 +194,19 @@ class TestQzoneFeedWorker(unittest.IsolatedAsyncioTestCase):
 
     async def test_persistence_failure_prevents_send(self):
         self.posts(self.post("one"))
-        with mock.patch.object(self.worker, "_save", side_effect=OSError("disk full")):
+        with mock.patch.object(GatewayFeedCoordinator, "_save", side_effect=OSError("disk full")):
             with self.assertRaises(OSError):
                 await self.worker.scan_once()
         self.client.send_qzone_msg.assert_not_called()
 
     async def test_send_failure_or_uncertain_outcome_is_reserved_after_restart(self):
         self.posts(self.post("one"))
-        for error in (RuntimeError("rejected"), TimeoutError("outcome unknown")):
+        for error in (OneBotAPIError("send_qzone_msg", 100), TimeoutError("outcome unknown")):
             with self.subTest(error=error):
                 self.path.unlink(missing_ok=True)
                 self.client.send_qzone_msg.reset_mock()
                 self.client.send_qzone_msg.side_effect = error
-                with self.assertRaises(type(error)):
+                with self.assertRaises(RuntimeError):
                     await self.make_worker().scan_once()
                 self.assertIn("one", json.loads(self.path.read_text())["attempts"])
                 self.client.send_qzone_msg.side_effect = None
@@ -200,8 +240,85 @@ class TestQzoneFeedWorker(unittest.IsolatedAsyncioTestCase):
         self.client.send_qzone_msg.assert_not_called()
         self.assertFalse(self.path.exists())
 
+    async def test_multi_platform_feed_polls_once_and_routes_native_vs_chat(self):
+        png_raw = b"\x89PNG\r\n\x1a\nfictional"
+        b64_img = "base64://" + base64.b64encode(png_raw).decode("ascii")
+        self.posts(self.post("p1", text="今日随想", images=[b64_img]))
 
-class TestQzoneFeedConfig(unittest.TestCase):
+        gw_cfg = GatewayConfig(
+            feed=GatewayFeedConfig(enabled=True, targets={"onebot": "native", "qq": "auto"}),
+        )
+        gateway = UnifiedGateway(self.service, gw_cfg)
+        ob_dir = self.root / "multi-ob"
+        ob_cfg = OneBotConfig(
+            enabled=True, base_url="http://127.0.0.1:3000", admin_id=["999"],
+            qzone_feed=QzoneFeedConfig(enabled=False, ugc_right=64, state_file=str(self.path)),
+            routes_file=str(ob_dir / "routes.json"),
+            session_map_file=str(ob_dir / "sessions.json"),
+            push_state_file=str(ob_dir / "push.json"),
+            delivered_file=str(ob_dir / "delivered.jsonl"),
+            access_requests=AccessRequestsConfig(state_file=str(ob_dir / "access.json")),
+        )
+        qq_dir = self.root / "multi-qq"
+        qq_client = mock.Mock(
+            send_message=mock.Mock(return_value=(200, {"id": "qq-feed-msg"})),
+            upload_media=mock.Mock(return_value="qq-file-info"),
+        )
+        qq_cfg = QQConfig(
+            enabled=True, app_id="qq-app", app_secret="sec", admin_id=["qq-admin"],
+            routes_file=str(qq_dir / "routes.json"),
+            session_map_file=str(qq_dir / "sessions.json"),
+            push_state_file=str(qq_dir / "push.json"),
+            delivered_file=str(qq_dir / "delivered.jsonl"),
+            access_requests=AccessRequestsConfig(state_file=str(qq_dir / "access.json")),
+        )
+        gateway.mount(OneBotAdapter(ob_cfg, client=self.client))
+        gateway.mount(QQAdapter(qq_cfg, client=qq_client))
+        gateway.feed.clock = lambda: self.now
+
+        published = await gateway.feed.scan_once()
+        self.assertEqual(published, 2)
+        # Single upstream poll and single image preparation across both targets.
+        self.service.list_feed.assert_called_once_with(50)
+        self.service.prepare_feed_images.assert_called_once()
+        # OneBot used native Qzone with its platform-specific ugc_right.
+        self.client.send_qzone_msg.assert_called_once_with("今日随想", images=[b64_img], ugc_right=64)
+        # QQ auto-resolved to private chat notification_target with rendered text + uploaded PNG.
+        qq_client.upload_media.assert_called_once_with("private", "qq-admin", png_raw, 1, "feed-1.png")
+        self.assertEqual(qq_client.send_message.call_count, 2)
+        self.assertIn("【动态】\n今日随想", qq_client.send_message.call_args_list[0].args[2])
+
+        # Second scan sends nothing on either target.
+        self.assertEqual(await gateway.feed.scan_once(), 0)
+
+    async def test_onebot_can_route_feed_to_private_chat_instead_of_qzone(self):
+        self.posts(self.post("p-chat", text="转私聊动态"))
+        self.client.send_msg.return_value = {"message_id": 77}
+        gw_cfg = GatewayConfig(feed=GatewayFeedConfig(enabled=True, targets={"onebot": "chat"}))
+        worker = self.make_worker(gateway_config=gw_cfg)
+        self.assertEqual(await worker.scan_once(), 1)
+        self.client.send_qzone_msg.assert_not_called()
+        self.client.send_msg.assert_called_once()
+        self.assertEqual(self.client.send_msg.call_args.args[:2], ("private", "999"))
+
+    async def test_native_mode_on_adapter_without_native_feed_fails_closed(self):
+        gw_cfg = GatewayConfig(feed=GatewayFeedConfig(enabled=True, targets={"qq": "native"}))
+        gateway = UnifiedGateway(self.service, gw_cfg)
+        qq_dir = self.root / "bad-qq"
+        qq_cfg = QQConfig(
+            enabled=True, app_id="qq-app", app_secret="sec", admin_id=["qq-admin"],
+            routes_file=str(qq_dir / "routes.json"),
+            session_map_file=str(qq_dir / "sessions.json"),
+            push_state_file=str(qq_dir / "push.json"),
+            delivered_file=str(qq_dir / "delivered.jsonl"),
+            access_requests=AccessRequestsConfig(state_file=str(qq_dir / "access.json")),
+        )
+        gateway.mount(QQAdapter(qq_cfg, client=mock.Mock()))
+        with self.assertRaises(ValueError):
+            await gateway.feed.scan_once()
+
+
+class TestQzoneAndGatewayFeedConfig(unittest.TestCase):
     def test_defaults_are_opt_in_and_bounded(self):
         self.assertEqual(dataclasses.asdict(QzoneFeedConfig()), {
             "enabled": False, "poll_interval_s": 300, "max_age_s": 3600,
@@ -209,13 +326,21 @@ class TestQzoneFeedConfig(unittest.TestCase):
             "publish_window_s": 3600, "max_per_window": 5, "ugc_right": 4,
             "state_file": "data/onebot_qzone_feed.local.json",
         })
+        self.assertEqual(dataclasses.asdict(GatewayFeedConfig()), {
+            "enabled": False, "targets": {}, "poll_interval_s": 300, "max_age_s": 3600,
+            "scan_limit": 50, "max_per_scan": 3, "min_publish_interval_s": 60,
+            "publish_window_s": 3600, "max_per_window": 5,
+        })
 
     def test_enabled_is_strict_boolean(self):
         for value in (0, 1, "true", "false", None, [], {}):
             with self.subTest(value=value), self.assertRaises(ValueError):
                 QzoneFeedConfig(enabled=value)
+            with self.subTest(gw_value=value), self.assertRaises(ValueError):
+                GatewayFeedConfig(enabled=value)
         for value in (True, False):
             self.assertIs(QzoneFeedConfig(enabled=value).enabled, value)
+            self.assertIs(GatewayFeedConfig(enabled=value).enabled, value)
 
     def test_positive_integers_are_strict(self):
         for name in ("poll_interval_s", "max_age_s", "scan_limit", "max_per_scan",
@@ -223,13 +348,18 @@ class TestQzoneFeedConfig(unittest.TestCase):
             for value in (True, False, 0, -1, 1.0, "1", None):
                 with self.subTest(name=name, value=value), self.assertRaises(ValueError):
                     QzoneFeedConfig(**{name: value})
+                with self.subTest(gw_name=name, value=value), self.assertRaises(ValueError):
+                    GatewayFeedConfig(**{name: value})
 
-    def test_bounds_permissions_and_state_path(self):
+    def test_bounds_permissions_targets_and_state_path(self):
         for kwargs in ({"scan_limit": 101}, {"scan_limit": 2, "max_per_scan": 3},
                        *({"ugc_right": v} for v in (True, 1.0, "4", 0, 16, 128)),
                        *({"state_file": v} for v in (None, "", " \n", 123))):
             with self.subTest(kwargs=kwargs), self.assertRaises(ValueError):
                 QzoneFeedConfig(**kwargs)
+        for bad_targets in ({"telegram": "chat"}, {"qq": "moments"}, ["qq"], "qq"):
+            with self.subTest(targets=bad_targets), self.assertRaises(ValueError):
+                GatewayFeedConfig(targets=bad_targets)
         for permission in (1, 4, 64):
             self.assertEqual(QzoneFeedConfig(ugc_right=permission).ugc_right, permission)
 
@@ -238,7 +368,6 @@ class TestQzoneFeedConfig(unittest.TestCase):
                 mock.patch("muse_bridge.config.models._detect_egress_ip",
                            side_effect=AssertionError("must not detect egress")) as detect:
             path = Path(directory) / "config.json"
-            # Isolate the optional cwd-relative const.json without changing cwd.
             original_exists = __import__("os").path.exists
             with mock.patch("muse_bridge.config.models.os.path.exists",
                             side_effect=lambda p: False if p == "const.json" else original_exists(p)):
@@ -254,6 +383,12 @@ class TestQzoneFeedConfig(unittest.TestCase):
                         else:
                             with self.assertRaises(ValueError):
                                 ConfigLoader.load(str(path))
+                path.write_text(json.dumps({
+                    "muse": {"client_ip": "127.0.0.1"},
+                    "gateway": {"feed": {"enabled": True, "targets": {"qq": "chat", "onebot": "native"}}},
+                }), encoding="utf-8")
+                gw_loaded = ConfigLoader.load(str(path)).gateway.feed
+                self.assertEqual(gw_loaded.targets, {"qq": "chat", "onebot": "native"})
             detect.assert_not_called()
 
 

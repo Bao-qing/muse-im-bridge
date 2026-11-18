@@ -14,6 +14,7 @@ from ..core.state_file import atomic_json_write
 from ..muse.interactions import LOGIN_RELOGIN_NOTICE
 from ..observability import get_logger, safe_error
 from .chat import ChannelContext
+from .feed import GatewayFeedCoordinator
 from .inbound import InboundPipeline
 from .muse_events import MuseEventPump
 
@@ -27,6 +28,7 @@ class UnifiedGateway:
         self.adapters = {}
         self.contexts = {}
         self.pipeline = InboundPipeline()
+        self.feed = GatewayFeedCoordinator(self)
         self.events = None
         self._channel_locks = {}
         self._session_locks = {}
@@ -262,6 +264,8 @@ class UnifiedGateway:
             tasks = [self._spawn(a.start()) for a in self.adapters.values() if a.is_enabled]
             tasks += [self._spawn(self._run_events()), self._spawn(
                 self.muse_service.interaction_protocol.run(self.notify_interaction, lambda: self._running))]
+            if self.feed.is_enabled:
+                tasks.append(self._spawn(self.feed.run()))
             if not ready and not await asyncio.to_thread(self.muse_service.token_manager.has_credentials):
                 tasks.append(self._spawn(self._startup_login_notice()))
             await asyncio.gather(*tasks)
@@ -275,6 +279,7 @@ class UnifiedGateway:
             return
         self._stopping = True
         self._running = False
+        await self.feed.stop()
         if self.events is not None:
             await self.events.stop()
         current = asyncio.current_task()

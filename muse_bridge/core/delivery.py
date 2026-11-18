@@ -37,6 +37,14 @@ class DeliveryEnvelope:
     fallback_target: str | None = None  # explicitly authorized by gateway policy
 
 
+@dataclass
+class FeedEnvelope:
+    post_id: str
+    text: str
+    images: list[str] = field(default_factory=list)
+    created_at: float = 0.0
+
+
 @dataclass(frozen=True)
 class DeliveryReceipt:
     target_type: str
