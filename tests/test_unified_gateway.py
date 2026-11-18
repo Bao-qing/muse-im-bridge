@@ -53,7 +53,7 @@ class Driver(BaseAdapter):
         return DeliveryResult(self.status, [DeliveryReceipt(
             envelope.target_type, envelope.target_id, (("id", f"receipt-{len(self.sent)}"),))])
 
-    async def activity(self, target, token, state):
+    async def activity(self, target, token, state, *, kind="private"):
         self.signals.append((target, token, state))
 
 
@@ -580,6 +580,52 @@ class UnifiedGatewayCase(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(driver.sent), 2)
         self.assertEqual(driver.sent[1].text, "【提示】视频超过当前渠道发送上限（10MB），无法直接发送。")
         self.assertTrue(ctx.deduplicator.is_delivered("url-vid-1"))
+
+    async def test_event_pump_finishes_turn_after_queued_delivery_completes(self):
+        driver, ctx = self.driver("onebot", "ob-acc")
+        ctx.session_mapper.bind("private", "u", "session")
+        ctx.outbound_pusher._gated.add("session")
+        order = []
+        deliver_started = asyncio.Event()
+        deliver_release = asyncio.Event()
+
+        async def slow_deliver(envelope):
+            order.append("deliver:start")
+            deliver_started.set()
+            await deliver_release.wait()
+            order.append("deliver:end")
+            return DeliveryResult(
+                DeliveryStatus.CONFIRMED,
+                [DeliveryReceipt("private", "u", (("id", "r-1"),))],
+            )
+
+        async def record_activity(target, token, state, *, kind="private"):
+            order.append(f"activity:{kind}:{target}:{state}")
+
+        driver.deliver = slow_deliver
+        driver.activity = record_activity
+        pump = MuseEventPump(self.gateway)
+        try:
+            reply_event = {
+                "role": "assistant",
+                "event_name": "message.assistant",
+                "message_id": "reply-1",
+                "seq": 1,
+                "display_text": "done",
+                "payload": {"status": "completed"},
+            }
+            await pump._hydrate_and_dispatch("session", [reply_event], is_initial_gate=False)
+            await pump.on_turn_finished("session")
+            await deliver_started.wait()
+            # Typing must NOT finish while slow platform delivery is still in progress
+            self.assertEqual(order, ["deliver:start"])
+            deliver_release.set()
+            await asyncio.wait_for(pump._queues[ctx].join(), 3)
+            self.assertEqual(order, ["deliver:start", "deliver:end", "activity:private:u:finished"])
+        finally:
+            for task in pump._workers.values():
+                task.cancel()
+            await asyncio.gather(*pump._workers.values(), return_exceptions=True)
 
     def test_platform_modules_do_not_import_business_services(self):
         root = Path(__file__).resolve().parents[1] / "muse_bridge" / "adapters"

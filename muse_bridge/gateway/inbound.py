@@ -116,7 +116,7 @@ class InboundPipeline:
             if content.split(None, 1)[0:1] == ["/stop"]:
                 sid = ctx.session_mapper.current(target_type, target_id)
                 if sid:
-                    await ctx.adapter.activity(target_id, sid, "finished")
+                    await ctx.adapter.activity(target_id, sid, "finished", kind=target_type)
 
     async def _run_command(self, ctx, parsed, target_type, target_id, msg_id, can_manage) -> None:
         cmd_name, cmd_args = parsed
@@ -152,7 +152,7 @@ class InboundPipeline:
                 ctx.muse_service.config.session_id,
             )
             if cmd_name in {"stop", "delete", "archive"} or new_sid != chat_session_id:
-                await ctx.adapter.activity(target_id, chat_session_id, "finished")
+                await ctx.adapter.activity(target_id, chat_session_id, "finished", kind=target_type)
             if new_sid != chat_session_id:
                 ctx.session_mapper.bind(target_type, target_id, new_sid)
                 if cmd_name == "new":
@@ -186,111 +186,122 @@ class InboundPipeline:
     async def _forward(self, ctx, target_type, target_id, content, attachments, msg_id, can_manage, references=(), event=None) -> str:
         """handled: consumed; unknown: POST may have run; retryable: no POST attempted."""
         post_started = False
+        turn_tracked = False
         session_id = ""
         loop = asyncio.get_running_loop()
         quote = {}
+        intake_token = f"intake:{msg_id or id(event)}"
+        intake_started = not content.startswith("/")
 
         own_references = [("id", msg_id)] if msg_id else []
         own_references.extend((event or {}).get("own_references", ()))
 
-        # Download attachments if any
-        for att in attachments:
-            if (att.url or att.file_info) and not att.data:
-                max_cap = (
-                    ctx.config.max_video_bytes if att.type == "video"
-                    else ctx.config.max_file_bytes if att.type == "file"
-                    else ctx.config.max_image_bytes
-                )
-                try:
-                    att.data = await ctx.download_attachment(att, max_cap)
-                except Exception as e:
-                    logger.warning('Attachment download failed: %s', safe_error(e))
-                    content += f"\n[{att.type}下载失败]"
-
+        if intake_started:
+            ctx.adapter.activity_started(target_id, intake_token, kind=target_type)
         try:
-            # Preserve the legacy admin main-session binding, not every personal chat.
-            if (ctx.seed_main and target_type == "private" and isinstance(ctx.config, ChatConfig)
-                    and can_manage and ctx.muse_service.config.session_id):
-                if not ctx.session_mapper.current("private", target_id):
-                    ctx.session_mapper.bind("private", target_id, ctx.muse_service.config.session_id)
+            # Download attachments if any
+            for att in attachments:
+                if (att.url or att.file_info) and not att.data:
+                    max_cap = (
+                        ctx.config.max_video_bytes if att.type == "video"
+                        else ctx.config.max_file_bytes if att.type == "file"
+                        else ctx.config.max_image_bytes
+                    )
+                    try:
+                        att.data = await ctx.download_attachment(att, max_cap)
+                    except Exception as e:
+                        logger.warning('Attachment download failed: %s', safe_error(e))
+                        content += f"\n[{att.type}下载失败]"
 
-            # Resolve which Muse session this chat talks to
-            session_id, created = ctx.session_mapper.resolve(target_type, target_id)
-            if created:
-                ctx.outbound_pusher.track_session(session_id, fresh=True)
-                logger.info('New isolated Muse session %s for %s:%s', session_id, target_type, target_id)
-            else:
-                # Pre-bound / restored session: baseline once so old history is never replayed
-                await ctx.outbound_pusher.ensure_baseline(session_id)
+            try:
+                # Preserve the legacy admin main-session binding, not every personal chat.
+                if (ctx.seed_main and target_type == "private" and isinstance(ctx.config, ChatConfig)
+                        and can_manage and ctx.muse_service.config.session_id):
+                    if not ctx.session_mapper.current("private", target_id):
+                        ctx.session_mapper.bind("private", target_id, ctx.muse_service.config.session_id)
 
-            reference = ctx.outbound_pusher.reference_store.resolve_channel(
-                session_id, target_type, target_id, references)
-            quote = {}
-            if reference:
-                if reference.reply_target:
-                    quote["reply_to_target"] = reference.reply_target
+                # Resolve which Muse session this chat talks to
+                session_id, created = ctx.session_mapper.resolve(target_type, target_id)
+                if created:
+                    ctx.outbound_pusher.track_session(session_id, fresh=True)
+                    logger.info('New isolated Muse session %s for %s:%s', session_id, target_type, target_id)
                 else:
-                    quote["in_reply_to"] = reference.muse_id
-            elif references:
-                content = "【引用消息未关联到当前会话】" + chr(10) + content
+                    # Pre-bound / restored session: baseline once so old history is never replayed
+                    await ctx.outbound_pusher.ensure_baseline(session_id)
 
-            # Post message to Muse in strict chronological order
-            post_started = True
-            sent_mid = await asyncio.to_thread(
-                ctx.muse_service.post_message, session_id, content, attachments,
-                ctx.config.file_ref_threshold_bytes, **quote)
-            if sent_mid and msg_id:
-                ctx.outbound_pusher.reference_store.remember(
-                    session_id, target_type, target_id, sent_mid, own_references, content)
-            ctx.outbound_pusher.track_session(session_id)
+                reference = ctx.outbound_pusher.reference_store.resolve_channel(
+                    session_id, target_type, target_id, references)
+                quote = {}
+                if reference:
+                    if reference.reply_target:
+                        quote["reply_to_target"] = reference.reply_target
+                    else:
+                        quote["in_reply_to"] = reference.muse_id
+                elif references:
+                    content = "【引用消息未关联到当前会话】" + chr(10) + content
 
-            # Preserve causal ownership independently of passive route lifetime.
-            ctx.outbound_pusher.remember_origin(session_id, sent_mid, target_type, target_id)
-            ctx.route_manager.register(sent_mid, target_type, target_id, msg_id)
-            logger.debug('Message delivered to Muse (mid=%s), route registered for %s:%s', sent_mid, target_type, target_id)
-            trace_event(f"{ctx.name}.adapter", "route.registered", session_id=session_id, sent_mid=sent_mid,
-                        target_type=target_type, target_id=target_id, msg_id=msg_id)
-            return "handled" if sent_mid else "unknown"
-        except ApprovalBlocked as e:
-            await ctx.send_reply(target_type, target_id, str(e), msg_id)
-            return "handled"
-        except Exception as e:
-            if isinstance(e, LoginRequired):
-                logger.warning('Cookie 会话不可用，需要重新登录。 error=%s', safe_error(e))
-                ctx.enter_login_mode()
-                target = ctx.notification_target()
-                if target_type == "private" and can_manage:
-                    reply = "Muse 登录已失效，请发送 /登录 或 /登录 <邮箱> 重新登录。"
-                else:
-                    reply = "Muse 登录已失效，已通知管理员重新登录。"
-                    if target and (target_type != "private" or target_id != target):
-                        loop.call_soon(asyncio.create_task, ctx._notify_admin_login(target))
-                await ctx.send_reply(target_type, target_id, reply, msg_id)
+                # Post message to Muse in strict chronological order
+                post_started = True
+                sent_mid = await asyncio.to_thread(
+                    ctx.muse_service.post_message, session_id, content, attachments,
+                    ctx.config.file_ref_threshold_bytes, **quote)
+                if sent_mid and msg_id:
+                    ctx.outbound_pusher.reference_store.remember(
+                        session_id, target_type, target_id, sent_mid, own_references, content)
+                ctx.outbound_pusher.track_session(session_id)
+                turn_tracked = True
+
+                # Preserve causal ownership independently of passive route lifetime.
+                ctx.outbound_pusher.remember_origin(session_id, sent_mid, target_type, target_id)
+                ctx.route_manager.register(sent_mid, target_type, target_id, msg_id)
+                logger.debug('Message delivered to Muse (mid=%s), route registered for %s:%s', sent_mid, target_type, target_id)
+                trace_event(f"{ctx.name}.adapter", "route.registered", session_id=session_id, sent_mid=sent_mid,
+                            target_type=target_type, target_id=target_id, msg_id=msg_id)
+                return "handled" if sent_mid else "unknown"
+            except ApprovalBlocked as e:
+                await ctx.send_reply(target_type, target_id, str(e), msg_id)
+                return "handled"
+            except Exception as e:
+                if isinstance(e, LoginRequired):
+                    logger.warning('Cookie 会话不可用，需要重新登录。 error=%s', safe_error(e))
+                    ctx.enter_login_mode()
+                    target = ctx.notification_target()
+                    if target_type == "private" and can_manage:
+                        reply = "Muse 登录已失效，请发送 /登录 或 /登录 <邮箱> 重新登录。"
+                    else:
+                        reply = "Muse 登录已失效，已通知管理员重新登录。"
+                        if target and (target_type != "private" or target_id != target):
+                            loop.call_soon(asyncio.create_task, ctx._notify_admin_login(target))
+                    await ctx.send_reply(target_type, target_id, reply, msg_id)
+                    return "unknown" if post_started else "retryable"
+                if post_started and not quote and ctx.can_recreate_session(e):
+                    # Preserve legacy recovery only for an explicit session rejection.
+                    # A failed recovery POST is never replayed again.
+                    try:
+                        new_sid = ctx.session_mapper.new_session(target_type, target_id)
+                        ctx.outbound_pusher.track_session(new_sid, fresh=True)
+                        sent_mid = await asyncio.to_thread(
+                            ctx.muse_service.post_message, new_sid, content, attachments,
+                            ctx.config.file_ref_threshold_bytes)
+                        if sent_mid and msg_id:
+                            ctx.outbound_pusher.reference_store.remember(
+                                new_sid, target_type, target_id, sent_mid, own_references, content)
+                        ctx.outbound_pusher.track_session(new_sid)
+                        turn_tracked = True
+                        ctx.outbound_pusher.remember_origin(new_sid, sent_mid, target_type, target_id)
+                        ctx.route_manager.register(sent_mid, target_type, target_id, msg_id)
+                        return "handled" if sent_mid else "unknown"
+                    except Exception as recovery_error:
+                        logger.error('Missing-session recovery unconfirmed: %s', safe_error(recovery_error))
+                        await ctx.send_command_output(target_type, target_id,
+                            "消息结果未能确认，没有重复发送，请稍后核对。", msg_id)
+                        return "unknown"
+                # Transport failures and unclassified errors never replay user input.
+                logger.error('Failed to post message to Muse: %s', safe_error(e))
+                await ctx.send_reply(target_type, target_id,
+                    "连接暂时不可用，消息可能已发送，请稍后核对。" if post_started
+                    else "连接暂时不可用，消息尚未发送，请稍后重试。", msg_id)
                 return "unknown" if post_started else "retryable"
-            if post_started and not quote and ctx.can_recreate_session(e):
-                # Preserve legacy recovery only for an explicit session rejection.
-                # A failed recovery POST is never replayed again.
-                try:
-                    new_sid = ctx.session_mapper.new_session(target_type, target_id)
-                    ctx.outbound_pusher.track_session(new_sid, fresh=True)
-                    sent_mid = await asyncio.to_thread(
-                        ctx.muse_service.post_message, new_sid, content, attachments,
-                        ctx.config.file_ref_threshold_bytes)
-                    if sent_mid and msg_id:
-                        ctx.outbound_pusher.reference_store.remember(
-                            new_sid, target_type, target_id, sent_mid, own_references, content)
-                    ctx.outbound_pusher.track_session(new_sid)
-                    ctx.outbound_pusher.remember_origin(new_sid, sent_mid, target_type, target_id)
-                    ctx.route_manager.register(sent_mid, target_type, target_id, msg_id)
-                    return "handled" if sent_mid else "unknown"
-                except Exception as recovery_error:
-                    logger.error('Missing-session recovery unconfirmed: %s', safe_error(recovery_error))
-                    await ctx.send_command_output(target_type, target_id,
-                        "消息结果未能确认，没有重复发送，请稍后核对。", msg_id)
-                    return "unknown"
-            # Transport failures and unclassified errors never replay user input.
-            logger.error('Failed to post message to Muse: %s', safe_error(e))
-            await ctx.send_reply(target_type, target_id,
-                "连接暂时不可用，消息可能已发送，请稍后核对。" if post_started
-                else "连接暂时不可用，消息尚未发送，请稍后重试。", msg_id)
-            return "unknown" if post_started else "retryable"
+        finally:
+            if intake_started and not turn_tracked:
+                await ctx.adapter.activity(target_id, intake_token, "finished", kind=target_type)

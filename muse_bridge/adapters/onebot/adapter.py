@@ -11,6 +11,7 @@ import asyncio
 import base64
 import mimetypes
 import re
+import time
 from typing import Dict, List, Optional, Tuple
 
 from ...config.models import OneBotConfig
@@ -28,6 +29,8 @@ logger = get_logger(__name__)
 _CQ_RE = re.compile(r"\[CQ:[^\]]*\]")
 _CQ_AT_RE = re.compile(r"\[CQ:at,qq=(\d+|all)[^\]]*\]")
 _CQ_REPLY_RE = re.compile(r"\[CQ:reply,id=(-?\d+)[^\]]*\]")
+_TYPING_MAX_SECONDS = 600.0
+_TYPING_INTERVAL_SECONDS = 5.0
 
 
 def _default_ws_url(base_url: str) -> str:
@@ -103,11 +106,96 @@ class OneBotAdapter(BaseAdapter):
         self.self_id: Optional[str] = None
         # file_id -> group id of a received group file (get_group_file_url needs it).
         self._file_groups: Dict[str, str] = {}
+        self._typing_tasks: Dict[str, asyncio.Task] = {}
+        self._typing_sessions: Dict[str, str] = {}
+        self._typing_deadlines: Dict[str, float] = {}
+        self._typing_retry: Dict[str, Tuple[float, float]] = {}
+
     def account_identity(self):
         return self.self_id or ""
 
     async def deliver(self, envelope):
         return await self.sender.deliver(envelope)
+
+    def activity_started(self, target: str, token: str, *, kind: str = "private") -> None:
+        if kind != "private" or not self.config.typing_enabled or not target:
+            return
+        if token.startswith("intake:"):
+            self._typing_sessions.setdefault(target, token)
+        else:
+            self._typing_sessions[target] = token
+        self._ensure_typing(target)
+
+    async def activity(self, target: str, token: str, state: str, *, kind: str = "private") -> None:
+        if kind != "private" or not target:
+            return
+        if state == "started" and self.config.typing_enabled:
+            if token.startswith("intake:"):
+                self._typing_sessions.setdefault(target, token)
+            else:
+                self._typing_sessions[target] = token
+            self._ensure_typing(target)
+        elif state == "finished" and self._typing_sessions.get(target) == token:
+            await self._stop_typing(target)
+
+    def _ensure_typing(self, user: str) -> None:
+        self._typing_deadlines[user] = time.monotonic() + _TYPING_MAX_SECONDS
+        existing = self._typing_tasks.get(user)
+        if existing and not existing.done():
+            return
+        self._typing_tasks[user] = asyncio.create_task(self._typing(user))
+
+    async def _stop_typing(self, user: str) -> None:
+        self._typing_sessions.pop(user, None)
+        self._typing_deadlines.pop(user, None)
+        task = self._typing_tasks.pop(user, None)
+        if task and not task.done():
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
+    async def _send_input_status(self, user: str, event_type: int, timeout: int = 5) -> None:
+        await asyncio.to_thread(self.client.set_input_status, user, event_type, timeout)
+
+    async def _typing(self, user: str) -> None:
+        attempted_active = False
+        failed_active = False
+        now = time.monotonic()
+        retry_at, delay = self._typing_retry.get(user, (0.0, 2.0))
+        deadline = self._typing_deadlines.setdefault(user, now + _TYPING_MAX_SECONDS)
+        try:
+            if retry_at > now:
+                return
+            while True:
+                remaining = self._typing_deadlines.get(user, deadline) - time.monotonic()
+                if remaining <= 0:
+                    break
+                attempted_active = True
+                await self._send_input_status(user, 1)
+                self._typing_retry.pop(user, None)
+                remaining = self._typing_deadlines.get(user, deadline) - time.monotonic()
+                if remaining <= 0:
+                    break
+                await asyncio.sleep(min(_TYPING_INTERVAL_SECONDS, remaining))
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            failed_active = True
+            now = time.monotonic()
+            if user not in self._typing_retry and len(self._typing_retry) >= 2048:
+                self._typing_retry.pop(next(iter(self._typing_retry)))
+            self._typing_retry[user] = (now + delay, min(3600.0, delay * 2))
+            logger.debug("OneBot typing unavailable: %s", safe_error(exc))
+        finally:
+            current = asyncio.current_task()
+            if self._typing_tasks.get(user) is current:
+                self._typing_tasks.pop(user, None)
+                self._typing_sessions.pop(user, None)
+                self._typing_deadlines.pop(user, None)
+            if attempted_active and not failed_active:
+                try:
+                    await asyncio.wait_for(self._send_input_status(user, 2, timeout=3), timeout=3.0)
+                except Exception:
+                    pass
 
     def supports_native_feed(self) -> bool:
         return True
@@ -155,6 +243,14 @@ class OneBotAdapter(BaseAdapter):
     async def stop(self):
         self._running = False
         await self.gateway.stop()
+        tasks = [t for t in self._typing_tasks.values() if t and not t.done()]
+        for task in tasks:
+            task.cancel()
+        self._typing_tasks.clear()
+        self._typing_sessions.clear()
+        self._typing_deadlines.clear()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
 
     async def download_attachment(self, att: Attachment, max_bytes: int) -> bytes:
         url = att.url

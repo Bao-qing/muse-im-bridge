@@ -184,11 +184,11 @@ class UnifiedGateway:
         except RuntimeError:
             return
         for kind, target in ctx.session_mapper.owners(sid):
-            ctx.adapter.activity_started(target, sid)
+            ctx.adapter.activity_started(target, sid, kind=kind)
 
     async def turn_finished(self, ctx, sid):
         for kind, target in ctx.session_mapper.owners(sid):
-            await ctx.adapter.activity(target, sid, "finished")
+            await ctx.adapter.activity(target, sid, "finished", kind=kind)
 
     async def notify_interaction(self, item, text):
         contexts = [ctx for ctx in self.contexts.values() if ctx.is_enabled]

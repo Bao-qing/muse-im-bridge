@@ -373,11 +373,15 @@ class FullConfigEditor:
             print(f"  [13] session_bindings (会话预绑定映射):   {ob.get('session_bindings') or {}}")
             print(f"  [14] group_sender_info (群消息附带发送者信息): {ob.get('group_sender_info', True)}")
             print(f"  [15] qzone_feed (个人动态同步到 QQ空间): {'开启' if ob.get('qzone_feed', {}).get('enabled', False) else '关闭'}")
+            print(f"  [16] typing_enabled (私聊输入状态提示):  {'开启' if ob.get('typing_enabled', False) else '关闭'}")
             print("  [0] 返回上级菜单")
 
-            c = _prompt_input("请选择要修改的项编号 (0-15)", default="0")
+            c = _prompt_input("请选择要修改的项编号 (0-16)", default="0")
             if c == "0":
                 break
+            elif c == "16":
+                ob["typing_enabled"] = _prompt_bool("私聊回复期间是否展示输入状态 (NapCat set_input_status)", ob.get("typing_enabled", False))
+                self._modified = True
             elif c == "15":
                 self._edit_qzone_feed(ob)
             elif c == "14":

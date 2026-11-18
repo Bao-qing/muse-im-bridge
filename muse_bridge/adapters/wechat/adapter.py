@@ -196,14 +196,23 @@ class WeChatAdapter(BaseAdapter):
     async def deliver(self, envelope):
         return await self.transport.deliver(envelope)
 
-    def activity_started(self, target, token):
-        if self.config.typing_enabled:
+    def activity_started(self, target, token, *, kind="private"):
+        if kind != "private" or not self.config.typing_enabled:
+            return
+        if token.startswith("intake:"):
+            self._typing_sessions.setdefault(target, token)
+        else:
             self._typing_sessions[target] = token
-            self._ensure_typing(target, self._typing_inputs.get(target))
+        self._ensure_typing(target, self._typing_inputs.get(target))
 
-    async def activity(self, target, token, state):
+    async def activity(self, target, token, state, *, kind="private"):
+        if kind != "private":
+            return
         if state == "started" and self.config.typing_enabled:
-            self._typing_sessions[target] = token
+            if token.startswith("intake:"):
+                self._typing_sessions.setdefault(target, token)
+            else:
+                self._typing_sessions[target] = token
             self._ensure_typing(target, self._typing_inputs.get(target))
         elif state == "finished" and self._typing_sessions.get(target) == token:
             await self._stop_typing(target)

@@ -307,12 +307,15 @@ class OneBotConfig(ChatConfig):
     ws_url: str = ""
     # Which group messages reach Muse: "all", "at" (@bot or a / command), "prefix" (/ only).
     group_trigger: str = constants.DEFAULT_ONEBOT_GROUP_TRIGGER
+    typing_enabled: bool = False
     qzone_feed: QzoneFeedConfig = dataclasses.field(default_factory=QzoneFeedConfig)
 
     def __post_init__(self):
         super().__post_init__()
         self.whitelist = _normalize_whitelist(self.whitelist)
         self.admin_id = [str(a) for a in self.admin_id if a is not None and str(a).strip()]
+        if type(self.typing_enabled) is not bool:
+            raise ValueError("adapters.onebot.typing_enabled must be a boolean")
         if not isinstance(self.qzone_feed, QzoneFeedConfig):
             raise ValueError("adapters.onebot.qzone_feed must be a QzoneFeedConfig")
         if self.group_trigger not in {"all", "at", "prefix"}:
@@ -712,6 +715,11 @@ class ConfigLoader:
             access_token=str(ob_raw.get("access_token") or os.environ.get("ONEBOT_ACCESS_TOKEN") or ""),
             ws_url=str(ob_raw.get("ws_url") or os.environ.get("ONEBOT_WS_URL") or ""),
             group_trigger=ob_raw.get("group_trigger", constants.DEFAULT_ONEBOT_GROUP_TRIGGER),
+            typing_enabled=(
+                overrides["typing_enabled"]
+                if ("typing_enabled" in overrides and overrides["typing_enabled"] is not None)
+                else ob_raw.get("typing_enabled", False)
+            ),
         )
 
         # 4. Gateway config

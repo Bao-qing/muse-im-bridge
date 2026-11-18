@@ -37,14 +37,33 @@ class TestOneBotConfig(unittest.TestCase):
         self.assertTrue(cfg.is_admin("300000003"))
 
     def test_group_trigger_and_booleans_are_validated(self):
+        self.assertFalse(OneBotConfig().typing_enabled)
         with self.assertRaisesRegex(ValueError, "adapters.onebot.group_trigger"):
             OneBotConfig(group_trigger="sometimes")
+        with self.assertRaisesRegex(ValueError, "adapters.onebot.typing_enabled"):
+            OneBotConfig(typing_enabled="yes")
+        with self.assertRaisesRegex(ValueError, "adapters.onebot.typing_enabled"):
+            OneBotConfig(typing_enabled=1)
         with self.assertRaisesRegex(ValueError, "adapters.onebot.approvals_in_place"):
             OneBotConfig(approvals_in_place="yes")
         with self.assertRaisesRegex(ValueError, "adapters.onebot.allow_all_private"):
             OneBotConfig(allow_all_private="yes")
         with self.assertRaisesRegex(ValueError, "adapters.onebot.allow_all_group"):
             OneBotConfig(allow_all_group="yes")
+
+    def test_loader_loads_typing_enabled_and_wizard_toggles_it(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp, "config.json")
+            path.write_text(json.dumps({
+                "muse": {"client_ip": "198.51.100.1"},
+                "adapters": {"qq": {"enabled": False}, "onebot": {"enabled": True, "typing_enabled": True}},
+            }), encoding="utf-8")
+            self.assertTrue(ConfigLoader.load(str(path)).onebot.typing_enabled)
+        from init_config import FullConfigEditor
+        editor = FullConfigEditor({"adapters": {"onebot": {}}})
+        with mock.patch("init_config._prompt_input", side_effect=["16", "y", "0"]), mock.patch("builtins.print"):
+            editor._edit_onebot_category()
+        self.assertTrue(editor.data["adapters"]["onebot"]["typing_enabled"])
 
     def test_loader_uses_onebot_state_files_and_env_token(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -93,6 +112,25 @@ class TestOneBotClient(unittest.TestCase):
         with mock.patch("urllib.request.urlopen", return_value=_response({"status": "failed", "retcode": 100})):
             with self.assertRaises(OneBotAPIError):
                 self.client.send_group_msg(1, "x")
+
+    def test_set_input_status_validates_params_and_stays_quiet_on_error(self):
+        ok = {"status": "ok", "retcode": 0, "data": {}}
+        with mock.patch("urllib.request.urlopen", return_value=_response(ok)) as open_:
+            self.client.set_input_status("42", 1)
+        req = open_.call_args.args[0]
+        self.assertEqual(req.full_url, "https://onebot.test/set_input_status")
+        self.assertEqual(json.loads(req.data), {"user_id": 42, "event_type": 1})
+        for bad_uid in (0, -5, "abc"):
+            with self.assertRaises(ValueError):
+                self.client.set_input_status(bad_uid, 1)
+        for bad_type in (3, -1, True, "1"):
+            with self.assertRaises(ValueError):
+                self.client.set_input_status(42, bad_type)
+        with mock.patch("urllib.request.urlopen", side_effect=OSError("offline")), \
+             mock.patch("muse_bridge.adapters.onebot.client.logger.error") as err_log:
+            with self.assertRaises(RuntimeError):
+                self.client.set_input_status(42, 1)
+            err_log.assert_not_called()
 
     def test_file_source_prefers_base64_then_http_url_and_skips_local_paths(self):
         answers = [{"status": "ok", "retcode": 0, "data": {"url": "/app/temp/a.txt"}},
@@ -528,3 +566,121 @@ class TestGatewayRouting(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(qq.ctx._in_login_fallback)
         ob.client.send_msg.assert_called_once()
         qq.send_notice.assert_not_awaited()
+
+
+class TestOneBotTyping(unittest.IsolatedAsyncioTestCase):
+    async def test_private_full_turn_typing_persists_without_flicker_and_skips_groups_or_strangers(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            adapter, muse = _make_adapter(tmp, typing_enabled=True)
+            started = asyncio.Event()
+            calls = []
+
+            async def fake_send_status(user, event_type, timeout=5):
+                calls.append((user, event_type))
+                if event_type == 1:
+                    started.set()
+
+            adapter.adapter._send_input_status = fake_send_status
+
+            # Unauthorized private DMs, group messages and local commands never trigger typing
+            await adapter.handle_event(_private(999, "stranger", 1))
+            await adapter.handle_event(_group("G1", 5, "group hello", 2))
+            await adapter.handle_event(_private(100, "/help", 3))
+            await asyncio.sleep(0)
+            self.assertEqual(calls, [])
+
+            # Authorized private message starts typing and binds to the resolved Muse session
+            await adapter.handle_event(_private(100, "hello", 4))
+            await started.wait()
+            sid = adapter.session_mapper.current("private", "100")
+            self.assertIn("100", adapter.adapter._typing_tasks)
+            self.assertEqual(adapter.adapter._typing_sessions.get("100"), sid)
+            self.assertEqual(calls, [("100", 1)])
+
+            # Sharing the same session with a group still only sends typing to the private user
+            adapter.session_mapper.bind("group", "G1", sid)
+            task_before = adapter.adapter._typing_tasks["100"]
+            await adapter.handle_event(_private(100, "follow up", 5))
+            self.assertIs(adapter.adapter._typing_tasks["100"], task_before)
+            self.assertNotIn("G1", adapter.adapter._typing_tasks)
+            self.assertEqual(calls, [("100", 1)])
+
+            # Finishing the turn stops typing for the private user only
+            await adapter.outbound_pusher.on_turn_finished(sid)
+            self.assertNotIn("100", adapter.adapter._typing_tasks)
+            self.assertNotIn("100", adapter.adapter._typing_sessions)
+            self.assertEqual(calls, [("100", 1), ("100", 2)])
+
+    async def test_typing_stops_on_failed_post_commands_cards_and_shutdown(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            adapter, muse = _make_adapter(tmp, typing_enabled=True)
+            calls = []
+
+            async def fake_send_status(user, event_type, timeout=5):
+                calls.append((user, event_type))
+
+            adapter.adapter._send_input_status = fake_send_status
+
+            # 1. Failed post_message cleans up intake typing immediately
+            muse.post_message.side_effect = RuntimeError("upstream down")
+            await adapter.handle_event(_private(100, "fail", 10))
+            await asyncio.sleep(0)
+            self.assertNotIn("100", adapter.adapter._typing_tasks)
+            if calls:
+                self.assertEqual(calls[-1], ("100", 2))
+
+            # 2. /停止 cancels active typing
+            calls.clear()
+            muse.post_message.side_effect = lambda sid, text, atts, thr: f"mid-{sid}-{text}"
+            await adapter.handle_event(_private(100, "work", 11))
+            await asyncio.sleep(0)
+            self.assertIn("100", adapter.adapter._typing_tasks)
+            await adapter.handle_event(_private(100, "/停止", 12))
+            self.assertNotIn("100", adapter.adapter._typing_tasks)
+            self.assertEqual(calls, [("100", 1), ("100", 2)])
+
+            # 3. /新建 cancels active typing
+            calls.clear()
+            await adapter.handle_event(_private("A1", "work", 13))
+            await asyncio.sleep(0)
+            self.assertIn("A1", adapter.adapter._typing_tasks)
+            await adapter.handle_event(_private("A1", "/新建", 14))
+            self.assertNotIn("A1", adapter.adapter._typing_tasks)
+            self.assertEqual(calls, [("A1", 1), ("A1", 2)])
+
+            # 4. Approval pause and adapter.stop() clear active typing
+            calls.clear()
+            await adapter.handle_event(_private("A1", "ssh check", 15))
+            await asyncio.sleep(0)
+            sid = adapter.session_mapper.current("private", "A1")
+            approval = muse.interactions.add("approval", session_id=sid, context={"fingerprint": "fp"})
+            muse.interaction_protocol.display_snapshot.return_value = ("fp", [])
+            self.assertTrue(await adapter.notify_interaction(approval, "【审批】"))
+            self.assertNotIn("A1", adapter.adapter._typing_tasks)
+            self.assertEqual(calls, [("A1", 1), ("A1", 2)])
+            approval.state = "denied"
+
+            calls.clear()
+            await adapter.handle_event(_private("A1", "before stop", 16))
+            await asyncio.sleep(0)
+            self.assertIn("A1", adapter.adapter._typing_tasks)
+            await adapter.adapter.stop()
+            self.assertFalse(adapter.adapter._typing_tasks)
+            self.assertEqual(calls, [("A1", 1), ("A1", 2)])
+
+    async def test_typing_failure_backs_off_without_sending_clear(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            adapter, _ = _make_adapter(tmp, typing_enabled=True)
+            calls = []
+
+            async def failing_status(user, event_type, timeout=5):
+                calls.append((user, event_type))
+                raise OneBotAPIError("set_input_status", 1404, "unsupported action")
+
+            adapter.adapter._send_input_status = failing_status
+            await adapter.handle_event(_private(100, "first", 20))
+            await asyncio.sleep(0)
+            await adapter.handle_event(_private(100, "second", 21))
+            await asyncio.sleep(0)
+            self.assertEqual(calls, [("100", 1)])
+            self.assertIn("100", adapter.adapter._typing_retry)

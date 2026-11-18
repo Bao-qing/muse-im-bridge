@@ -63,8 +63,8 @@ class BaseAdapter(ABC):
         """Publish a resolved feed post to the platform's native feed surface."""
         return DeliveryResult(DeliveryStatus.REJECTED, reason="Native feed surface not supported")
 
-    def activity_started(self, target: str, token: str) -> None:
+    def activity_started(self, target: str, token: str, *, kind: str = "private") -> None:
         """Record activity synchronously before the intake awaitable returns."""
 
-    async def activity(self, target: str, token: str, state: str) -> None:
+    async def activity(self, target: str, token: str, state: str, *, kind: str = "private") -> None:
         """Optional platform typing signal; token is opaque to the adapter."""

@@ -65,6 +65,10 @@ class MuseEventPump(OutboundDispatcher):
         while True:
             sid, hist = await queue.get()
             try:
+                if hist is None:
+                    if ctx in self.gateway.contexts.values() and ctx.owns_session(sid):
+                        await ctx.outbound_pusher.on_turn_finished(sid)
+                    continue
                 # Wait for post_message -> route registration, but never hold a
                 # session submit lock during slow platform delivery.
                 async with self.gateway.session_lock(sid):
@@ -81,7 +85,13 @@ class MuseEventPump(OutboundDispatcher):
 
     async def on_turn_finished(self, sid):
         for ctx in list(self.gateway.contexts.values()):
-            if ctx.owns_session(sid):
+            if not ctx.owns_session(sid):
+                continue
+            worker = self._workers.get(ctx)
+            queue = self._queues.get(ctx)
+            if worker is not None and not worker.done() and queue is not None and not queue.full():
+                queue.put_nowait((sid, None))
+            else:
                 await ctx.outbound_pusher.on_turn_finished(sid)
 
     async def on_turns_cleared(self):

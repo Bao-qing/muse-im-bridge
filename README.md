@@ -233,6 +233,7 @@ python -m unittest discover tests
                                                    // ONEBOT_ACCESS_TOKEN / ONEBOT_BASE_URL / ONEBOT_WS_URL 提供；ws_url 留空时由 base_url 推出
       "admin_id": ["YOUR_ADMIN_QQ"],               // [可选] 管理员 QQ 号（审批、凭证、/登录、管理指令）
       "group_trigger": "all",                      // [可选] 群消息触发：all 全部 / at 需 @机器人或 / 指令 / prefix 仅 / 指令 (默认: all)
+      "typing_enabled": false,                     // [可选] 私聊回复期间是否展示「正在输入...」(NapCat set_input_status，默认: false)
       "whitelist": {                               // [必填-若启用] 与 QQ 同格式；为空时拒绝所有聊天
         "private": ["YOUR_ADMIN_QQ"],              // 允许私聊的 QQ 号
         "YOUR_GROUP_ID": "*"                       // 群号: "*" 全员开放，或成员 QQ 号列表；旧写法 "groups": [群号] 仍兼容
@@ -419,6 +420,7 @@ OneBot 与 QQ 走同一个 Gateway 层（`muse_bridge/gateway/`），会话隔�
 - **消息格式**：按 Array 消息段解析 `text`、`at`、`reply`、`image`、`video`、`file`、`record`；`message_format: string`（CQ 码）只取文本、@ 与引用。
 - **过滤**：丢弃机器人自己发的消息（`self_id`）与 `message_sent` 事件；按 `message_id` 去重。
 - **群触发**：`group_trigger` 为 `all`（默认，群内所有消息）、`at`（需 @机器人，或以 `/` 开头的指令）、`prefix`（只处理 `/` 指令）。私聊不受影响。
+- **私聊输入状态**：`typing_enabled: true`（默认 `false`）时，私聊消息进入转发流程至 Muse 本轮结束（回复投递完成、弹出审批/凭证/密钥卡、`/停止`、会话切换或停机）期间，通过 NapCat 扩展接口 `set_input_status` 展示并保活「正在输入...」；群聊、未授权私聊及斜杠指令不触发。需机器人 QQ 开启「展示我的输入状态」。
 - **回复与推送**：OneBot 没有被动回复窗口，回复和主动推送都直接发送，投递顺序同上（提问所在聊天 → 会话绑定的聊天 → 管理员 → 丢弃）。长文本按 `chunk_chars` / `max_chunks` 分段；图片、视频以 `base64://` 消息段发送，文件走 `upload_group_file` / `upload_private_file`。群发送被 NapCat 拒绝（`retcode != 0`，如被禁言、被移出群）时，加「【群消息提醒】」前缀改发第一个管理员私聊；网络超时不会改发，避免重复。
 - **收图与文件**：图片段自带可下载的 QQ CDN 地址（含 rkey），直接下载。文件段只有 `file_id`，依次尝试 `get_file`（base64 或 http 地址）与 `get_group_file_url`；NapCat 只给出它本机路径时无法读取，Muse 收到的消息会附「[file下载失败：NapCat 未提供可下载地址]」。
 - **凭证引用**：回复（引用）凭证提示消息即可选中该凭证，等同 QQ 的引用回复。

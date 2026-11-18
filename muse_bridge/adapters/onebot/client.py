@@ -93,7 +93,7 @@ class OneBotClient:
         self._ssl_ctx.check_hostname = False
         self._ssl_ctx.verify_mode = ssl.CERT_NONE
 
-    def _post(self, path: str, payload: dict, timeout: int = 15) -> dict:
+    def _post(self, path: str, payload: dict, timeout: int = 15, *, quiet: bool = False) -> dict:
         url = f"{self.base_url}{path}"
         body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
         headers = {
@@ -114,7 +114,10 @@ class OneBotClient:
             # Unlike QQ, OneBot deliberately does not read an HTTPError body.
             _trace_http("error", request_id, started, url=url, error=e,
                         response=e if isinstance(e, urllib.error.HTTPError) else None)
-            logger.error("OneBot HTTP request failed: %s", safe_error(e))
+            if quiet:
+                logger.debug("OneBot HTTP request failed: %s", safe_error(e))
+            else:
+                logger.error("OneBot HTTP request failed: %s", safe_error(e))
             raise RuntimeError(f"OneBot API request to {path} failed: {e}")
 
     def call(self, action: str, timeout: int = 15, **params) -> Any:
@@ -197,6 +200,18 @@ class OneBotClient:
         """Send a private message using Array segments format; returns the raw response."""
         payload = {"user_id": int(user_id), "message": self._segments(text, image_urls)}
         return _check("send_private_msg", self._post("/send_private_msg", payload))
+
+    def set_input_status(self, user_id: int | str, event_type: int = 1, timeout: int = 5) -> dict:
+        """Send NapCat private-chat input status (0=speaking, 1=typing, 2=clear)."""
+        uid = int(user_id)
+        if uid <= 0:
+            raise ValueError("user_id must be a positive integer")
+        if type(event_type) is not int or event_type not in {0, 1, 2}:
+            raise ValueError("event_type must be 0, 1, or 2")
+        return _check(
+            "set_input_status",
+            self._post("/set_input_status", {"user_id": uid, "event_type": event_type}, timeout=timeout, quiet=True),
+        )
 
     # -- receiving media ----------------------------------------------------
     def file_source(self, file_id: str, group_id=None) -> Dict[str, str]:

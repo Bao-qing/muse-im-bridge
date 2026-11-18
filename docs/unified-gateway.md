@@ -27,7 +27,7 @@ MuseService 保留 token、RPC、附件上传、工作区文件和登录/凭证/
 - `download_attachment(...)`：平台鉴权、媒体描述符解密/下载，受类型大小上限约束。
 - `deliver(envelope)`：只发送网关已解析的目标和内容，返回状态与实际收件人/原生 ID。
 - `supports_native_feed()` / `publish_feed(feed)`：可选的平台原生动态广场投递（如 OneBot QQ 空间）；无原生广场或配置为 `chat` 模式时，由网关统一渲染并经 `deliver` 推送到该账号的 `notification_target()`。
-- `activity_started` / `activity(..., 'finished')`：平台输入状态，token 对适配器不透明。
+- `activity_started(..., kind=...)` / `activity(..., 'finished', kind=...)`：平台输入状态（目前微信 iLink 与 OneBot NapCat 私聊已实现），token 对适配器不透明，群聊由适配器按 `kind` 忽略。
 
 QQSender 拥有被动序号和主动配额，序号在请求前持久化。OneBotSender 编码原生消息段和引用。WeChatSenderTransport 使用原有分段投递账本，明确区分本次输入 token 快照与异步输出的最新 token。
 
