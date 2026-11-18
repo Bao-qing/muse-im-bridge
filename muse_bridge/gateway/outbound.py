@@ -105,6 +105,21 @@ def _extract_media_descriptors(event: dict, raw_text: str) -> Tuple[List[dict], 
     return _dedup(images), _dedup(files), _dedup(videos)
 
 
+def _format_media_size(num_bytes: int) -> str:
+    mib = 1024 * 1024
+    if num_bytes >= mib:
+        return f"{num_bytes // mib}MB" if num_bytes % mib == 0 else f"{num_bytes / mib:.1f}MB"
+    if num_bytes >= 1024:
+        return f"{num_bytes // 1024}KB" if num_bytes % 1024 == 0 else f"{num_bytes / 1024:.1f}KB"
+    return f"{num_bytes}B"
+
+
+def format_oversize_notice(label_cn: str, limit: int, actual: Optional[int] = None) -> str:
+    if type(actual) is int and actual > limit:
+        return f"【提示】{label_cn}大小（{_format_media_size(actual)}）超过当前渠道发送上限（{_format_media_size(limit)}），无法直接发送。"
+    return f"【提示】{label_cn}超过当前渠道发送上限（{_format_media_size(limit)}），无法直接发送。"
+
+
 def gate_catch_up(
     hist: List[dict],
     seen_ids: Set[str],
@@ -281,7 +296,7 @@ class OutboundDispatcher:
 
     async def start(self) -> None:
         self._running = True
-        logger.info('Started %s outbound dispatcher (bound sessions only)', self.platform)
+        logger.info('Muse event subscription started (shared by all mounted adapters; bound sessions only)')
 
         while self._running:
             try:
@@ -323,17 +338,33 @@ class OutboundDispatcher:
 
         for ev in hist:
             mid = ev.get("message_id")
-            if not mid or mid in self._seen_ids or self.deduplicator.is_delivered(mid):
+            if not mid or self._is_event_already_handled(session_id, mid):
                 continue
             if ev.get("role") != "assistant":
                 continue
             raw_t = ev.get("display_text") or ""
             imgs, fls, vids = _extract_media_descriptors(ev, raw_t)
-            for it in imgs + fls + vids:
-                wpath = it.get("workspace_path")
-                if wpath and not it.get("data"):
+            for kind, group in (("image", imgs), ("file", fls), ("video", vids)):
+                cap = self._media_upload_cap(session_id, kind)
+                for it in group:
+                    wpath = it.get("workspace_path")
+                    if not wpath or it.get("data"):
+                        continue
+                    known_len = it.get("byte_len")
+                    if type(known_len) is int and known_len > cap:
+                        it["oversize_bytes"] = known_len
+                        continue
                     try:
-                        it["data"] = client.read_file(wpath)
+                        if hasattr(client, "read_file_bounded"):
+                            data, exact_size, exceeded = client.read_file_bounded(wpath, cap)
+                            if exceeded:
+                                it["oversize_exceeded"] = True
+                                if exact_size is not None:
+                                    it["oversize_bytes"] = exact_size
+                            elif data is not None:
+                                it["data"] = data
+                        else:
+                            it["data"] = client.read_file(wpath)
                     except Exception as e:
                         logger.debug('Failed reading workspace media: %s', safe_error(e))
             ev["_extracted_images"] = imgs
@@ -349,6 +380,42 @@ class OutboundDispatcher:
                     self._touch_hot(session_id)
                     break
         return hist
+
+    def _is_event_already_handled(self, session_id: str, mid: str) -> bool:
+        return bool(mid and (mid in self._seen_ids or self.deduplicator.is_delivered(mid)))
+
+    def _media_upload_cap(self, session_id: str, kind: str) -> int:
+        attr = {"image": "max_image_bytes", "file": "max_file_bytes", "video": "max_video_upload_bytes"}[kind]
+        return getattr(self.config, attr)
+
+    def _filter_oversized_media(
+        self,
+        items: List[dict],
+        limit: int,
+        label_cn: str,
+        label_en: str,
+        target_type: str,
+        target_id: str,
+    ) -> Tuple[List[dict], List[str]]:
+        kept: List[dict] = []
+        notices: List[str] = []
+        for it in items:
+            data = it.get("data")
+            size: Optional[int] = len(data) if isinstance(data, (bytes, bytearray)) else None
+            if size is None and type(it.get("oversize_bytes")) is int:
+                size = it["oversize_bytes"]
+            if size is None and type(it.get("byte_len")) is int and it["byte_len"] >= 0:
+                size = it["byte_len"]
+            if it.get("oversize_exceeded") or (size is not None and size > limit):
+                logger.warning(
+                    "Skipping oversized %s for %s:%s (%s > %s bytes)",
+                    label_en, target_type, target_id,
+                    size if size is not None else f">{limit}", limit,
+                )
+                notices.append(format_oversize_notice(label_cn, limit, size))
+                continue
+            kept.append(it)
+        return kept, notices
 
     def _touch_hot(self, session_id: str) -> None:
         self._hot_until[session_id] = time.monotonic() + max(5, self.config.session_hot_window_s)
@@ -991,15 +1058,9 @@ class OutboundDispatcher:
             else:
                 clean_text = _clean_text(raw_text, payload.get("widgets"))
 
-            images = event.get("_extracted_images") or []
-            files = event.get("_extracted_files") or []
-            videos = event.get("_extracted_videos") or []
-
-            # If text simply mirrors the filename of an extracted file or image, suppress redundant text chunk
-            if files and clean_text in [fl.get("filename") for fl in files if fl.get("filename")]:
-                clean_text = ""
-            if images and clean_text in [im.get("filename") for im in images if im.get("filename")]:
-                clean_text = ""
+            images = list(event.get("_extracted_images") or [])
+            files = list(event.get("_extracted_files") or [])
+            videos = list(event.get("_extracted_videos") or [])
 
             if not clean_text and not images and not files and not videos:
                 continue
@@ -1014,6 +1075,25 @@ class OutboundDispatcher:
             if not target_id:
                 logger.warning('Message %s of session %s has no bound chat; dropped.',
                                mid, (session_id or "")[:8])
+                continue
+
+            images, img_notices = self._filter_oversized_media(
+                images, self.config.max_image_bytes, "图片", "image", target_type, target_id)
+            videos, vid_notices = self._filter_oversized_media(
+                videos, self.config.max_video_upload_bytes, "视频", "video", target_type, target_id)
+            files, file_notices = self._filter_oversized_media(
+                files, self.config.max_file_bytes, "文件", "file", target_type, target_id)
+            oversize_notices = img_notices + vid_notices + file_notices
+
+            # If text simply mirrors the filename of an extracted file or image, suppress redundant text chunk
+            if files and clean_text in [fl.get("filename") for fl in files if fl.get("filename")]:
+                clean_text = ""
+            if images and clean_text in [im.get("filename") for im in images if im.get("filename")]:
+                clean_text = ""
+            if oversize_notices:
+                clean_text = "\n".join([*([clean_text] if clean_text else []), *oversize_notices])
+
+            if not clean_text and not images and not files and not videos:
                 continue
 
             # Mark processing

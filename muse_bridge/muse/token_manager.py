@@ -28,6 +28,8 @@ import httpx
 
 from .client.errors import CredentialRefreshError, LoginRequired
 from ..observability import http_request, observed
+from ..config.models import WorkerConfig
+from .routing import cookie_domain, http_base, worker_http_options
 
 _BASE_HEADERS = {
     "User-Agent": (
@@ -53,12 +55,15 @@ class MuseTokenManager:
         cookies_file: str = "cookies.json",
         vm_id: str = "",
         base_url: str = "https://muse.ai",
+        *, worker: WorkerConfig | None = None,
     ):
         self.mint_file = mint_file
         self.cookies_file = cookies_file
         self.vm_id = vm_id
         self._explicit_vm = bool(vm_id)
-        self.base_url = base_url.rstrip("/")
+        self.worker = worker or WorkerConfig()
+        self.real_base_url = base_url.rstrip("/")
+        self.base_url = http_base(base_url, self.worker)
 
         self._token = ""
         self._notary_token = ""
@@ -142,8 +147,12 @@ class MuseTokenManager:
             if isinstance(data, dict):
                 if "cookie" in data and isinstance(data["cookie"], str):
                     return data["cookie"].strip()
+                if isinstance(data.get("cookies"), list):
+                    return self._cookie_records(data["cookies"])
                 pairs = [f"{k}={v}" for k, v in data.items() if isinstance(v, str) and v.strip()]
                 return "; ".join(pairs)
+            if isinstance(data, list):
+                return self._cookie_records(data)
             if isinstance(data, str):
                 return data.strip()
         except Exception:
@@ -159,19 +168,25 @@ class MuseTokenManager:
                 line = line.split(":", 1)[1].strip()
             if "\t" in line:
                 fields = line.split("\t")
-                if len(fields) >= 7 and "muse.ai" in fields[0] and fields[5]:
+                if len(fields) >= 7 and cookie_domain(fields[0], self.worker) and fields[5]:
                     pairs.append(f"{fields[5]}={fields[6]}")
             elif "=" in line:
                 pairs.append(line)
         return "; ".join(pairs)
+
+    def _cookie_records(self, records: list) -> str:
+        return "; ".join(f"{c['name']}={c['value']}" for c in records
+                         if isinstance(c, dict) and isinstance(c.get("domain"), str)
+                         and cookie_domain(c["domain"], self.worker)
+                         and c.get("name") and isinstance(c.get("value"), str) and c["value"])
 
     def _get_headers(self, cookie: str) -> dict:
         return {
             "Content-Type": "application/json",
             "Cookie": cookie,
             "Accept": "application/json, text/plain, */*",
-            "Origin": self.base_url,
-            "Referer": f"{self.base_url}/",
+            "Origin": self.real_base_url,
+            "Referer": f"{self.real_base_url}/",
             "User-Agent": _BASE_HEADERS["User-Agent"],
             "Sec-Ch-Ua": _BASE_HEADERS["Sec-Ch-Ua"],
             "Sec-Ch-Ua-Mobile": _BASE_HEADERS["Sec-Ch-Ua-Mobile"],
@@ -190,8 +205,11 @@ class MuseTokenManager:
         headers["Sec-Fetch-Dest"] = "document"
         headers["Sec-Fetch-Mode"] = "navigate"
         try:
-            with httpx.Client(http2=True, timeout=timeout, follow_redirects=True) as client:
+            with httpx.Client(http2=True, timeout=timeout, follow_redirects=True,
+                              **worker_http_options(self.worker)) as client:
                 resp = http_request(client, "get",f"{self.base_url}/", headers=headers)
+                if self.worker.http:
+                    resp.raise_for_status()
                 html = resp.text
         except Exception:
             raise CredentialRefreshError("resolve_vm") from None
@@ -204,7 +222,8 @@ class MuseTokenManager:
         headers = self._get_headers(cookie)
         stage = url.rsplit("/", 1)[-1]
         try:
-            with httpx.Client(http2=True, timeout=timeout) as client:
+            with httpx.Client(http2=True, timeout=timeout,
+                              **worker_http_options(self.worker)) as client:
                 resp = http_request(client, "post",url, headers=headers, json=payload)
                 if resp.status_code != 200:
                     try:

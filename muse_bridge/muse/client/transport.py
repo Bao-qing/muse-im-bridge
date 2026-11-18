@@ -157,7 +157,8 @@ def noise_handshake(ws) -> tuple:
 
 # ---------- WebSocket transport (via egress CONNECT proxy) ----------
 class WS:
-    def __init__(self, url: str, proxy_url: str = None, direct: bool = False):
+    def __init__(self, url: str, proxy_url: str = None, direct: bool = False,
+                 *, permessage_deflate: bool = True):
         self._log_connection_id = new_id()
         trace_event("muse.websocket", "connect.start", connection_id=self._log_connection_id, url=url)
         u = urlparse(url)
@@ -191,6 +192,8 @@ class WS:
         self.sock = ctx.wrap_socket(s, server_hostname=host)
         self.sock.settimeout(20.0)
         self.buf = b""
+        self._recv_frags = []
+        self._recv_opcode = None
         key = base64.b64encode(os.urandom(16)).decode()
         req = (
             f"GET {path} HTTP/1.1\r\nHost: {host}\r\nUpgrade: websocket\r\n"
@@ -199,7 +202,8 @@ class WS:
             f"User-Agent: {UA}\r\nAccept-Encoding: gzip, deflate, br, zstd\r\n"
             f"Accept-Language: zh-CN,zh;q=0.9\r\nPragma: no-cache\r\n"
             f"Cache-Control: no-cache\r\n"
-            f"Sec-WebSocket-Extensions: permessage-deflate; client_max_window_bits\r\n\r\n"
+            + ("Sec-WebSocket-Extensions: permessage-deflate; client_max_window_bits\r\n"
+               if permessage_deflate else "") + "\r\n"
         )
         self.sock.sendall(req.encode())
         resp = self._read_until(self.sock, b"\r\n\r\n")
@@ -234,13 +238,16 @@ class WS:
             data += chunk
         return data
 
-    def _read_exact(self, n: int) -> bytes:
+    def _read_exact(self, n: int, *, consume: bool = True) -> bytes:
+        """Buffer partial reads even on timeout; optionally peek without consuming."""
         while len(self.buf) < n:
             chunk = self.sock.recv(65536)
             if not chunk:
                 raise ConnectionError("socket closed")
             self.buf += chunk
-        out, self.buf = self.buf[:n], self.buf[n:]
+        out = self.buf[:n]
+        if consume:
+            self.buf = self.buf[n:]
         return out
 
     def send(self, data: bytes, opcode: int = 2):
@@ -257,30 +264,44 @@ class WS:
         trace_event("muse.websocket", "frame.send", connection_id=self._log_connection_id, opcode=opcode, bytes=ln)
 
     def recv(self, timeout: float = 20.0):
-        """Return (opcode, payload) of the next data/control frame."""
+        """Return the next complete data message, retaining progress on timeout."""
         self.sock.settimeout(timeout)
-        frags = []
         while True:
-            b0, b1 = self._read_exact(2)
+            # Peek at the header and consume only once the entire frame is
+            # buffered. A timeout anywhere leaves its header and body together
+            # for the next recv(), rather than interpreting body bytes as a header.
+            b0, b1 = self._read_exact(2, consume=False)
             fin = b0 & 0x80
             opcode = b0 & 0x0F
             ln = b1 & 0x7F
-            if ln == 126:
-                ln = struct.unpack(">H", self._read_exact(2))[0]
-            elif ln == 127:
-                ln = struct.unpack(">Q", self._read_exact(8))[0]
+            header_len = 2
+            if ln in (126, 127):
+                header_len += 2 if ln == 126 else 8
+                header = self._read_exact(header_len, consume=False)
+                ln = int.from_bytes(header[2:], "big")
             if b1 & 0x80:
-                self._read_exact(4)  # server frames are unmasked; skip if present
-            payload = self._read_exact(ln) if ln else b""
+                header_len += 4  # server frames are unmasked; skip if present
+            payload = self._read_exact(header_len + ln)[header_len:]
             trace_event("muse.websocket", "frame.receive", connection_id=self._log_connection_id, opcode=opcode, bytes=ln, final=bool(fin))
             if opcode == 9:  # ping
                 self.send(payload, opcode=10)
                 continue
+            if opcode == 10:  # pong is not a Noise message
+                continue
             if opcode == 8:
                 raise ConnectionError(f"ws closed by server: {payload[:120]}")
-            frags.append(payload)
+            if opcode in (1, 2):
+                if self._recv_opcode is not None:
+                    raise ConnectionError("new ws data frame during fragmented message")
+                self._recv_opcode = opcode
+            elif opcode != 0 or self._recv_opcode is None:
+                raise ConnectionError(f"unexpected ws opcode: {opcode}")
+            self._recv_frags.append(payload)
             if fin:
-                return opcode, b"".join(frags)
+                result = self._recv_opcode, b"".join(self._recv_frags)
+                self._recv_opcode = None
+                self._recv_frags = []
+                return result
 
     def close(self):
         try:

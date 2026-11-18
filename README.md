@@ -25,8 +25,13 @@ muse_bridge/
 │   │   ├── token_manager.py  # 自动凭证推导与静默续期（cookies -> vm_id -> mint）
 │   │   └── service.py        # 会话交互、附件处理、工作区文件读写、主动事件流订阅
 │   ├── gateway/              # 与平台无关的 Gateway 层（对接 Muse）
-│   │   ├── chat.py           # ChatGateway：会话映射、斜杠命令、登录/凭证/审批输入、入站流水线
-│   │   ├── outbound.py       # OutboundDispatcher：订阅 Muse 事件、路由、审批卡投递（平台只实现 _deliver）
+│   │   ├── runtime.py        # UnifiedGateway：挂载适配器、账号隔离、串行入站与生命周期
+│   │   ├── inbound.py        # 所有平台共用的命令、交互与 Muse 提交流水线
+│   │   ├── chat.py           # 网关拥有的账号上下文与业务仓库，不是适配器基类
+│   │   ├── muse_events.py    # 单一 Muse 订阅协调器、会话并集、独立投递队列
+│   │   ├── feed.py           # Muse 个人动态统一轮询、限流、预留账本与跨平台分发
+│   │   ├── delivery.py       # 因果路由、投递账本、真实平台回执关联
+│   │   ├── outbound.py       # Muse 历史处理、呈现渲染与订阅协议实现
 │   │   ├── interactions.py   # 登录、凭证、审批数字回复的输入路由
 │   │   ├── access.py         # 白名单申请与本地审批
 │   │   └── routes.py         # Muse 消息 ID -> 聊天目的地
@@ -36,13 +41,13 @@ muse_bridge/
 │   │   │   ├── adapter.py    # QQAdapter：解析 QQ 事件、被动/主动回复
 │   │   │   ├── client.py     # QQ OpenAPI 客户端（鉴权、发消息、上传富媒体）
 │   │   │   ├── gateway.py    # QQ WebSocket 事件源（心跳与事件分发）
-│   │   │   ├── outbound.py   # QQOutboundPusher：被动回复、主动配额、富媒体上传
+│   │   │   ├── outbound.py   # QQSender：被动序号、主动配额、富媒体上传与明确投递结果
 │   │   │   └── ws_transport.py # 兼容 QQ 101 Connection:close 的底层 WS 客户端
 │   │   └── onebot/           # OneBot v11 (NapCat) 适配器
-│   │       ├── adapter.py    # OneBotAdapter：消息段解析、群触发策略、自身/重复过滤
+│   │       ├── adapter.py    # OneBotAdapter：消息段解析、可信账号身份、自身消息过滤
 │   │       ├── client.py     # NapCat HTTP API 客户端（Array 消息段、retcode 校验）
 │   │       ├── gateway.py    # NapCat 正向 WebSocket 事件源（退避重连）
-│   │       └── outbound.py   # OneBotOutboundPusher：文本分段、base64 图片/视频、文件上传
+│   │       └── outbound.py   # OneBotSender：文本分段、原生引用、base64 媒体与文件上传
 │   └── engine.py             # BridgeEngine 协调调度引擎
 ├── tools/
 │   └── export_cookies.js     # 网页端 Cookie 一键导出辅助工具
@@ -54,12 +59,20 @@ muse_bridge/
 
 ## 核心设计与特性
 
+- **单一业务网关**：`BridgeEngine` 组装一个 `UnifiedGateway`，QQ、OneBot、微信适配器挂载其上，不再各自继承业务网关或运行 Muse 订阅。Muse 的 token、RPC 和交互协议仍由独立服务负责。
+- **严格入站顺序**：同一平台账号/聊天从附件下载前开始排队；已共享 Muse 会话的聊天还串行提交，避免后发文字和命令超车图片、视频。不使用全局大锁阻塞其他聊天。
+- **显式输入归属**：只有前台审批会阻塞所属会话；凭证卡、连接器密钥卡与后台审批均不阻塞聊天，必须引用对应卡片或使用显式命令才会进入处理流程，未引用时普通消息直接发给 Muse。
+- **保守投递语义**：区分确认、明确拒绝、部分完成和结果未知；未知/部分结果保留账本，不整包重放。平台原生引用、业务因果路由和被动回复权限分别处理。
+
+架构边界、状态文件与升级/回退注意事项见 [统一网关说明](docs/unified-gateway.md)。
 
 ---
 
 ## 快速开始
 
 环境要求：Python 3.11 或更高版本。
+
+可选网络传输：默认保留原路由，也可按 WS、普通 HTTPS、登录三个通道独立启用用户自有 Cloudflare Worker。配置示例、分阶段启用与退回步骤见 [Worker 传输说明](docs/worker-transport.md)。
 
 ### 1. 安装依赖
 
@@ -163,7 +176,8 @@ python -m unittest discover tests
     "direct": true,                                // [可选] 是否直连 (默认: true)
     "approval": {                                // [可选] 原生审批策略，不改变长期权限规则
       "mode": "manual",                         // manual / allow_all / deny_all
-      "notify": true                              // 自动决定后通知，默认开启
+      "notify": true,                             // 自动决定后通知，默认开启
+      "sync_interval_s": 180                       // 审批补偿全量同步间隔，正整数秒，默认 180
     }
   },
   "adapters": {
@@ -219,6 +233,7 @@ python -m unittest discover tests
                                                    // ONEBOT_ACCESS_TOKEN / ONEBOT_BASE_URL / ONEBOT_WS_URL 提供；ws_url 留空时由 base_url 推出
       "admin_id": ["YOUR_ADMIN_QQ"],               // [可选] 管理员 QQ 号（审批、凭证、/登录、管理指令）
       "group_trigger": "all",                      // [可选] 群消息触发：all 全部 / at 需 @机器人或 / 指令 / prefix 仅 / 指令 (默认: all)
+      "typing_enabled": false,                     // [可选] 私聊回复期间是否展示「正在输入...」(NapCat set_input_status，默认: false)
       "whitelist": {                               // [必填-若启用] 与 QQ 同格式；为空时拒绝所有聊天
         "private": ["YOUR_ADMIN_QQ"],              // 允许私聊的 QQ 号
         "YOUR_GROUP_ID": "*"                       // 群号: "*" 全员开放，或成员 QQ 号列表；旧写法 "groups": [群号] 仍兼容
@@ -352,7 +367,8 @@ IM 私聊不等同网页安全输入：密码、验证码和私钥等秘密仍�
 ```json
 "approval": {
   "mode": "manual",
-  "notify": true
+  "notify": true,
+  "sync_interval_s": 180
 }
 ```
 
@@ -361,7 +377,7 @@ IM 私聊不等同网页安全输入：密码、验证码和私钥等秘密仍�
 - 原生 `decision_options` 存在时（即使为空）为权威列表，不从标签、域名或排他标记猜测范围。仅在该字段缺失且请求类型受支持时，采用网页源码已验证的旧版回退规则；无法验证选项时保留门禁并引导网页处理。若只提供长期权限选项，自动策略不擅自创建长期规则，而是交回人工选择。
 - 单字段卡按明确的 capture 类型提交受保护字段，不根据标题猜测字段类型；未知类型、字段与卡片 URL 冲突时仍回退网页。旧版 `create_password` 卡允许不带 `capture_authorization`（与已验证的 Authd 行为一致），其他卡仍要求授权；所有提交都带所属会话 ID。
 - 凭证 capture 返回有效 ID 才记录完成；网页成功回调也只更新本地展示，不额外猜测远端卡片完成接口。桥接在 `cookies_file + .captures.local.json` 中原子保存目标/会话/卡片/授权上下文的 SHA-256 回执，以防重启重开已成功提交的同一卡片。文件不含账号、密码、验证码、授权原文或 capture ID；删除该回执文件会丢失本地完成去重，损坏或不可读时拒绝启动。远端 `credential_capture_completed` 状态仍以服务器事件为准。
-- 审批使用独立 Sentinel 状态协调（约三秒一次，发送前再次核对）；聊天出站仍为事件驱动。尚未把未证实的 `approvals.snapshot` 订阅来源写死。重启从远端恢复待审批，状态查询失败时不放行普通消息。
+- 审批由独立的账号级 `daemon/chat.subscribe` 订阅接收 `approvals.snapshot`，同时覆盖前台与后台审批；不依赖聊天是否已有出站订阅。**普通发送只读本地审批门禁，不再逐条查询 `/approvals`**。启动时先检查远端审批，之后按 `sync_interval_s`（默认 **180 秒**，必须为正整数）全量补偿同步；事件通知不等待慢速补偿查询完成。断线、凭据轮换、无效快照及状态查询失败时保守门禁并重新同步；旧连接或过时查询结果不能覆盖较新事件。快照中消失但没有明确终态的审批保留门禁，再查详情确认。约三秒的本地通知补推／故障重试不是正常全量查询周期。用户显式处理审批时仍查询远端状态与版本，不自动重试不确定的决定。详见 [事件驱动审批说明](docs/approval-event-driven.md) 与 [网页运行时证据](docs/approval-events-runtime.md)。
 
 ## 会话隔离
 
@@ -404,15 +420,18 @@ OneBot 与 QQ 走同一个 Gateway 层（`muse_bridge/gateway/`），会话隔�
 - **消息格式**：按 Array 消息段解析 `text`、`at`、`reply`、`image`、`video`、`file`、`record`；`message_format: string`（CQ 码）只取文本、@ 与引用。
 - **过滤**：丢弃机器人自己发的消息（`self_id`）与 `message_sent` 事件；按 `message_id` 去重。
 - **群触发**：`group_trigger` 为 `all`（默认，群内所有消息）、`at`（需 @机器人，或以 `/` 开头的指令）、`prefix`（只处理 `/` 指令）。私聊不受影响。
+- **私聊输入状态**：`typing_enabled: true`（默认 `false`）时，私聊消息进入转发流程至 Muse 本轮结束（回复投递完成、弹出审批/凭证/密钥卡、`/停止`、会话切换或停机）期间，通过 NapCat 扩展接口 `set_input_status` 展示并保活「正在输入...」；群聊、未授权私聊及斜杠指令不触发。需机器人 QQ 开启「展示我的输入状态」。
 - **回复与推送**：OneBot 没有被动回复窗口，回复和主动推送都直接发送，投递顺序同上（提问所在聊天 → 会话绑定的聊天 → 管理员 → 丢弃）。长文本按 `chunk_chars` / `max_chunks` 分段；图片、视频以 `base64://` 消息段发送，文件走 `upload_group_file` / `upload_private_file`。群发送被 NapCat 拒绝（`retcode != 0`，如被禁言、被移出群）时，加「【群消息提醒】」前缀改发第一个管理员私聊；网络超时不会改发，避免重复。
 - **收图与文件**：图片段自带可下载的 QQ CDN 地址（含 rkey），直接下载。文件段只有 `file_id`，依次尝试 `get_file`（base64 或 http 地址）与 `get_group_file_url`；NapCat 只给出它本机路径时无法读取，Muse 收到的消息会附「[file下载失败：NapCat 未提供可下载地址]」。
 - **凭证引用**：回复（引用）凭证提示消息即可选中该凭证，等同 QQ 的引用回复。
 - **白名单**：与 QQ 同格式，QQ 号、群号写成字符串或数字均可；为空时拒绝所有聊天（旧版 OneBot 原型为空即放行，已改）。旧写法 `"groups": [群号]` 等价于这些群 `"*"`。
 - **审批卡与登录**：聊天审批卡只推送到拥有该会话的适配器，未绑定会话不广播管理员；后台审批统一按 `gateway.background_approval_push` 选择一个管理员私聊收件箱。`gateway.login_through_adapter` 设为 `"onebot"` 时，凭据失效的登录提醒发给 OneBot 管理员。
 
-### Muse 动态同步到 QQ 空间（可选）
+### Muse 动态同步（统一网关协调，支持 QQ 空间或私聊推送）
 
-需要 OneBot 后端支持 SnowLuma 的扩展动作 [`send_qzone_msg`](https://snowluma.github.io/zh/docs/api/qzone/send_qzone_msg)；**这不是 OneBot v11 标准接口，不保证普通 NapCat 版本支持**。只实现发表，不读取、点赞、评论或删除空间内容。客户端方法 `OneBotClient.send_qzone_msg(content, images=[...])` 支持纯文本及图文，图片源支持 HTTP(S)、`file://`、`base64://`，返回经校验的 `tid` / `time`。
+动态轮询、时间窗口、滚动配额与先落盘预留后发送的幂等账本统一由 `UnifiedGateway` 的 `GatewayFeedCoordinator` 管理：
+- **统一配置（推荐）**：可在 `gateway.feed` 中按平台配置投递模式（`"native"` 发往平台原生动态广场如 OneBot QQ 空间；`"chat"` 渲染为图文消息发往该平台管理员/扫码用户私聊；`"auto"` 有原生广场走原生，否则走私聊），多平台同时启用时上游 `GET /api/feed` 每轮只拉取一次，各渠道账本相互独立。
+- **OneBot 原有配置兼容**：`adapters.onebot.qzone_feed` 继续保留并完全兼容原有 `data/onebot_qzone_feed.local.json` 状态文件。原生 QQ 空间发表需要 OneBot 后端支持 SnowLuma 扩展动作 [`send_qzone_msg`](https://snowluma.github.io/zh/docs/api/qzone/send_qzone_msg)；**这不是 OneBot v11 标准接口，不保证普通 NapCat 版本支持**。只实现发表，不读取、点赞、评论或删除空间内容。客户端方法 `OneBotClient.send_qzone_msg(content, images=[...])` 支持纯文本及图文，图片源支持 HTTP(S)、`file://`、`base64://`，返回经校验的 `tid` / `time`。
 
 在 `adapters.onebot` 下增加以下配置，或在配置编辑器的 OneBot 分类选择 **15**。自动同步默认关闭；启用后会把当前登录 Muse 账号的个人动态正文、标题和图片发布到当前 OneBot 登录账号的空间，内容可能包含私人信息，请先检查可见范围。
 

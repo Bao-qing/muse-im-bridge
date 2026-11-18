@@ -12,43 +12,25 @@ from muse_bridge.config.models import QQConfig, OneBotConfig, MuseConfig
 from muse_bridge.core.interactions import InteractionManager, interaction_owner, interaction_target
 from muse_bridge.core.message import DeliveryReference, InboundMessage, MessageSource
 from muse_bridge.core.state_file import atomic_json_write
-from muse_bridge.gateway.chat import ChatGateway
-from muse_bridge.gateway.outbound import OutboundDispatcher
+from gateway_helpers import FakeAdapter, MountedAdapter, OneBotAdapter
 from muse_bridge.muse.interactions import MuseInteractions
 from muse_bridge.muse.service import MuseService
 from muse_bridge.observability import _payload, observed, safe_text
 
 
-class RecordingDispatcher(OutboundDispatcher):
-    platform = "qq"
+def memory_gateway(config, service):
+    mounted = MountedAdapter(FakeAdapter(config), service)
+    outbound = mounted.ctx.outbound_pusher
+    outbound.sent = []
+    deliver = outbound._deliver
 
-    async def _deliver(self, *args, **kwargs):
-        self.sent.append((args, kwargs))
-        return True
+    async def record(*args, **kwargs):
+        outbound.sent.append((args, kwargs))
+        return await deliver(*args, **kwargs)
 
-
-class MemoryGateway(ChatGateway):
-    name = "qq"
-
-    def create_outbound(self):
-        dispatcher = RecordingDispatcher(self.config, None, self.muse_service,
-            self.deduplicator, self.route_manager, self.session_mapper)
-        dispatcher.sent = []
-        dispatcher.ensure_baseline = AsyncMock()
-        return dispatcher
-
-    async def start(self):
-        pass
-
-    async def stop(self):
-        pass
-
-    def access_identity(self):
-        return "test"
-
-    async def send_reply(self, kind, target, text, msg_id=None):
-        self.replies.append(text)
-        return {"id": "local-reply"}
+    outbound._deliver = record
+    outbound.ensure_baseline = AsyncMock()
+    return mounted
 
 
 class AtomicJSONTests(unittest.TestCase):
@@ -182,7 +164,7 @@ class GatewayTests(unittest.IsolatedAsyncioTestCase):
             delivered_file=str(root / "delivered.jsonl"), push_state_file=str(root / "push.json"),
             session_bindings={"private:7": "s"})
         cfg.access_requests.state_file = str(root / "access.json")
-        self.gateway = MemoryGateway(cfg, self.service)
+        self.gateway = memory_gateway(cfg, self.service)
         self.gateway.replies = []
         self.outbound = self.gateway.outbound_pusher
         self.addCleanup(self.service.interactions.close)
@@ -207,13 +189,16 @@ class GatewayTests(unittest.IsolatedAsyncioTestCase):
                          ("group", "G", recent, None))
 
     def test_onebot_reference_identity_keeps_legacy_format(self):
-        self.outbound.platform = "onebot"
-        self.outbound.config = OneBotConfig(base_url="http://local.test", routes_file=None,
-                                           push_state_file=None)
-        self.assertEqual(self.outbound.reference_identity(), "onebot:http://local.test")
-        self.outbound.bind_reference_account("123")
-        self.assertEqual(self.outbound.account_identity(), "123")
-        self.assertEqual(self.outbound.interaction_target("private", "7"),
+        cfg = OneBotConfig(base_url="http://local.test", routes_file=None,
+                           session_map_file=str(Path(self.tmp.name) / "onebot-map.json"),
+                           push_state_file=None)
+        mounted = OneBotAdapter(cfg, self.service, self_id="123")
+        mounted.self_id = "123"
+        mounted.host.identity_changed(mounted.adapter)
+        outbound = mounted.ctx.outbound_pusher
+        self.assertEqual(outbound.reference_identity(), "onebot:http://local.test")
+        self.assertEqual(outbound.account_identity(), "123")
+        self.assertEqual(outbound.interaction_target("private", "7"),
                          ("private", "7", "onebot", "123"))
 
     async def test_notification_and_reaction_purpose(self):

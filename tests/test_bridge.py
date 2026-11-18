@@ -25,7 +25,7 @@ from muse_bridge.core.message import (
     split_markdown,
 )
 from muse_bridge.muse.token_manager import MuseTokenManager
-from muse_bridge.adapters.qq.adapter import QQAdapter
+from gateway_helpers import QQAdapter
 from muse_bridge.adapters.onebot.client import OneBotClient
 
 
@@ -138,7 +138,7 @@ class TestMessageAndSplitter(unittest.TestCase):
 
 class TestMediaExtraction(unittest.TestCase):
     def test_extract_media_descriptors(self):
-        from muse_bridge.adapters.qq.outbound import _extract_media_descriptors, _clean_text
+        from muse_bridge.gateway.outbound import _extract_media_descriptors, _clean_text
         event = {
             "role": "assistant",
             "message_id": "mid_media",
@@ -351,7 +351,7 @@ class TestRouteManager(unittest.TestCase):
 
 class TestGateCatchUp(unittest.TestCase):
     def test_baseline_when_disabled(self):
-        from muse_bridge.adapters.qq.outbound import gate_catch_up
+        from muse_bridge.gateway.outbound import gate_catch_up
         hist = [
             {"role": "assistant", "message_id": "m1", "seq": 1},
             {"role": "assistant", "message_id": "m2", "seq": 2},
@@ -372,7 +372,7 @@ class TestGateCatchUp(unittest.TestCase):
         self.assertIn("m2", seen_ids)
 
     def test_catch_up_within_window(self):
-        from muse_bridge.adapters.qq.outbound import gate_catch_up
+        from muse_bridge.gateway.outbound import gate_catch_up
         hist = [
             {"role": "assistant", "message_id": f"m{i}", "seq": i} for i in range(1, 10)
         ]

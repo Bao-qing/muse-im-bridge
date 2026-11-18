@@ -13,8 +13,7 @@ from muse_bridge.core.session_map import SessionMapper
 from muse_bridge.muse.token_manager import MuseTokenManager
 from muse_bridge.muse.client.errors import LoginRequired, HandshakeError, RPCError
 from muse_bridge.muse.service import MuseService
-from muse_bridge.adapters.qq.adapter import QQAdapter
-from muse_bridge.adapters.qq.outbound import QQOutboundPusher
+from gateway_helpers import QQAdapter, make_qq_outbound
 from muse_bridge.core.deduplicator import MessageDeduplicator
 from muse_bridge.adapters.qq.route_manager import RouteManager
 
@@ -116,7 +115,7 @@ class TestLoginFallback(unittest.IsolatedAsyncioTestCase):
             login_required_called.append(target)
             login_required.set()
 
-        pusher = QQOutboundPusher(
+        pusher = make_qq_outbound(
             config=qq_config,
             client=mock_qq_client,
             muse_service=self.muse_service,
@@ -174,7 +173,8 @@ class TestLoginFallback(unittest.IsolatedAsyncioTestCase):
             mock_qq_client.send_message.assert_called()
             sent_text = mock_qq_client.send_message.call_args_list[0][0][2]
             self.assertNotIn("/login", sent_text)
-            self.assertIn("未自动重发", sent_text)
+            self.assertIn("消息可能已发送", sent_text)
+            self.assertIn("请稍后核对", sent_text)
 
     async def test_explicit_login_initiates_otp_session(self):
         """Explicit /login starts an owned temporary OTP interaction."""
@@ -206,7 +206,7 @@ class TestLoginFallback(unittest.IsolatedAsyncioTestCase):
         """Test outbound pusher treats 404 session not found as empty and marks it gated."""
         qq_config = self._make_qq_config()
         mock_qq_client = MagicMock()
-        pusher = QQOutboundPusher(
+        pusher = make_qq_outbound(
             config=qq_config,
             client=mock_qq_client,
             muse_service=self.muse_service,

@@ -205,9 +205,12 @@ class TestWeChatCLI(unittest.TestCase):
         adapter_cls = mock.Mock()
         module = types.SimpleNamespace(WeChatAdapter=adapter_cls)
         cfg = AppConfig(qq=QQConfig(enabled=False), wechat=WeChatConfig(enabled=True))
-        with mock.patch.dict(sys.modules, {"muse_bridge.adapters.wechat.adapter": module}), mock.patch.object(engine, "MuseTokenManager"), mock.patch.object(engine, "MuseService") as service:
+        with mock.patch.dict(sys.modules, {"muse_bridge.adapters.wechat.adapter": module}), mock.patch.object(engine, "MuseTokenManager"), mock.patch.object(engine, "MuseService") as service, mock.patch.object(engine, "UnifiedGateway") as gateway:
+            gateway.return_value.mount.side_effect = lambda adapter: adapter
             instance = engine.BridgeEngine(cfg)
-        adapter_cls.assert_called_once_with(config=cfg.wechat, muse_service=service.return_value)
+        adapter_cls.assert_called_once_with(cfg.wechat)
+        gateway.assert_called_once_with(service.return_value, cfg.gateway)
+        gateway.return_value.mount.assert_called_once_with(adapter_cls.return_value)
         self.assertEqual(instance.adapters, [adapter_cls.return_value])
         self.auth_cls.assert_not_called()
 

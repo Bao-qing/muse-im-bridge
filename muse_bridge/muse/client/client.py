@@ -59,6 +59,8 @@ from .protocol import (
 )
 from .transport import WS, noise_handshake
 from urllib.parse import quote
+from ...config.models import WorkerConfig
+from ..routing import worker_url
 
 DEFAULT_CAPABILITIES = [
     "hotel_results",
@@ -123,6 +125,7 @@ class PushSubscription:
         self._client = client
         self.stream_id = stream_id
         self._buf = buffer
+        self._ended = False
         if hasattr(client, "_register_subscription"):
             client._register_subscription(self)
 
@@ -157,14 +160,16 @@ class PushSubscription:
         events = self.drain_events()
         if events:
             return events
+        if self._ended:
+            raise ConnectionLost("push subscription ended")
         while time.time() < deadline:
             try:
                 _, frame = self._client._ws.recv(
                     timeout=min(10, max(0.1, deadline - time.time())))
-            except ConnectionError as e:
-                raise ConnectionLost(f"push stream lost: {e}") from e
-            except Exception:
+            except TimeoutError:
                 continue
+            except Exception as e:
+                raise ConnectionLost(f"push stream lost: {e}") from e
             try:
                 pt = self._client._recv_cs.decrypt(frame)
             except Exception as e:
@@ -178,15 +183,16 @@ class PushSubscription:
                 if hasattr(self._client, "_dispatch_other_stream_frame"):
                     self._client._dispatch_other_stream_frame(sid, kind, detail)
                 continue
-            if kind == "body_chunk":
-                data = detail.get("data", b"")
+            if kind in {"body_chunk", "response"}:
+                data = detail.get("data" if kind == "body_chunk" else "body", b"")
                 if data:
                     self._buf += data
+                self._ended = self._ended or bool(detail.get("end_body"))
                 events.extend(self.drain_events())
                 if events:
                     return events
-                if detail.get("end_body"):
-                    break
+                if self._ended:
+                    raise ConnectionLost("push subscription ended")
         events.extend(self.drain_events())
         return events
 
@@ -194,7 +200,7 @@ class PushSubscription:
 class MuseClient:
     def __init__(self, token, notary_token, vm_id, client_ip,
                  host="hatch.metaaivm.com",
-                 timezone="Asia/Shanghai", proxy_url=None, direct=False):
+                 timezone="Asia/Shanghai", proxy_url=None, direct=False, worker=None):
         # vm_id and client_ip are required, with no defaults: they are
         # deployment values (your VM, your egress IP), not library
         # constants. host is the shared service endpoint and timezone a
@@ -207,6 +213,7 @@ class MuseClient:
         self.timezone = timezone
         self.proxy_url = proxy_url
         self.direct = direct
+        self.worker = worker or WorkerConfig()
         self._ws = None
         self._send_cs = None
         self._recv_cs = None
@@ -226,6 +233,8 @@ class MuseClient:
             sub.feed_bytes(detail.get("data", b""))
         elif kind == "response" and detail.get("body"):
             sub.feed_bytes(detail["body"])
+        if detail.get("end_body"):
+            sub._ended = True
 
     def read_any_subscription_events(self, timeout: float = 1.0):
         """Read multiplexed push events across all active PushSubscriptions on this connection.
@@ -235,16 +244,18 @@ class MuseClient:
             events.extend(sub.drain_events())
         if events:
             return events
+        if any(sub._ended for sub in self._subscriptions.values()):
+            raise ConnectionLost("push subscription ended")
 
         deadline = time.time() + timeout
         while time.time() < deadline:
             try:
                 _, frame = self._ws.recv(
                     timeout=min(10, max(0.05, deadline - time.time())))
-            except ConnectionError as e:
-                raise ConnectionLost(f"push stream lost: {e}") from e
-            except Exception:
+            except TimeoutError:
                 continue
+            except Exception as e:
+                raise ConnectionLost(f"push stream lost: {e}") from e
             try:
                 pt = self._recv_cs.decrypt(frame)
             except Exception as e:
@@ -259,6 +270,8 @@ class MuseClient:
                 events.extend(sub.drain_events())
             if events:
                 return events
+            if any(sub._ended for sub in self._subscriptions.values()):
+                raise ConnectionLost("push subscription ended")
         return events
 
     # -- connection ---------------------------------------------------
@@ -276,9 +289,17 @@ class MuseClient:
             f"request_id={uuid.uuid4()}",
         ]
         url = f"wss://{self.host}/v1/noise?" + "&".join(params)
+        ws_options = {"proxy_url": self.proxy_url, "direct": self.direct}
+        if self.worker.ws:
+            url = worker_url(url, self.worker)
+            ws_options = {"direct": True}
+            # Pending live validation: disable only for Worker if its upstream
+            # fetch Upgrade cannot negotiate permessage-deflate correctly.
+            if not self.worker.ws_permessage_deflate:
+                ws_options["permessage_deflate"] = False
         ws = None
         try:
-            ws = WS(url, proxy_url=self.proxy_url, direct=self.direct)
+            ws = WS(url, **ws_options)
             send_cs, recv_cs = noise_handshake(ws)
         except Exception as e:
             if ws is not None:
@@ -656,6 +677,41 @@ class MuseClient:
                 offset += n
             if n == 0 or result.get("eof"):
                 return bytes(data)
+        raise MuseError(f"/fs/read did not terminate for {path}")
+
+    def read_file_bounded(self, path, max_bytes, chunk_size=1048576):
+        """Read a workspace file up to ``max_bytes``.
+
+        Returns ``(data, exact_size, exceeded)``. Stops reading further chunks
+        as soon as ``len(data) > max_bytes`` so oversized videos do not stall
+        the subscription sync loop.
+        """
+        import base64 as _base64
+
+        data = bytearray()
+        offset = 0
+        for _ in range(100000):
+            result = self._fs_call("/fs/read", {
+                "path": path, "offset": offset, "len": chunk_size})
+            n = result.get("len") or 0
+            if n:
+                b64 = result.get("data_base64") or ""
+                try:
+                    chunk = _base64.b64decode(b64)
+                except Exception:
+                    raise MuseError(
+                        f"/fs/read returned malformed base64 for {path}")
+                if len(chunk) != n:
+                    raise MuseError(
+                        f"/fs/read length mismatch for {path}: "
+                        f"len={n} decoded={len(chunk)}")
+                data += chunk
+                offset += n
+            eof = n == 0 or bool(result.get("eof"))
+            if max_bytes is not None and len(data) > max_bytes:
+                return None, (len(data) if eof else None), True
+            if eof:
+                return bytes(data), len(data), False
         raise MuseError(f"/fs/read did not terminate for {path}")
 
     def get_history(self, session_id, limit=40):

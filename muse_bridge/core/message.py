@@ -47,6 +47,8 @@ class InboundMessage:
     attachments: List[Attachment] = dataclasses.field(default_factory=list)
     timestamp: float = 0.0
     references: List[tuple[str, str]] = dataclasses.field(default_factory=list)
+    own_references: List[tuple[str, str]] = dataclasses.field(default_factory=list)
+    mentioned: bool = False
 
 
 @dataclasses.dataclass

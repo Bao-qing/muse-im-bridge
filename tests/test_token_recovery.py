@@ -299,20 +299,19 @@ class TestTokenRecovery(unittest.TestCase):
 
 class TestStartupRecovery(unittest.IsolatedAsyncioTestCase):
     async def test_temporary_startup_failure_starts_adapter_without_login(self):
-        from muse_bridge.engine import BridgeEngine
-        from muse_bridge.adapters.qq.adapter import QQAdapter
-        engine = BridgeEngine.__new__(BridgeEngine)
-        engine._running = False
-        engine.config = MagicMock()
-        engine.muse_service = MagicMock()
-        engine.muse_service.verify_connection.side_effect = HandshakeError("temporary")
-        engine.muse_service.interaction_protocol.run = AsyncMock()
-        adapter = MagicMock(spec=QQAdapter)
-        adapter.is_enabled = True
-        adapter.name = "qq"
-        adapter.start = AsyncMock()
-        engine.adapters = [adapter]
-        with contextlib.redirect_stdout(io.StringIO()):
-            await engine.start()
-        adapter.start.assert_awaited_once()
-        adapter.enter_login_mode.assert_not_called()
+        from gateway_helpers import QQAdapter
+        from muse_bridge.config.models import QQConfig
+        with tempfile.TemporaryDirectory() as root:
+            service = MagicMock()
+            service.verify_connection.side_effect = HandshakeError("temporary")
+            service.token_manager.has_credentials.return_value = True
+            service.interaction_protocol.run = AsyncMock()
+            adapter = QQAdapter(QQConfig(enabled=True, app_id="test", app_secret="stub",
+                routes_file=str(Path(root) / "routes.json")), service)
+            adapter.start = AsyncMock()
+            gateway = adapter.runtime
+            gateway._run_events = AsyncMock()
+            with contextlib.redirect_stdout(io.StringIO()):
+                await gateway.start()
+            adapter.start.assert_awaited_once()
+            self.assertFalse(adapter.ctx._in_login_fallback)

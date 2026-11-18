@@ -7,7 +7,7 @@ from test_onebot_adapter import _make_adapter, _group
 from muse_bridge.core.message import DeliveryReference
 from muse_bridge.muse.client.client import MuseClient
 from muse_bridge.adapters.onebot.client import OneBotAPIError
-from muse_bridge.adapters.qq.outbound import QQOutboundPusher
+from gateway_helpers import make_qq_outbound
 from muse_bridge.config.models import QQConfig
 from muse_bridge.core.deduplicator import MessageDeduplicator
 from muse_bridge.core.session_map import SessionMapper
@@ -66,6 +66,7 @@ class QuoteCase(unittest.IsolatedAsyncioTestCase):
         with tempfile.TemporaryDirectory() as tmp:
             adapter, muse = _make_adapter(tmp, group_trigger='at')
             muse.post_message.side_effect = None
+            muse.post_message.return_value = 'quoted-presentation-reply'
             adapter.session_mapper.bind('group', 'G1', 'sid')
             target = {'type': 'presentation', 'presentation_event_id': 'card'}
             adapter.outbound_pusher.reference_store.remember('sid', 'group', 'G1', 'card', [('id', '7')], 'card', target)
@@ -106,7 +107,7 @@ class QuoteCase(unittest.IsolatedAsyncioTestCase):
                               routes_file=tmp+'/routes', push_state_file=tmp+'/push')
             client = mock.Mock()
             client.send_message.return_value = (200, {'id': 'qq-out', 'ext_info': {'ref_idx': 'opaque'}})
-            p = QQOutboundPusher(config, client, mock.Mock(), MessageDeduplicator(), RouteManager(), SessionMapper())
+            p = make_qq_outbound(config, client, mock.Mock(), MessageDeduplicator(), RouteManager(), SessionMapper())
             p.reference_store.remember('s', 'group', 'G', 'old', [('ref', 'old-ref')], 'quoted anchor')
             await p._deliver('group', 'G', 'reply', [], [], [], delivery=DeliveryReference('s', 'new', 'reply', 'old'))
             self.assertEqual(client.send_message.call_args.args[2], 'reply')
@@ -120,7 +121,7 @@ class QuoteCase(unittest.IsolatedAsyncioTestCase):
             config = QQConfig(app_id='bot', app_secret='unused', routes_file=tmp+'/r', push_state_file=tmp+'/p')
             client = mock.Mock()
             client.send_message.return_value = (200, {'id': 'out'})
-            p = QQOutboundPusher(config, client, mock.Mock(), MessageDeduplicator(), RouteManager(), SessionMapper())
+            p = make_qq_outbound(config, client, mock.Mock(), MessageDeduplicator(), RouteManager(), SessionMapper())
             await p._deliver('group', 'G', 'reply', [], [], [], delivery=DeliveryReference('s', 'new', 'reply', 'missing'))
             self.assertIn('原消息在此聊天不可用', client.send_message.call_args.args[2])
             self.assertNotIn('message_reference', client.send_message.call_args.kwargs)
@@ -130,7 +131,7 @@ class QuoteCase(unittest.IsolatedAsyncioTestCase):
             config = QQConfig(app_id='bot', app_secret='unused', routes_file=tmp+'/r', push_state_file=tmp+'/p')
             client = mock.Mock()
             client.send_message.return_value = (400, {'message': 'not allowed'})
-            p = QQOutboundPusher(config, client, mock.Mock(), MessageDeduplicator(), RouteManager(), SessionMapper())
+            p = make_qq_outbound(config, client, mock.Mock(), MessageDeduplicator(), RouteManager(), SessionMapper())
             p.reference_store.remember('s', 'group', 'G', 'old', [('ref', 'REFIDX_exact')])
             self.assertFalse(await p._deliver('group', 'G', 'reply', [], [], [], delivery=DeliveryReference('s', 'n', 'reply', 'old')))
             self.assertEqual(client.send_message.call_count, 1)
@@ -147,7 +148,7 @@ class QuoteCase(unittest.IsolatedAsyncioTestCase):
                     client.send_message.return_value = (400, error)
                     routes = RouteManager(state_file=None)
                     route = routes.register('user', 'group', 'G', 'passive-id') if passive else None
-                    p = QQOutboundPusher(config, client, mock.Mock(), MessageDeduplicator(), routes, SessionMapper())
+                    p = make_qq_outbound(config, client, mock.Mock(), MessageDeduplicator(), routes, SessionMapper())
                     p.reference_store.remember('s', 'group', 'G', 'old', [('ref', 'REFIDX_exact')])
                     result = await p._deliver('group', 'G', 'reply', [], [], [], route=route,
                                               delivery=DeliveryReference('s', 'new', 'reply', 'old'))
@@ -248,7 +249,7 @@ class QQReactionTextCase(unittest.IsolatedAsyncioTestCase):
         client = QQClient('bot', 'unused')
         client.post_with_retry = mock.Mock(return_value=(200, {'id': 'out'}))
         mapper = SessionMapper(bindings={kind+':target': 's'})
-        pusher = QQOutboundPusher(config, client, mock.Mock(), MessageDeduplicator(persistence_file=None),
+        pusher = make_qq_outbound(config, client, mock.Mock(), MessageDeduplicator(persistence_file=None),
                                   RouteManager(state_file=None), mapper)
         pusher.reference_store.remember('s', kind, 'target', 'old', [('ref', 'REFIDX_old')])
         return pusher, client
@@ -459,8 +460,11 @@ class DeliveryEdgeCase(unittest.IsolatedAsyncioTestCase):
             a, _ = _make_adapter(tmp)
             p = a.outbound_pusher
             p.reference_store.remember('s', 'group', 'G1', 'old', [('id', '8')])
-            p.bind_reference_account('different-bot')
-            self.assertIsNone(p.reference_store.resolve_channel('s', 'group', 'G1', [('id', '8')]))
+            a.self_id = 'different-bot'
+            a.host.identity_changed(a.adapter)
+            replacement = a.ctx.outbound_pusher
+            self.assertIsNot(replacement, p)
+            self.assertIsNone(replacement.reference_store.resolve_channel('s', 'group', 'G1', [('id', '8')]))
 
     async def test_file_companion_retains_native_quote_and_reverse_mapping(self):
         with tempfile.TemporaryDirectory() as tmp:

@@ -186,7 +186,7 @@ class ConnectorChatCase(unittest.IsolatedAsyncioTestCase):
         item = self.card()
         with patch.object(self.service, "capture_credential", return_value="saved") as capture:
             await self.send(f"/密钥 {item.id}")
-            self.assertIn("单行", self.text())
+            self.assertIn("一行即可", self.text())
             await self.send("account\npassword")
             self.assertIn("只接受一行", self.text())
             capture.assert_not_called()
@@ -209,7 +209,7 @@ class ConnectorChatCase(unittest.IsolatedAsyncioTestCase):
         with patch.object(self.service, "capture_credential", return_value="saved") as capture:
             await self.quoted(f"/密钥 {item.id}")
             capture.assert_not_called()
-            self.assertIn("单行", self.text())
+            self.assertIn("一行即可", self.text())
             await self.send("fictional-key")
             capture.assert_called_once_with(item, "fictional-key")
         self.service.post_message.assert_not_called()

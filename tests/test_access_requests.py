@@ -11,7 +11,7 @@ from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 from muse_bridge.adapters.qq.access import AccessRequestStore
-from muse_bridge.adapters.qq.adapter import QQAdapter
+from gateway_helpers import QQAdapter
 from muse_bridge.config.models import AccessRequestsConfig, ConfigLoader, MuseConfig, QQConfig
 from muse_bridge.muse.service import MuseService
 
@@ -150,7 +150,7 @@ class TestAccessRequests(unittest.IsolatedAsyncioTestCase):
 
     async def test_failed_save_never_publishes_automatic_grant(self):
         self.config.access_requests.auto_approve = True
-        with patch("muse_bridge.gateway.access.os.replace", side_effect=OSError("disk")):
+        with patch.object(self.adapter.access_requests.store, "_commit", side_effect=OSError("disk")):
             await self.send("/申请")
         self.assertFalse(self.allowed())
         self.assertFalse(Path(self.config.access_requests.state_file).exists())
@@ -160,7 +160,7 @@ class TestAccessRequests(unittest.IsolatedAsyncioTestCase):
     async def test_failed_approval_save_keeps_pending_and_no_access(self):
         await self.send("/申请")
         row = self.pending()[0]
-        with patch("muse_bridge.gateway.access.os.replace", side_effect=OSError("disk")):
+        with patch.object(self.adapter.access_requests.store, "_commit", side_effect=OSError("disk")):
             await self.send(f"/申请审批 {row['id']} 同意", user="ADMIN", group=None)
         self.assertFalse(self.allowed())
         self.assertEqual(self.adapter.access_requests.store.get(row["id"])["status"], "pending")
@@ -272,7 +272,8 @@ class TestAccessRequests(unittest.IsolatedAsyncioTestCase):
 
     async def test_partial_admin_delivery_retries_only_failed_recipient(self):
         self.config.admin_id.append("ADMIN2")
-        self.adapter.client.send_message.side_effect = [(200, {}), (500, {}), (500, {}), (200, {})]
+        # A known refusal can be retried; an unknown 5xx outcome must not replay.
+        self.adapter.client.send_message.side_effect = [(200, {}), (403, {}), (200, {})]
         await self.send("/申请")
         row = self.pending()[0]
         self.assertEqual(row["notified"], ["ADMIN"])
@@ -281,7 +282,7 @@ class TestAccessRequests(unittest.IsolatedAsyncioTestCase):
             await self.send("/申请")
         calls = self.adapter.client.send_message.call_args_list
         self.assertEqual(sum(c.args[:2] == ("private", "ADMIN") for c in calls), 1)
-        self.assertEqual(sum(c.args[:2] == ("private", "ADMIN2") for c in calls), 3)
+        self.assertEqual(sum(c.args[:2] == ("private", "ADMIN2") for c in calls), 2)
         self.assertEqual(self.pending()[0]["notified"], ["ADMIN", "ADMIN2"])
 
     def test_restart_and_multiple_member_grants_preserve_wildcard(self):

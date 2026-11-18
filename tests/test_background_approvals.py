@@ -10,14 +10,14 @@ import uuid
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
-from muse_bridge.adapters.onebot.adapter import OneBotAdapter
-from muse_bridge.adapters.qq.adapter import QQAdapter
+from gateway_helpers import OneBotAdapter, QQAdapter
 from muse_bridge.config.models import (
     AccessRequestsConfig, AppConfig, ApprovalConfig, ConfigLoader, GatewayConfig,
     MuseConfig, OneBotConfig, QQConfig,
 )
 from muse_bridge.engine import BridgeEngine
 from muse_bridge.gateway.admin_activity import AdminPrivateActivity
+from muse_bridge.gateway.runtime import UnifiedGateway
 from muse_bridge.muse.interactions import ApprovalBlocked
 from muse_bridge.muse.service import MuseService
 
@@ -68,16 +68,15 @@ class BackgroundCase(unittest.IsolatedAsyncioTestCase):
         self.p = self.service.interaction_protocol
         self.remote = Remote(background())
         self.p.request = MagicMock(side_effect=self.remote)
-        self.qq = QQAdapter(self.config(QQConfig, "qq", ["ADMIN", "SECOND"]), self.service)
-        self.ob = OneBotAdapter(self.config(OneBotConfig, "onebot", ["12345"]), self.service)
+        self.gateway = UnifiedGateway(self.service)
+        self.qq = QQAdapter(self.config(QQConfig, "qq", ["ADMIN", "SECOND"]), self.service,
+                            gateway=self.gateway)
+        self.ob = OneBotAdapter(self.config(OneBotConfig, "onebot", ["12345"]), self.service,
+                               gateway=self.gateway)
         self.qq.client = MagicMock()
         self.qq.client.send_message.return_value = (200, {"id": "sent-card"})
-        self.qq.outbound_pusher.client = self.qq.client
-        self.ob.outbound_pusher._deliver = AsyncMock(return_value=True)
-        self.engine = BridgeEngine.__new__(BridgeEngine)
-        self.engine.config = AppConfig(qq=self.qq.config, onebot=self.ob.config)
-        self.engine.adapters = [self.qq, self.ob]
-        self.engine.muse_service = self.service
+        self.ob.client.send_msg.return_value = {"message_id": 777}
+        self.ob.outbound_pusher._deliver = AsyncMock(wraps=self.ob.outbound_pusher._deliver)
 
     def config(self, cls, name, admins):
         credentials = ({"app_id": "test-app", "app_secret": "test-secret"} if cls is QQConfig
@@ -104,9 +103,10 @@ class BackgroundCase(unittest.IsolatedAsyncioTestCase):
         await self.qq.handle_event("GROUP_AT_MESSAGE_CREATE" if group else "C2C_MESSAGE_CREATE", event)
 
     async def tick(self, notify=None):
-        turns = iter([True, False])
-        with patch("muse_bridge.muse.interactions.asyncio.sleep", new=AsyncMock()):
-            await self.p.run(notify or self.engine._notify_interaction, lambda: next(turns))
+        # Policy/routing tests drive one completed synchronization, without
+        # starting the separately tested account-wide socket worker.
+        pending = await self.p.reconcile()
+        await self.p._notify_pending(notify or self.gateway.notify_interaction, pending)
 
     def test_schedule_is_independent_of_every_chat_gate(self):
         item = self.load()
@@ -185,20 +185,20 @@ class BackgroundCase(unittest.IsolatedAsyncioTestCase):
 
     async def test_no_admin_activity_retains_pending_without_broadcast(self):
         item = self.load()
-        self.assertFalse(await self.p.announce(item, self.engine._notify_interaction))
+        self.assertFalse(await self.p.announce(item, self.gateway.notify_interaction))
         self.qq.client.send_message.assert_not_called()
         self.ob.outbound_pusher._deliver.assert_not_awaited()
         self.assertFalse(item.context.get("notified", False))
         await self.send("/聊天")
-        self.assertTrue(await self.p.announce(item, self.engine._notify_interaction))
+        self.assertTrue(await self.p.announce(item, self.gateway.notify_interaction))
         self.assertEqual(self.qq.client.send_message.call_args.args[:2], ("private", "ADMIN"))
         self.assertFalse(self.qq.session_mapper.current("private", "ADMIN"))
 
     async def test_explicit_target_needs_no_activity_or_session_binding(self):
-        self.engine.config.gateway = GatewayConfig(background_approval_push="qq:SECOND")
+        self.gateway.config = GatewayConfig(background_approval_push="qq:SECOND")
         self.qq.session_mapper.bind("group", "G", "unrelated")
         item = self.load()
-        self.assertTrue(await self.p.announce(item, self.engine._notify_interaction))
+        self.assertTrue(await self.p.announce(item, self.gateway.notify_interaction))
         self.assertEqual(self.qq.client.send_message.call_args.args[:2], ("private", "SECOND"))
         self.ob.outbound_pusher._deliver.assert_not_awaited()
         self.assertEqual(self.qq.session_mapper.snapshot(), {"group:G": "unrelated"})
@@ -209,7 +209,7 @@ class BackgroundCase(unittest.IsolatedAsyncioTestCase):
             self.ob.admin_private_activity.record(self.ob._admin_activity_identity(), "12345", ["12345"])
         self.qq.client.send_message.reset_mock()
         item = self.load()
-        await self.p.announce(item, self.engine._notify_interaction)
+        await self.p.announce(item, self.gateway.notify_interaction)
         self.qq.client.send_message.assert_not_called()
         self.ob.outbound_pusher._deliver.assert_awaited_once()
         self.assertEqual(self.ob.outbound_pusher._deliver.await_args.args[:2], ("private", "12345"))
@@ -217,20 +217,22 @@ class BackgroundCase(unittest.IsolatedAsyncioTestCase):
     async def test_failed_send_keeps_selected_inbox_for_retry(self):
         await self.send("/聊天")
         item = self.load()
-        self.qq.outbound_pusher._send_to_qq = AsyncMock(return_value=False)
-        self.assertFalse(await self.p.announce(item, self.engine._notify_interaction))
+        self.qq.client.send_message.reset_mock()
+        self.qq.client.send_message.return_value = (403, {"message": "refused"})
+        self.assertFalse(await self.p.announce(item, self.gateway.notify_interaction))
+        first = self.qq.client.send_message.call_args.args[:2]
+        self.qq.client.send_message.return_value = (200, {"id": "retry-card"})
         await self.send("/聊天", user="SECOND")
-        self.qq.outbound_pusher._send_to_qq.return_value = True
-        self.assertTrue(await self.p.announce(item, self.engine._notify_interaction))
-        self.assertEqual([c.args[:2] for c in self.qq.outbound_pusher._send_to_qq.await_args_list],
+        self.assertTrue(await self.p.announce(item, self.gateway.notify_interaction))
+        self.assertEqual([first, self.qq.client.send_message.call_args.args[:2]],
                          [("private", "ADMIN"), ("private", "ADMIN")])
 
     async def test_background_push_and_listing_never_acquire_chat_input(self):
-        self.engine.config.gateway = GatewayConfig(background_approval_push="qq:ADMIN")
+        self.gateway.config = GatewayConfig(background_approval_push="qq:ADMIN")
         item = self.load()
         self.qq.session_mapper.bind("private", "ADMIN", "s1")
         self.qq.outbound_pusher.ensure_baseline = AsyncMock()
-        await self.p.announce(item, self.engine._notify_interaction)
+        await self.p.announce(item, self.gateway.notify_interaction)
         for listed in (False, True):
             if listed:
                 await self.send("/审批")
@@ -250,40 +252,40 @@ class BackgroundCase(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("可直接回复数字审批", hint)
 
     async def test_private_quoted_choice_uses_background_queue(self):
-        self.engine.config.gateway = GatewayConfig(background_approval_push="qq:ADMIN")
+        self.gateway.config = GatewayConfig(background_approval_push="qq:ADMIN")
         item = self.load()
-        await self.p.announce(item, self.engine._notify_interaction)
+        await self.p.announce(item, self.gateway.notify_interaction)
         await self.send("1", quote="sent-card")
         self.assertTrue(item.terminal)
         self.assertEqual(self.remote.posts[0][1]["decision"], "allow_once")
         self.service.post_message.assert_not_called()
 
     async def test_unrelated_quote_does_not_enter_background_approval_flow(self):
-        self.engine.config.gateway = GatewayConfig(background_approval_push="qq:ADMIN")
+        self.gateway.config = GatewayConfig(background_approval_push="qq:ADMIN")
         self.load()
-        await self.p.announce(self.load(), self.engine._notify_interaction)
+        await self.p.announce(self.load(), self.gateway.notify_interaction)
         router = self.qq.interaction_router
-        event = {"message_reference": {"message_id": "ordinary-message"}}
+        event = {"references": [("id", "ordinary-message")]}
         self.assertFalse(router.is_credential_input(("private", "ADMIN", "ADMIN"), "1", event))
         self.assertFalse(await router.handle(("private", "ADMIN", "ADMIN"), "1", "in", True, "", event))
         self.assertEqual(self.remote.posts, [])
 
     async def test_quoted_card_invalid_choice_stays_in_explicit_quote_flow(self):
-        self.engine.config.gateway = GatewayConfig(background_approval_push="qq:ADMIN")
+        self.gateway.config = GatewayConfig(background_approval_push="qq:ADMIN")
         item = self.load()
-        await self.p.announce(item, self.engine._notify_interaction)
+        await self.p.announce(item, self.gateway.notify_interaction)
         await self.send("不是选项", quote="sent-card")
         self.assertEqual(self.remote.posts, [])
         self.service.post_message.assert_not_called()
-        self.assertIn("选项数字", self.qq.client.send_message.call_args.args[2])
+        self.assertIn("审批卡回复数字", self.qq.client.send_message.call_args.args[2])
 
     async def test_quote_replay_cannot_decide_next_background_card(self):
-        self.engine.config.gateway = GatewayConfig(background_approval_push="qq:ADMIN")
+        self.gateway.config = GatewayConfig(background_approval_push="qq:ADMIN")
         self.remote.rows["scheduled-2"] = background("scheduled-2", requested_at_ms=2000)
         item = self.load()
-        await self.p.announce(item, self.engine._notify_interaction)
+        await self.p.announce(item, self.gateway.notify_interaction)
         router = self.qq.interaction_router
-        event = {"message_reference": {"message_id": "sent-card"}}
+        event = {"references": [("id", "sent-card")]}
         self.qq.client.send_message.return_value = (200, {"id": "next-card"})
         for _ in range(2):
             await router.handle(("private", "ADMIN", "ADMIN"), "1", "incoming", True, "", event=event)
@@ -341,9 +343,9 @@ class BackgroundCase(unittest.IsolatedAsyncioTestCase):
         self.assertIn("变化", self.qq.client.send_message.call_args.args[2])
 
     async def test_background_queue_does_not_steal_foreground_gate_input(self):
-        self.engine.config.gateway = GatewayConfig(background_approval_push="qq:ADMIN")
+        self.gateway.config = GatewayConfig(background_approval_push="qq:ADMIN")
         item = self.load()
-        await self.p.announce(item, self.engine._notify_interaction)
+        await self.p.announce(item, self.gateway.notify_interaction)
         self.qq.session_mapper.bind("private", "ADMIN", "s1")
         self.service.interactions.managed_sessions.add("s1")
         self.remote.rows["foreground"] = background("foreground", scope={"thread_id": "s1"}, display={})
@@ -366,11 +368,11 @@ class BackgroundCase(unittest.IsolatedAsyncioTestCase):
         item = self.load()
         self.qq.config.admin_id.remove("ADMIN")
         self.qq.client.send_message.reset_mock()
-        self.assertFalse(await self.p.announce(item, self.engine._notify_interaction))
+        self.assertFalse(await self.p.announce(item, self.gateway.notify_interaction))
         self.qq.client.send_message.assert_not_called()
         await self.send("/聊天", user="SECOND")
         self.qq.config.enabled = False
-        self.assertFalse(await self.p.announce(item, self.engine._notify_interaction))
+        self.assertFalse(await self.p.announce(item, self.gateway.notify_interaction))
 
     async def test_native_scheduled_task_option_is_not_replaced_by_chat_permission(self):
         item = self.load()
@@ -401,7 +403,7 @@ class BackgroundCase(unittest.IsolatedAsyncioTestCase):
         await self.send("/审批", user="SECOND", group=True)
         self.assertEqual(self.qq.latest_admin_private(), first)
         item = self.load()
-        await self.p.announce(item, self.engine._notify_interaction)
+        await self.p.announce(item, self.gateway.notify_interaction)
         self.assertEqual(self.qq.latest_admin_private(), first)
         restored = AdminPrivateActivity(str(self.qq.config.routes_file) + ".admins.local.json")
         self.assertEqual(restored.latest(self.qq._admin_activity_identity(), ["ADMIN"]), first)

@@ -16,6 +16,7 @@ import json
 import os
 import urllib.request
 from typing import Any, ClassVar, Dict, List, Optional, Union
+from urllib.parse import urlsplit
 
 from . import constants
 
@@ -54,12 +55,49 @@ def _detect_egress_ip(proxy_url: Optional[str] = None, direct: bool = True) -> s
 class ApprovalConfig:
     mode: str = "manual"
     notify: bool = True
+    sync_interval_s: int = 180
 
     def __post_init__(self):
         if self.mode not in {"manual", "allow_all", "deny_all"}:
             raise ValueError("muse.approval.mode must be manual, allow_all, or deny_all")
         if not isinstance(self.notify, bool):
             raise ValueError("muse.approval.notify must be a boolean")
+        if type(self.sync_interval_s) is not int or self.sync_interval_s <= 0:
+            raise ValueError("muse.approval.sync_interval_s must be a positive integer")
+
+
+@dataclasses.dataclass
+class WorkerConfig:
+    base: str = "https://your-worker.example.com"
+    ws: bool = False
+    http: bool = False
+    login: bool = False
+    login_origin: str = "real"
+    ws_permessage_deflate: bool = True
+
+    def __post_init__(self):
+        for name in ("ws", "http", "login", "ws_permessage_deflate"):
+            if type(getattr(self, name)) is not bool:
+                raise ValueError(f"muse.worker.{name} must be a boolean")
+        if self.login_origin not in {"real", "worker"}:
+            raise ValueError("muse.worker.login_origin must be real or worker")
+        if not isinstance(self.base, str):
+            raise ValueError("muse.worker.base must be an HTTPS origin")
+        try:
+            parsed = urlsplit(self.base)
+            valid = (parsed.scheme == "https" and parsed.hostname and not parsed.username
+                     and not parsed.password and parsed.port in (None, 443)
+                     and parsed.path in ("", "/") and not parsed.query and not parsed.fragment)
+        except ValueError:
+            valid = False
+        if not valid:
+            # WS transport intentionally retains its fixed TLS port 443.
+            raise ValueError("muse.worker.base must be an HTTPS origin on port 443")
+        self.base = self.base.rstrip("/")
+
+    @property
+    def enabled(self) -> bool:
+        return self.ws or self.http or self.login
 
 
 @dataclasses.dataclass
@@ -74,6 +112,7 @@ class MuseConfig:
     proxy_url: Optional[str] = None
     direct: bool = constants.DEFAULT_MUSE_DIRECT
     approval: ApprovalConfig = dataclasses.field(default_factory=ApprovalConfig)
+    worker: WorkerConfig = dataclasses.field(default_factory=WorkerConfig)
 
 
 @dataclasses.dataclass
@@ -268,12 +307,15 @@ class OneBotConfig(ChatConfig):
     ws_url: str = ""
     # Which group messages reach Muse: "all", "at" (@bot or a / command), "prefix" (/ only).
     group_trigger: str = constants.DEFAULT_ONEBOT_GROUP_TRIGGER
+    typing_enabled: bool = False
     qzone_feed: QzoneFeedConfig = dataclasses.field(default_factory=QzoneFeedConfig)
 
     def __post_init__(self):
         super().__post_init__()
         self.whitelist = _normalize_whitelist(self.whitelist)
         self.admin_id = [str(a) for a in self.admin_id if a is not None and str(a).strip()]
+        if type(self.typing_enabled) is not bool:
+            raise ValueError("adapters.onebot.typing_enabled must be a boolean")
         if not isinstance(self.qzone_feed, QzoneFeedConfig):
             raise ValueError("adapters.onebot.qzone_feed must be a QzoneFeedConfig")
         if self.group_trigger not in {"all", "at", "prefix"}:
@@ -343,11 +385,49 @@ class WeChatConfig(ConversationConfig):
 
 
 @dataclasses.dataclass
+class GatewayFeedConfig:
+    """Gateway-owned Muse feed publishing across mounted adapters."""
+
+    enabled: bool = False
+    targets: Dict[str, str] = dataclasses.field(default_factory=dict)
+    poll_interval_s: int = 300
+    max_age_s: int = 3600
+    scan_limit: int = 50
+    max_per_scan: int = 3
+    min_publish_interval_s: int = 60
+    publish_window_s: int = 3600
+    max_per_window: int = 5
+
+    def __post_init__(self):
+        if type(self.enabled) is not bool:
+            raise ValueError("gateway.feed.enabled must be a boolean")
+        if not isinstance(self.targets, dict):
+            raise ValueError("gateway.feed.targets must be an object")
+        normalized: Dict[str, str] = {}
+        for key, mode in self.targets.items():
+            if key not in {"qq", "onebot", "wechat"}:
+                raise ValueError("gateway.feed.targets keys must be qq, onebot, or wechat")
+            if mode not in {"auto", "native", "chat"}:
+                raise ValueError("gateway.feed.targets values must be auto, native, or chat")
+            normalized[key] = mode
+        self.targets = normalized
+        for name in ("poll_interval_s", "max_age_s", "scan_limit", "max_per_scan",
+                     "min_publish_interval_s", "publish_window_s", "max_per_window"):
+            if type(getattr(self, name)) is not int or getattr(self, name) <= 0:
+                raise ValueError(f"gateway.feed.{name} must be a positive integer")
+        if self.scan_limit > 100 or self.max_per_scan > self.scan_limit:
+            raise ValueError("gateway.feed requires max_per_scan <= scan_limit <= 100")
+
+
+@dataclasses.dataclass
 class GatewayConfig:
     login_through_adapter: str = ""
     background_approval_push: str = ""
+    feed: GatewayFeedConfig = dataclasses.field(default_factory=GatewayFeedConfig)
 
     def __post_init__(self):
+        if not isinstance(self.feed, GatewayFeedConfig):
+            raise ValueError("gateway.feed must be a GatewayFeedConfig")
         value = self.background_approval_push
         if not isinstance(value, str):
             raise ValueError("gateway.background_approval_push must be a string")
@@ -512,8 +592,14 @@ class ConfigLoader:
         approval_cfg = ApprovalConfig(
             mode=approval_raw.get("mode", "manual"),
             notify=approval_raw.get("notify", True),
+            sync_interval_s=approval_raw.get("sync_interval_s", 180),
         )
+        worker_raw = m_raw.get("worker", {})
+        if not isinstance(worker_raw, dict):
+            raise ValueError("muse.worker must be an object")
+        worker_cfg = WorkerConfig(**worker_raw)
         muse_cfg = MuseConfig(
+            worker=worker_cfg,
             approval=approval_cfg,
             mint_file=_get_val(m_raw, "mint_file", os.environ.get("MUSE_MINT_FILE") or ".mint.json"),
             cookies_file=_get_val(m_raw, "cookies_file", os.environ.get("MUSE_COOKIES_FILE") or "cookies.json"),
@@ -526,7 +612,10 @@ class ConfigLoader:
             direct=_get_val(m_raw, "direct", constants.DEFAULT_MUSE_DIRECT),
         )
 
-        if not muse_cfg.client_ip:
+        # Worker egress is not the bridge's egress. Never probe third parties in
+        # any Worker mode. Empty client_ip acceptance is pending live validation;
+        # set muse.client_ip explicitly to test a supplied value instead.
+        if not muse_cfg.client_ip and not muse_cfg.worker.enabled:
             detected = _detect_egress_ip(muse_cfg.proxy_url, muse_cfg.direct)
             if detected:
                 muse_cfg.client_ip = detected
@@ -626,15 +715,25 @@ class ConfigLoader:
             access_token=str(ob_raw.get("access_token") or os.environ.get("ONEBOT_ACCESS_TOKEN") or ""),
             ws_url=str(ob_raw.get("ws_url") or os.environ.get("ONEBOT_WS_URL") or ""),
             group_trigger=ob_raw.get("group_trigger", constants.DEFAULT_ONEBOT_GROUP_TRIGGER),
+            typing_enabled=(
+                overrides["typing_enabled"]
+                if ("typing_enabled" in overrides and overrides["typing_enabled"] is not None)
+                else ob_raw.get("typing_enabled", False)
+            ),
         )
 
         # 4. Gateway config
         gw_raw = raw_data.get("gateway", {})
         if not isinstance(gw_raw, dict):
             raise ValueError("gateway must be an object")
+        gw_feed_raw = gw_raw.get("feed", {})
+        gw_feed_fields = {f.name for f in dataclasses.fields(GatewayFeedConfig)}
+        if not isinstance(gw_feed_raw, dict) or gw_feed_raw.keys() - gw_feed_fields:
+            raise ValueError("gateway.feed must be an object with known fields")
         gw_cfg = GatewayConfig(
             login_through_adapter=str(gw_raw.get("login_through_adapter", "")),
             background_approval_push=gw_raw.get("background_approval_push", ""),
+            feed=GatewayFeedConfig(**gw_feed_raw),
         )
 
         # 5. Logging config. An explicit level wins over legacy debug flags.
