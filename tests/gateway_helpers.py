@@ -12,7 +12,7 @@ from muse_bridge.adapters.qq.adapter import QQAdapter as QQDriver
 from muse_bridge.adapters.onebot.adapter import OneBotAdapter as OneBotDriver
 from muse_bridge.adapters.wechat.adapter import WeChatAdapter as WeChatDriver
 from muse_bridge.config.models import MuseConfig
-from muse_bridge.core.delivery import DeliveryReceipt, DeliveryResult, DeliveryStatus
+from muse_bridge.core.delivery import DeliveryReceipt, DeliveryResult, DeliveryStatus, reaction_as_delivery
 from muse_bridge.core.interactions import InteractionManager
 from muse_bridge.gateway.delivery import GatewayOutbound
 from muse_bridge.gateway.runtime import UnifiedGateway
@@ -169,3 +169,6 @@ class FakeAdapter(BaseAdapter):
         self.replies.append(envelope.text)
         return DeliveryResult(DeliveryStatus.CONFIRMED, [
             DeliveryReceipt(envelope.target_type, envelope.target_id, (("id", "local-reply"),))])
+
+    async def deliver_reaction(self, envelope):
+        return await self.deliver(reaction_as_delivery(envelope))

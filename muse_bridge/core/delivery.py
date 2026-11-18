@@ -44,6 +44,38 @@ class ReactionEnvelope:
     target_id: str
     message_ref: tuple[str, str]
     reactions: tuple[str, ...]  # Complete desired state, including empty to clear.
+    added: tuple[str, ...] = ()
+    removed: tuple[str, ...] = ()
+    quote: NativeQuote | None = None
+    quote_fallback: str = ""
+    passive_id: str | None = None
+    fallback_target: str | None = None
+
+
+def reaction_as_delivery(envelope: ReactionEnvelope) -> DeliveryEnvelope:
+    """Render a ReactionEnvelope as a quoted plain-text message for chat platforms."""
+    parts = []
+    if envelope.added:
+        parts.append(" ".join(envelope.added))
+    if envelope.removed:
+        parts.append(" ".join(envelope.removed))
+    if not parts and envelope.reactions:
+        parts.append(" ".join(envelope.reactions))
+    quote = envelope.quote
+    if quote is None and envelope.message_ref and envelope.message_ref[0] and envelope.message_ref[1]:
+        quote = NativeQuote((envelope.message_ref,))
+    return DeliveryEnvelope(
+        delivery_id=envelope.delivery_id,
+        target_type=envelope.target_type,
+        target_id=envelope.target_id,
+        text="\n".join(parts),
+        purpose="notification",
+        passive_id=envelope.passive_id,
+        quote=quote,
+        quote_fallback=envelope.quote_fallback,
+        plain_text=True,
+        fallback_target=envelope.fallback_target,
+    )
 
 
 @dataclass

@@ -212,7 +212,11 @@ class OutboundDispatcher:
         self._last_sweep: float = 0.0
         self._pending_subscribe: Set[str] = set()     # sessions that need /聊天/subscribe opened
         self._uncreated_sessions: Set[str] = set()    # lazy sessions (404 until first message is posted)
+        self._reaction_locks: Dict[Tuple[str, str], asyncio.Lock] = {}
         self._load_state()
+
+    def reaction_lock(self, session_id: str, message_id: str) -> asyncio.Lock:
+        return self._reaction_locks.setdefault((str(session_id), str(message_id)), asyncio.Lock())
 
     def reference_identity(self) -> str:
         """Persistent reference identity; retain legacy QQ/OneBot format."""
@@ -1203,53 +1207,57 @@ class OutboundDispatcher:
             return None
         if not isinstance(mid, str) or not mid or type(seq) is not int:
             return None
+        aliases = {"hatch:facebook_thumbs_up_v1": "👍", "hatch:heart_v1": "🫶"}
         emojis = [e.get("emoji") if isinstance(e, dict) else e for e in emojis]
-        emojis = list(dict.fromkeys(e for e in emojis if isinstance(e, str) and 0 < len(e) <= 64))[:64]
+        emojis = [aliases.get(e, e) for e in emojis if isinstance(e, str)]
+        emojis = list(dict.fromkeys(e for e in emojis if 0 < len(e) <= 64))[:64]
         return mid, seq, emojis
+
+    async def _deliver_reaction(self, target_type, target_id, emojis, additions, removals, delivery=None):
+        parts = []
+        if additions:
+            parts.append(" ".join(additions))
+        if removals:
+            parts.append(" ".join(removals))
+        text = chr(10).join(parts)
+        return await self._deliver(target_type, target_id, text, [], [], [], delivery=delivery)
 
     async def _dispatch_reaction(self, event, session_id, baseline=False):
         snapshot = self._reaction_snapshot(event)
         if not session_id or snapshot is None:
             return
         mid, seq, emojis = snapshot
-        previous = self.reference_store.reaction_state(session_id, mid)
-        if baseline:
-            if previous is None:
-                self.reference_store.set_reaction_state(session_id, mid, seq, emojis)
-            return
-        if previous:
-            prev_seq, old = previous
-            if seq and prev_seq and seq <= prev_seq:
+        async with self.reaction_lock(session_id, mid):
+            previous = self.reference_store.reaction_state(session_id, mid)
+            if baseline:
+                if previous is None:
+                    self.reference_store.set_reaction_state(session_id, mid, seq, emojis)
                 return
-            # History is fetched after push batches and is authoritative even
-            # when a newer reaction was missed during a transport disconnect.
-        else:
-            prev_seq, old = 0, []
-        if old == emojis:
-            if seq > prev_seq:
-                self.reference_store.set_reaction_state(session_id, mid, seq, emojis)
-            return
-        target_type, target_id = self._proactive_target(session_id)
-        if not target_id:
-            return
-        additions = [e for e in emojis if e not in old]
-        removals = [e for e in old if e not in emojis]
-        parts = []
-        if additions:
-            # parts.append("【Muse 反应】" + " ".join(additions))
-            parts.append(" ".join(additions))
-        if removals:
-            # parts.append("【Muse 取消反应】" + " ".join(removals))
-            parts.append(" ".join(removals))
-        text = chr(10).join(parts)
-        try:
-            success = await self._deliver(
-                target_type, target_id, text, [], [], [],
-                delivery=DeliveryReference(session_id, mid, "", mid, plain_text=True, purpose="notification", revision=seq))
-            if success:
-                self.reference_store.set_reaction_state(session_id, mid, max(seq, prev_seq), emojis)
-        except Exception as exc:
-            logger.warning("Reaction delivery failed: %s", safe_error(exc))
+            if previous:
+                prev_seq, old = previous
+                if seq and prev_seq and seq <= prev_seq:
+                    return
+                # History is fetched after push batches and is authoritative even
+                # when a newer reaction was missed during a transport disconnect.
+            else:
+                prev_seq, old = 0, []
+            if old == emojis:
+                if seq > prev_seq:
+                    self.reference_store.set_reaction_state(session_id, mid, seq, emojis)
+                return
+            target_type, target_id = self._proactive_target(session_id)
+            if not target_id:
+                return
+            additions = [e for e in emojis if e not in old]
+            removals = [e for e in old if e not in emojis]
+            try:
+                success = await self._deliver_reaction(
+                    target_type, target_id, emojis, additions, removals,
+                    delivery=DeliveryReference(session_id, mid, "", mid, plain_text=True, purpose="notification", revision=seq))
+                if success:
+                    self.reference_store.set_reaction_state(session_id, mid, max(seq, prev_seq), emojis)
+            except Exception as exc:
+                logger.warning("Reaction delivery failed: %s", safe_error(exc))
 
     def bind_reference_account(self, account_id):
         """Never reuse another logged-in OneBot account's opaque IDs."""

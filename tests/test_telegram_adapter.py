@@ -256,7 +256,7 @@ class TelegramAdapterTests(unittest.IsolatedAsyncioTestCase):
             "timeout": 30, "allowed_updates": ["message", "message_reaction"], "offset": 24,
         }))
 
-    async def test_old_gateway_ignores_reaction_then_processes_chat(self):
+    async def test_reaction_without_session_is_ignored_then_processes_chat(self):
         adapter, _, svc = await self.mounted()
         self.updates = [reaction_update(1, [], ["👍"]), update(2, 5, "ordinary chat")]
         self.assertTrue(await adapter._poller.poll_once())
@@ -563,3 +563,160 @@ class TelegramAdapterTests(unittest.IsolatedAsyncioTestCase):
             await adapter.client.call("getMe")
         self.assertNotIn(TOKEN, str(cm.exception))
         self.assertFalse(cm.exception.rejected)
+
+    async def test_bidirectional_reaction_gateway_roundtrip_and_no_echo(self):
+        adapter, ctx, svc = await self.mounted()
+        toggled = []
+
+        def fake_toggle(mid, emoji):
+            toggled.append((mid, emoji))
+            if emoji == "👍" and toggled.count((mid, "👍")) == 1:
+                return ["👍"]
+            if emoji == "❤️":
+                return ["❤️"]
+            return []
+
+        svc.toggle_reaction = MagicMock(side_effect=fake_toggle)
+        self.updates = [update(1, 50, "hello")]
+        await adapter._poller.poll_once()
+        sid = ctx.session_mapper.current("private", str(USER_ID))
+        self.assertTrue(sid)
+
+        # User reacts on Telegram message 50 -> gateway toggles Muse and suppresses push echo.
+        self.updates = [
+            {"update_id": 2, "message_reaction": {
+                "message_id": 50, "date": 1235,
+                "chat": {"id": USER_ID, "type": "private"},
+                "user": {"id": USER_ID, "is_bot": False},
+                "old_reaction": [], "new_reaction": [{"type": "emoji", "emoji": "👍"}],
+            }}
+        ]
+        await adapter._poller.poll_once()
+        self.assertEqual(toggled, [("m1", "👍")])
+
+        # Muse echoes back reactions.updated ["👍"] -> suppressed by gateway state.
+        await ctx.outbound_pusher._scan_and_dispatch(
+            [{"event": "reactions.updated", "seq": 10, "payload": {"message_id": "m1", "reactions": ["👍"]}}],
+            sid,
+        )
+        self.assertFalse(any(m == "setMessageReaction" for m, _ in self.requests))
+
+        # User switches 👍 -> ❤️ then clears on Telegram.
+        self.updates = [
+            {"update_id": 3, "message_reaction": {
+                "message_id": 50, "date": 1236,
+                "chat": {"id": USER_ID, "type": "private"},
+                "user": {"id": USER_ID, "is_bot": False},
+                "old_reaction": [{"type": "emoji", "emoji": "👍"}],
+                "new_reaction": [{"type": "emoji", "emoji": "❤️"}],
+            }},
+            {"update_id": 4, "message_reaction": {
+                "message_id": 50, "date": 1237,
+                "chat": {"id": USER_ID, "type": "private"},
+                "user": {"id": USER_ID, "is_bot": False},
+                "old_reaction": [{"type": "emoji", "emoji": "❤️"}],
+                "new_reaction": [],
+            }},
+        ]
+        await adapter._poller.poll_once()
+        self.assertEqual(toggled, [("m1", "👍"), ("m1", "👍"), ("m1", "❤️"), ("m1", "❤️")])
+
+        # Muse sets native reaction on a delivered assistant message and clears it.
+        ctx.outbound_pusher.reference_store.remember(sid, "private", str(USER_ID), "assistant-msg-9", [("id", "123:77")])
+        self.responses["setMessageReaction"] = [ok(True), ok(True)]
+        await ctx.outbound_pusher._scan_and_dispatch(
+            [{"event": "reactions.updated", "seq": 11,
+              "payload": {"message_id": "assistant-msg-9", "reactions": ["👍"]}}],
+            sid,
+        )
+        await ctx.outbound_pusher._scan_and_dispatch(
+            [{"event": "reactions.updated", "seq": 12,
+              "payload": {"message_id": "assistant-msg-9", "reactions": []}}],
+            sid,
+        )
+        reaction_calls = [p for m, p in self.requests if m == "setMessageReaction"]
+        self.assertEqual(reaction_calls, [
+            {"chat_id": USER_ID, "message_id": 77, "reaction": [{"type": "emoji", "emoji": "👍"}]},
+            {"chat_id": USER_ID, "message_id": 77, "reaction": []},
+        ])
+        self.assertFalse(any(m == "sendMessage" for m, _ in self.requests))
+
+    async def test_gateway_ignores_unauthorized_or_cross_session_reaction_and_handles_failure(self):
+        adapter, ctx, svc = await self.mounted()
+        svc.toggle_reaction = MagicMock(return_value=["👍"])
+        self.updates = [update(1, 50, "hello")]
+        await adapter._poller.poll_once()
+        old_sid = ctx.session_mapper.current("private", str(USER_ID))
+
+        # Unauthorized private chat 999 is ignored.
+        self.updates = [
+            {"update_id": 2, "message_reaction": {
+                "message_id": 50, "date": 1235,
+                "chat": {"id": 999, "type": "private"},
+                "user": {"id": 999, "is_bot": False},
+                "old_reaction": [], "new_reaction": [{"type": "emoji", "emoji": "👍"}],
+            }}
+        ]
+        await adapter._poller.poll_once()
+        svc.toggle_reaction.assert_not_called()
+
+        # Reaction to message from an old session after /new is ignored.
+        ctx.session_mapper.bind("private", str(USER_ID), "new-session")
+        self.assertNotEqual(old_sid, "new-session")
+        self.updates = [
+            {"update_id": 3, "message_reaction": {
+                "message_id": 50, "date": 1236,
+                "chat": {"id": USER_ID, "type": "private"},
+                "user": {"id": USER_ID, "is_bot": False},
+                "old_reaction": [], "new_reaction": [{"type": "emoji", "emoji": "👍"}],
+            }}
+        ]
+        await adapter._poller.poll_once()
+        svc.toggle_reaction.assert_not_called()
+
+        # Switch back; toggle_reaction error returns unknown and advances offset without replaying.
+        ctx.session_mapper.bind("private", str(USER_ID), old_sid)
+        svc.toggle_reaction.side_effect = RuntimeError("rpc timeout")
+        self.updates = [
+            {"update_id": 4, "message_reaction": {
+                "message_id": 50, "date": 1237,
+                "chat": {"id": USER_ID, "type": "private"},
+                "user": {"id": USER_ID, "is_bot": False},
+                "old_reaction": [], "new_reaction": [{"type": "emoji", "emoji": "👍"}],
+            }}
+        ]
+        await adapter._poller.poll_once()
+        self.assertEqual(svc.toggle_reaction.call_count, 1)
+        self.assertEqual(adapter._poller._state["offset"], 5)
+        await adapter._poller.poll_once()
+        self.assertEqual(svc.toggle_reaction.call_count, 1)
+
+    async def test_native_reaction_skips_missing_anchor_without_fallback_text(self):
+        adapter, ctx, _ = await self.mounted()
+        self.updates = [update(1, 50, "hello")]
+        await adapter._poller.poll_once()
+        sid = ctx.session_mapper.current("private", str(USER_ID))
+        ctx.outbound_pusher._seen_ids.add("unseen-muse-mid")
+        await ctx.outbound_pusher._scan_and_dispatch(
+            [{"event": "reactions.updated", "seq": 10,
+              "payload": {"message_id": "unseen-muse-mid", "reactions": ["👍"]}}],
+            sid,
+        )
+        self.assertEqual(self.requests[-1][0], "getUpdates")
+        self.assertEqual(ctx.outbound_pusher.reference_store.reaction_state(sid, "unseen-muse-mid"), (10, ["👍"]))
+
+
+class MuseClientReactionTests(unittest.TestCase):
+    def test_toggle_reaction_normalizes_response_and_aliases(self):
+        from muse_bridge.muse.client.client import MuseClient
+
+        client = MuseClient("tok", "notary", "vm", "192.0.2.1")
+        client.request = MagicMock(side_effect=[
+            json.dumps({"reactions": [{"emoji": "hatch:facebook_thumbs_up_v1"}]}).encode(),
+            json.dumps({"result": {"reactions": ["❤️", "👍", "❤️"]}}).encode(),
+        ])
+        self.assertEqual(client.toggle_reaction("mid-1", "👍"), ["👍"])
+        self.assertEqual(client.request.call_args_list[0].args[:2], ("POST", "/reactions/toggle"))
+        self.assertEqual(json.loads(client.request.call_args_list[0].args[2]),
+                         {"message_id": "mid-1", "emoji": "👍"})
+        self.assertEqual(client.toggle_reaction("mid-1", "❤️"), ["❤️", "👍"])

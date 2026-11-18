@@ -10,6 +10,7 @@ from ..core.message import Attachment, InboundMessage, InboundReaction
 
 class AdapterHost(Protocol):
     async def accept(self, adapter: BaseAdapter, message: InboundMessage) -> str: ...
+    async def accept_reaction(self, adapter: BaseAdapter, event: InboundReaction) -> str: ...
     def identity_changed(self, adapter: BaseAdapter) -> None: ...
 
 
@@ -65,6 +66,10 @@ class BaseAdapter(ABC):
 
     @abstractmethod
     async def deliver(self, envelope: DeliveryEnvelope) -> DeliveryResult: ...
+
+    def supports_native_reactions(self) -> bool:
+        """Whether this platform supports attaching reactions natively instead of quoting."""
+        return False
 
     async def deliver_reaction(self, envelope: ReactionEnvelope) -> DeliveryResult:
         return DeliveryResult(DeliveryStatus.REJECTED, reason="Native reactions not supported")

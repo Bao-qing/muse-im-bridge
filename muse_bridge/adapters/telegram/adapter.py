@@ -218,6 +218,9 @@ class TelegramAdapter(BaseAdapter):
     async def download_attachment(self, attachment, max_bytes):
         return await self.client.download(attachment.file_info, max_bytes)
 
+    def supports_native_reactions(self) -> bool:
+        return True
+
     async def deliver(self, envelope):
         return await self.sender.deliver(envelope)
 

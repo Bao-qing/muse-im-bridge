@@ -9,7 +9,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 from muse_bridge.adapters.base import BaseAdapter
 from muse_bridge.config.models import AccessRequestsConfig, MuseConfig, QQConfig
-from muse_bridge.core.delivery import DeliveryEnvelope, DeliveryReceipt, DeliveryResult, DeliveryStatus
+from muse_bridge.core.delivery import DeliveryEnvelope, DeliveryReceipt, DeliveryResult, DeliveryStatus, reaction_as_delivery
 from muse_bridge.core.message import Attachment, InboundMessage, MessageSource
 from muse_bridge.gateway.muse_events import MuseEventPump
 from muse_bridge.gateway.runtime import UnifiedGateway
@@ -52,6 +52,9 @@ class Driver(BaseAdapter):
         self.sent.append(envelope)
         return DeliveryResult(self.status, [DeliveryReceipt(
             envelope.target_type, envelope.target_id, (("id", f"receipt-{len(self.sent)}"),))])
+
+    async def deliver_reaction(self, envelope):
+        return await self.deliver(reaction_as_delivery(envelope))
 
     async def activity(self, target, token, state, *, kind="private"):
         self.signals.append((target, token, state))

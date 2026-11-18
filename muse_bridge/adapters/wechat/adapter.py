@@ -8,6 +8,7 @@ import os
 import random
 import time
 
+from ...core.delivery import ReactionEnvelope, reaction_as_delivery
 from ...core.message import Attachment, InboundMessage, MessageSource
 from ..base import BaseAdapter
 from ...observability import get_logger, safe_error
@@ -195,6 +196,9 @@ class WeChatAdapter(BaseAdapter):
 
     async def deliver(self, envelope):
         return await self.transport.deliver(envelope)
+
+    async def deliver_reaction(self, envelope: ReactionEnvelope):
+        return await self.deliver(reaction_as_delivery(envelope))
 
     def activity_started(self, target, token, *, kind="private"):
         if kind != "private" or not self.config.typing_enabled:

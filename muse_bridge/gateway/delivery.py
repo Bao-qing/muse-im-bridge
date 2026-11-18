@@ -8,7 +8,14 @@ import os
 import re
 
 from ..config.models import ChatConfig
-from ..core.delivery import DeliveryEnvelope, DeliveryReceipt, DeliveryResult, DeliveryStatus, NativeQuote
+from ..core.delivery import (
+    DeliveryEnvelope,
+    DeliveryReceipt,
+    DeliveryResult,
+    DeliveryStatus,
+    NativeQuote,
+    ReactionEnvelope,
+)
 from ..core.references import MessageReferenceStore
 from ..muse.interactions import credential_input_kind
 from ..core.state_file import atomic_json_write
@@ -189,6 +196,80 @@ class GatewayOutbound(OutboundDispatcher):
                               "references": list(r.references)} for r in result.receipts]}
             self._save_ledger()
             return result
+
+    async def send_reaction_envelope(self, envelope: ReactionEnvelope) -> DeliveryResult:
+        lock = self._delivery_locks.setdefault((envelope.target_type, envelope.target_id), asyncio.Lock())
+        async with lock:
+            saved = self._ledger.get(envelope.delivery_id)
+            if saved:
+                receipts = [DeliveryReceipt(r["target_type"], r["target_id"], tuple(map(tuple, r["references"])))
+                            for r in saved.get("receipts", [])]
+                status = saved.get("status")
+                if status == "confirmed":
+                    return DeliveryResult(DeliveryStatus.CONFIRMED, receipts)
+                if status in {"sending", "unknown", "partial"}:
+                    return DeliveryResult(DeliveryStatus.UNKNOWN, receipts, "Previous delivery is uncertain; not replayed")
+            self._ledger[envelope.delivery_id] = {"status": "sending", "receipts": []}
+            self._save_ledger()
+            try:
+                result = await self.context.adapter.deliver_reaction(envelope)
+            except BaseException:
+                self._ledger[envelope.delivery_id]["status"] = "unknown"
+                self._save_ledger()
+                raise
+            self._ledger[envelope.delivery_id] = {"status": result.status.value,
+                "receipts": [{"target_type": r.target_type, "target_id": r.target_id,
+                              "references": list(r.references)} for r in result.receipts]}
+            self._save_ledger()
+            return result
+
+    async def _deliver_reaction(self, target_type, target_id, emojis, additions, removals, delivery=None):
+        reference = self.quote_for(delivery, target_type, target_id)
+        sid = getattr(delivery, "session_id", "")
+        mid = getattr(delivery, "muse_id", "") or ""
+        if self.context.adapter.supports_native_reactions() and reference is None:
+            return mid in self._seen_ids
+        quote = NativeQuote(tuple(reference.references), reference.excerpt) if reference else None
+        revision = getattr(delivery, "revision", None)
+        parts = []
+        if additions:
+            parts.append(" ".join(additions))
+        if removals:
+            parts.append(" ".join(removals))
+        digest = hashlib.sha256((chr(10).join(parts) + "|" + " ".join(emojis)).encode()).hexdigest()
+        key = f"muse-reaction:{self.account_identity()}:{sid}:{mid}:{revision}:{target_type}:{target_id}:{digest}"
+        fallback = (self.config.admin_target()
+                    if isinstance(self.config, ChatConfig) and target_type == "group" and not quote else None)
+        quote_fallback = (self.quote_text(delivery, target_type, target_id)
+                          if delivery and delivery.reply_to_id and not quote else "")
+        message_ref = next(
+            ((k, v) for k, v in reference.references if k == "id"),
+            reference.references[0] if reference and reference.references else ("", ""),
+        ) if reference else ("", "")
+        envelope = ReactionEnvelope(
+            delivery_id=key,
+            target_type=target_type,
+            target_id=target_id,
+            message_ref=message_ref,
+            reactions=tuple(emojis),
+            added=tuple(additions),
+            removed=tuple(removals),
+            quote=quote,
+            quote_fallback=quote_fallback,
+            fallback_target=fallback,
+        )
+        result = await self.send_reaction_envelope(envelope)
+        if result.status != DeliveryStatus.CONFIRMED:
+            logger.warning("Reaction delivery to %s:%s %s: %s", target_type, target_id,
+                           result.status.value, result.reason or "no reason reported")
+            if (self.context.adapter.supports_native_reactions()
+                    and result.status == DeliveryStatus.REJECTED
+                    and "(HTTP 429)" not in (result.reason or "")):
+                return True
+            return False
+        for receipt in result.receipts:
+            self.remember_delivery(delivery, receipt.target_type, receipt.target_id, receipt.as_body())
+        return True
 
     async def _deliver(self, target_type, target_id, text, images, files, videos,
                        route=None, credential=None, delivery=None):

@@ -208,9 +208,9 @@ class GatewayTests(unittest.IsolatedAsyncioTestCase):
         self.outbound.sent.clear()
         await self.outbound._dispatch_reaction({"event": "reactions.updated", "seq": 1,
             "payload": {"message_id": "u", "reactions": ["+1"]}}, "s")
-        delivery = self.outbound.sent[0][1]["delivery"]
-        self.assertEqual(delivery.purpose, "notification")
-        self.assertTrue(delivery.plain_text)
+        envelope = self.gateway.adapter.sent[-1]
+        self.assertEqual(envelope.purpose, "notification")
+        self.assertTrue(envelope.plain_text)
         self.assertIsNone(DeliveryReference("s", "u").purpose)
 
     async def test_resolution_override_propagates_purpose(self):
