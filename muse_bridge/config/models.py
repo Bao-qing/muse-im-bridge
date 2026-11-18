@@ -14,6 +14,7 @@ from pathlib import Path
 import ipaddress
 import json
 import os
+import re
 import urllib.request
 from typing import Any, ClassVar, Dict, List, Optional, Union
 from urllib.parse import urlsplit
@@ -209,8 +210,9 @@ class ConversationConfig:
 
 @dataclasses.dataclass
 class ChatConfig(ConversationConfig):
-    """QQ/OneBot access policy, separate from conversation runtime settings."""
+    """Group-capable adapter access policy and conversation defaults."""
 
+    seed_main_session: bool = True
     admin_id: List[str] = dataclasses.field(default_factory=list)
     admin_only: bool = constants.DEFAULT_ADMIN_ONLY
     unbound_push_to_admin: bool = constants.DEFAULT_UNBOUND_PUSH_TO_ADMIN
@@ -222,7 +224,8 @@ class ChatConfig(ConversationConfig):
 
     def __post_init__(self):
         super().__post_init__()
-        for name in ("unbound_push_to_admin", "allow_all_private", "allow_all_group", "group_sender_info"):
+        for name in ("seed_main_session", "unbound_push_to_admin", "allow_all_private",
+                     "allow_all_group", "group_sender_info"):
             if type(getattr(self, name)) is not bool:
                 raise ValueError(f"{self.section}.{name} must be a boolean")
 
@@ -320,6 +323,49 @@ class OneBotConfig(ChatConfig):
             raise ValueError("adapters.onebot.qzone_feed must be a QzoneFeedConfig")
         if self.group_trigger not in {"all", "at", "prefix"}:
             raise ValueError("adapters.onebot.group_trigger must be all, at, or prefix")
+
+
+@dataclasses.dataclass
+class TelegramConfig(ChatConfig):
+    section: ClassVar[str] = "adapters.telegram"
+
+    enabled: bool = False
+    seed_main_session: bool = False
+    access_requests: AccessRequestsConfig = dataclasses.field(
+        default_factory=lambda: AccessRequestsConfig(state_file="data/telegram_access.local.json"))
+    delivered_file: str = "data/telegram_delivered.jsonl"
+    session_map_file: str = "data/telegram_session_map.json"
+    push_state_file: str = "data/telegram_push_state.json"
+    routes_file: str = "data/telegram_routes.json"
+
+    bot_token: str = dataclasses.field(default="", repr=False)
+    proxy_url: Optional[str] = dataclasses.field(default=None, repr=False)
+    group_trigger: str = "at"
+    poll_timeout_s: int = 30
+
+    def __post_init__(self):
+        super().__post_init__()
+        self.whitelist = _normalize_whitelist(self.whitelist)
+        self.admin_id = [str(a) for a in self.admin_id if a is not None and str(a).strip()]
+        if type(self.enabled) is not bool:
+            raise ValueError("adapters.telegram.enabled must be a boolean")
+        if not isinstance(self.bot_token, str) or ((self.enabled or self.bot_token)
+                and not re.fullmatch(r"[1-9][0-9]*:[A-Za-z0-9_-]+", self.bot_token)):
+            raise ValueError("adapters.telegram requires a valid bot_token (or TELEGRAM_BOT_TOKEN)")
+        if self.proxy_url is not None:
+            try:
+                proxy = urlsplit(self.proxy_url)
+                valid_proxy = proxy.scheme in {"http", "https"} and bool(proxy.hostname) and proxy.port != 0
+            except (TypeError, ValueError, AttributeError):
+                valid_proxy = False
+            if not valid_proxy:
+                raise ValueError("adapters.telegram.proxy_url must be an HTTP(S) proxy URL")
+        if self.group_trigger not in ("all", "at", "prefix"):
+            raise ValueError("adapters.telegram.group_trigger must be all, at, or prefix")
+        if type(self.poll_timeout_s) is not int or not 1 <= self.poll_timeout_s <= 50:
+            raise ValueError("adapters.telegram.poll_timeout_s must be an integer between 1 and 50")
+        if self.enabled and (not isinstance(self.routes_file, str) or not self.routes_file.strip()):
+            raise ValueError("adapters.telegram.routes_file is required for the polling cursor")
 
 
 @dataclasses.dataclass
@@ -485,6 +531,7 @@ class AppConfig:
     debug: bool = False
     logging: LoggingConfig = dataclasses.field(default_factory=LoggingConfig)
     wechat: WeChatConfig = dataclasses.field(default_factory=WeChatConfig)
+    telegram: TelegramConfig = dataclasses.field(default_factory=TelegramConfig)
 
     def __post_init__(self):
         if self.gateway.background_approval_push:
@@ -620,7 +667,7 @@ class ConfigLoader:
             if detected:
                 muse_cfg.client_ip = detected
 
-        # 2. Chat platforms (adapters.qq / adapters.onebot) share one field set.
+        # 2. Group-capable adapters share one field set.
         adapters_raw = raw_data.get("adapters", {})
 
         def _chat_fields(raw: dict, cls) -> Dict[str, Any]:
@@ -654,10 +701,10 @@ class ConfigLoader:
                 enabled=raw.get("enabled", defaults["enabled"]),
                 admin_id=admin_ids,
                 admin_only=bool(_get_val(raw, "admin_only", constants.DEFAULT_ADMIN_ONLY)),
+                seed_main_session=_get_val(raw, "seed_main_session", defaults["seed_main_session"]),
                 unbound_push_to_admin=_get_val(raw, "unbound_push_to_admin",
                                                constants.DEFAULT_UNBOUND_PUSH_TO_ADMIN),
-                credentials_in_place=_get_val(raw, "credentials_in_place",
-                                              constants.DEFAULT_CREDENTIALS_IN_PLACE),
+                credentials_in_place=_get_val(raw, "credentials_in_place", defaults["credentials_in_place"]),
                 approvals_in_place=_get_val(raw, "approvals_in_place",
                                             constants.DEFAULT_APPROVALS_IN_PLACE),
                 allow_all_private=_get_val(raw, "allow_all_private",
@@ -722,6 +769,17 @@ class ConfigLoader:
             ),
         )
 
+        tg_raw = adapters_raw.get("telegram", {})
+        if not isinstance(tg_raw, dict):
+            raise ValueError("adapters.telegram must be an object")
+        telegram_cfg = TelegramConfig(
+            **_chat_fields(tg_raw, TelegramConfig),
+            bot_token=tg_raw.get("bot_token") or os.environ.get("TELEGRAM_BOT_TOKEN", ""),
+            proxy_url=tg_raw.get("proxy_url") or None,
+            group_trigger=tg_raw.get("group_trigger", "at"),
+            poll_timeout_s=tg_raw.get("poll_timeout_s", 30),
+        )
+
         # 4. Gateway config
         gw_raw = raw_data.get("gateway", {})
         if not isinstance(gw_raw, dict):
@@ -751,6 +809,7 @@ class ConfigLoader:
             qq=qq_cfg,
             onebot=ob_cfg,
             wechat=wechat_cfg,
+            telegram=telegram_cfg,
             gateway=gw_cfg,
             debug=debug,
             logging=logging_cfg,

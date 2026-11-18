@@ -113,7 +113,8 @@ class UnifiedGateway:
                for other, ctx in self.contexts.items() if other is not adapter):
             raise ValueError("A platform account may only be mounted once")
         config = self._account_config(adapter)
-        seed_main = config is adapter.config and (current is None or current.account_identity() == identity)
+        seed_main = (getattr(config, "seed_main_session", True) and config is adapter.config
+                     and (current is None or current.account_identity() == identity))
         if current is not None and config is adapter.config:
             config = dataclasses.replace(config, session_bindings={})
         self.contexts[adapter] = ChannelContext(adapter, self, config=config, seed_main=seed_main)

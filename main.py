@@ -157,6 +157,14 @@ def main(argv=None) -> int:
         else:
             print("OneBot Adapter: DISABLED")
 
+        tg = config.telegram
+        if tg.enabled:
+            print("Telegram Adapter: ENABLED (Bot API long polling)")
+            print(f"  Bot Token:    {'configured' if tg.bot_token else 'missing'}")
+            print(f"  Group mode:   {tg.group_trigger}; automatic main session: {'on' if tg.seed_main_session else 'off'}")
+        else:
+            print("Telegram Adapter: DISABLED")
+
         print(f"WeChat Adapter: {'ENABLED' if config.wechat.enabled else 'DISABLED'}")
         from muse_bridge.adapters.wechat.cli import run_status
         try:

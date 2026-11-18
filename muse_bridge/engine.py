@@ -24,6 +24,9 @@ class BridgeEngine:
         if config.wechat.enabled:
             from .adapters.wechat.adapter import WeChatAdapter
             self.adapters.append(self.gateway.mount(WeChatAdapter(config.wechat)))
+        if config.telegram.enabled:
+            from .adapters.telegram import TelegramAdapter
+            self.adapters.append(self.gateway.mount(TelegramAdapter(config.telegram)))
         self._running = False
 
     async def start(self):
