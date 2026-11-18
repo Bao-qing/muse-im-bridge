@@ -895,7 +895,9 @@ class OutboundDispatcher:
         if route:
             return route.target_type, route.target_id, route, None
         target_type, target_id = self._proactive_target(session_id)
-        if target_type == "group":
+        if target_type == "group" and self.platform != "telegram":
+            # Telegram can send proactively; an unrelated recent user message
+            # is not a valid native reply target.
             fallback = self.route_manager.get_latest_for_target("group", target_id, max_age_s=280.0)
             if fallback and fallback.msg_id:
                 route = fallback

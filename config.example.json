@@ -88,6 +88,21 @@
       "chunk_chars": 4000,
       "max_chunks": 8,
       "session_bindings": {}
+    },
+    "telegram": {
+      "enabled": false,
+      "bot_token": "",
+      "proxy_url": "",
+      "poll_timeout_s": 30,
+      "admin_id": [],
+      "seed_main_session": false,
+      "group_trigger": "at",
+      "credentials_in_place": true,
+      "allow_all_private": false,
+      "allow_all_group": false,
+      "whitelist": {
+        "private": []
+      }
     }
   },
   "gateway": {
