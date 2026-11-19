@@ -23,6 +23,7 @@
 ## 目录
 
 - [设计理念](#设计理念)
+- [效果演示](#效果演示)
 - [核心特性](#核心特性)
 - [支持平台与能力矩阵](#支持平台与能力矩阵)
   - [平台与系统限制说明](#平台与系统限制说明)
@@ -56,6 +57,59 @@
 **在日常聊天软件中，完整覆盖 Muse 的日常使用体验。**
 
 Muse IM Bridge 致力于将 Muse 的完整交互闭环自然融入你常用的即时通讯工具中。除极少数特殊操作外，从日常对话、多会话切换、富媒体收发，到审批确认、凭证与连接器密钥填写、账号登录以及个人动态转发，全部流程均可直接在聊天软件内完成——无需频繁切回 Muse 网页端，真正实现零割裂、无缝衔接的日常使用体验。
+
+---
+
+## 效果演示
+
+> 真实官方 QQ 机器人对话，展示日常聊天、多模态理解、引用填凭证、原生审批与平台边界提示。
+
+<table>
+  <tr>
+    <td align="center" valign="top" width="50%">
+      <strong>日常对话与 Emoji 反应</strong><br/><br/>
+      <img src="assets/demo/chat-and-reaction.png" width="340" alt="日常对话与 Emoji 反应" />
+    </td>
+    <td align="center" valign="top" width="50%">
+      <strong>多模态图片理解</strong><br/><br/>
+      <img src="assets/demo/image-vision.png" width="340" alt="多模态图片理解" />
+    </td>
+  </tr>
+  <tr>
+    <td align="center" valign="top" width="50%">
+      <strong>引用凭证卡填写（不阻塞聊天）</strong><br/><br/>
+      <img src="assets/demo/credential-fill.png" width="340" alt="引用凭证卡填写" />
+    </td>
+    <td align="center" valign="top" width="50%">
+      <strong>原生审批流（回复数字即刻放行）</strong><br/><br/>
+      <img src="assets/demo/approval-flow.png" width="340" alt="原生审批流" />
+    </td>
+  </tr>
+</table>
+
+<details>
+<summary>查看更多场景演示（工具状态卡片 / 文件读取 / 渠道超限提示）</summary>
+
+<table>
+  <tr>
+    <td align="center" valign="top" width="33%">
+      <strong>工具运行状态卡片</strong><br/><br/>
+      <img src="assets/demo/status-card.png" width="260" alt="工具运行状态卡片" />
+    </td>
+    <td align="center" valign="top" width="33%">
+      <strong>文件上传与内容解析</strong><br/><br/>
+      <img src="assets/demo/file-read.png" width="260" alt="文件上传与内容解析" />
+    </td>
+    <td align="center" valign="top" width="33%">
+      <strong>视频超限友好提示（QQ 10 MiB）</strong><br/><br/>
+      <img src="assets/demo/video-limit-notice.png" width="260" alt="视频超限友好提示" />
+    </td>
+  </tr>
+</table>
+
+<sub>注：最右侧演示了 QQ 官方机器人单视频 10 MiB 上传上限触发时的自动降级提示（不静默丢弃），详见 <a href="#平台与系统限制说明">平台与系统限制说明</a>。</sub>
+
+</details>
 
 ---
 
@@ -733,7 +787,7 @@ muse-im-bridge/
 │       ├── onebot/              # OneBot v11 适配器
 │       ├── telegram/            # Telegram Bot API 适配器（含 Markdown Entities 解析）
 │       └── wechat/              # 微信 iLink 适配器（扫码认证、媒体加解密）
-├── assets/                      # 项目图标等静态资源
+├── assets/                      # 项目图标与 README 演示截图（assets/demo/）
 ├── docs/                        # 架构设计与协议技术文档
 ├── tools/                       # 辅助脚本（cfproxy.js Worker 代理、login.py 登录、export_cookies.js 导出、onebot_live.py 联调）
 └── tests/                       # 单元测试套件与独立微信协议 CLI（tests/wechat_cli.py）
