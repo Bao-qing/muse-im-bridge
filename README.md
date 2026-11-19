@@ -64,6 +64,11 @@ Muse IM Bridge 致力于将 Muse 的完整交互闭环自然融入你常用的�
 
 > 真实官方 QQ 机器人对话，展示日常聊天、多模态理解、引用填凭证、原生审批与平台边界提示。
 
+<details>
+<summary><strong>点击展开全部场景演示（图片警告）</strong>（对话与 Emoji 反应 / 多模态图片理解 / 引用凭证卡填写 / 原生审批流 / 工具状态卡片 / 文件读取 / 视频超限提示）</summary>
+
+<br/>
+
 <table>
   <tr>
     <td align="center" valign="top" width="50%">
@@ -85,29 +90,26 @@ Muse IM Bridge 致力于将 Muse 的完整交互闭环自然融入你常用的�
       <img src="assets/demo/approval-flow.png" width="340" alt="原生审批流" />
     </td>
   </tr>
-</table>
-
-<details>
-<summary>查看更多场景演示（工具状态卡片 / 文件读取 / 渠道超限提示）</summary>
-
-<table>
   <tr>
-    <td align="center" valign="top" width="33%">
+    <td align="center" valign="top" width="50%">
       <strong>工具运行状态卡片</strong><br/><br/>
-      <img src="assets/demo/status-card.png" width="260" alt="工具运行状态卡片" />
+      <img src="assets/demo/status-card.png" width="340" alt="工具运行状态卡片" />
     </td>
-    <td align="center" valign="top" width="33%">
+    <td align="center" valign="top" width="50%">
       <strong>文件上传与内容解析</strong><br/><br/>
-      <img src="assets/demo/file-read.png" width="260" alt="文件上传与内容解析" />
+      <img src="assets/demo/file-read.png" width="340" alt="文件上传与内容解析" />
     </td>
-    <td align="center" valign="top" width="33%">
+  </tr>
+  <tr>
+    <td align="center" valign="top" width="50%">
       <strong>视频超限友好提示（QQ 10 MiB）</strong><br/><br/>
-      <img src="assets/demo/video-limit-notice.png" width="260" alt="视频超限友好提示" />
+      <img src="assets/demo/video-limit-notice.png" width="340" alt="视频超限友好提示" />
     </td>
+    <td align="center" valign="top" width="50%"></td>
   </tr>
 </table>
 
-<sub>注：最右侧演示了 QQ 官方机器人单视频 10 MiB 上传上限触发时的自动降级提示（不静默丢弃），详见 <a href="#平台与系统限制说明">平台与系统限制说明</a>。</sub>
+<sub>注：视频超限演示了 QQ 官方机器人单视频 10 MiB 上传上限触发时的自动降级提示，详见 <a href="#平台与系统限制说明">平台与系统限制说明</a>。</sub>
 
 </details>
 
