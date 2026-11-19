@@ -463,6 +463,37 @@ class TelegramAdapterTests(unittest.IsolatedAsyncioTestCase):
             ("setMessageReaction", {"chat_id": USER_ID, "message_id": 42, "reaction": []}),
         ])
 
+    async def test_unsupported_emoji_falls_back_to_quoted_message(self):
+        adapter = self.adapter()
+        env = ReactionEnvelope("fallback", "private", str(USER_ID), ("id", "123:42"),
+                               ("😮",), added=("😮",))
+        self.assertTrue((await adapter.deliver_reaction(env)).confirmed)
+        self.assertEqual(self.requests[-1], ("sendMessage", {
+            "chat_id": USER_ID, "text": "😮",
+            "reply_parameters": {"message_id": 42, "allow_sending_without_reply": True},
+        }))
+        self.assertNotIn("setMessageReaction", [method for method, _ in self.requests])
+
+    async def test_supported_emoji_forms_use_native_reaction(self):
+        adapter = self.adapter()
+        self.responses["setMessageReaction"] = [ok(True), ok(True), ok(True)]
+        for emoji in ("❤", "❤️", "❤️‍🔥"):
+            env = ReactionEnvelope(f"native-{len(emoji)}", "private", str(USER_ID), ("id", "123:42"), (emoji,))
+            self.assertTrue((await adapter.deliver_reaction(env)).confirmed)
+        self.assertEqual([p["reaction"] for m, p in self.requests if m == "setMessageReaction"],
+                         [[{"type": "emoji", "emoji": "❤"}],
+                          [{"type": "emoji", "emoji": "❤️"}],
+                          [{"type": "emoji", "emoji": "❤️‍🔥"}]])
+
+    async def test_clearing_reaction_stays_native_even_for_empty_state(self):
+        adapter = self.adapter()
+        self.responses["setMessageReaction"] = [ok(True)]
+        env = ReactionEnvelope("clear", "private", str(USER_ID), ("id", "123:42"), ())
+        self.assertTrue((await adapter.deliver_reaction(env)).confirmed)
+        self.assertEqual(self.requests[-1], ("setMessageReaction", {
+            "chat_id": USER_ID, "message_id": 42, "reaction": [],
+        }))
+
     async def test_native_reaction_rejects_invalid_targets_or_states(self):
         adapter = self.adapter()
         for ref, reactions in (("-100100:42", ("👍",)), ("123:0", ("👍",)),
