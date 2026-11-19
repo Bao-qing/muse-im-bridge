@@ -46,26 +46,24 @@ class ReactionEnvelope:
     reactions: tuple[str, ...]  # Complete desired state, including empty to clear.
     added: tuple[str, ...] = ()
     removed: tuple[str, ...] = ()
+    is_removal: bool = False
     quote: NativeQuote | None = None
     quote_fallback: str = ""
     passive_id: str | None = None
     fallback_target: str | None = None
 
 
-def reaction_as_delivery(envelope: ReactionEnvelope, *, quote: bool = False) -> DeliveryEnvelope:
+def reaction_as_delivery(envelope: ReactionEnvelope, *, quote: bool = False) -> DeliveryEnvelope | None:
     """Render a ReactionEnvelope as a plain-text message for chat platforms.
 
-    When ``quote`` is True, keep the original message quote (or its text
-    fallback). When ``quote`` is False (default), omit quoting so fallback
-    reactions keep the chat list clean.
+    Returns ``None`` when there are no added reactions to announce (for example,
+    pure removals). When ``quote`` is True, keep the original message quote (or
+    its text fallback); when ``quote`` is False (default), omit quoting so
+    fallback reactions keep the chat list clean.
     """
-    parts = []
-    if envelope.added:
-        parts.append(" ".join(envelope.added))
-    if envelope.removed:
-        parts.append(" ".join(envelope.removed))
-    if not parts and envelope.reactions:
-        parts.append(" ".join(envelope.reactions))
+    emojis = envelope.added or (() if (envelope.removed or envelope.is_removal) else envelope.reactions)
+    if not emojis:
+        return None
     native_quote = None
     quote_fallback = ""
     if quote:
@@ -77,7 +75,7 @@ def reaction_as_delivery(envelope: ReactionEnvelope, *, quote: bool = False) -> 
         delivery_id=envelope.delivery_id,
         target_type=envelope.target_type,
         target_id=envelope.target_id,
-        text="\n".join(parts),
+        text=" ".join(emojis),
         purpose="notification",
         passive_id=envelope.passive_id,
         quote=native_quote,

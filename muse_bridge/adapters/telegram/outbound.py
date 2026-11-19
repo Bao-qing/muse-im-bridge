@@ -84,20 +84,14 @@ class TelegramSender:
             return DeliveryResult(DeliveryStatus.REJECTED, reason="Invalid Telegram delivery target or ID")
         return await self._guarded("message", envelope, lambda: self._deliver_locked(envelope))
 
-    async def deliver_reaction(self, envelope: ReactionEnvelope) -> DeliveryResult:
-        ref = envelope.message_ref
-        message_id = (_reply_id(ref[1], envelope.target_id)
-                      if isinstance(ref, tuple) and len(ref) == 2 and ref[0] == "id" else None)
-        reactions = envelope.reactions
-        if (not envelope.delivery_id or not self._valid_target(envelope.target_type, envelope.target_id)
-                or not message_id or not isinstance(reactions, tuple) or len(reactions) > 1
-                or any(not isinstance(emoji, str) or not emoji.strip() for emoji in reactions)):
-            return DeliveryResult(DeliveryStatus.REJECTED, reason="Invalid Telegram reaction target or state")
-        if not supports_native_reaction(reactions):
-            # Bot API rejects emoji outside its fixed set, so fall back to a
-            # plain-text message instead of losing the reaction.
-            return await self.deliver(reaction_as_delivery(envelope, quote=self.config.reaction_quote))
-
+    async def _set_native_reaction(
+        self,
+        envelope: ReactionEnvelope,
+        message_id: int,
+        reactions: tuple[str, ...],
+        *,
+        operation: str = "reaction",
+    ) -> DeliveryResult:
         async def send():
             try:
                 result = await self.client.call("setMessageReaction", {
@@ -111,7 +105,36 @@ class TelegramSender:
                 return DeliveryResult(DeliveryStatus.CONFIRMED)
             return DeliveryResult(DeliveryStatus.UNKNOWN, reason="Telegram reaction not confirmed")
 
-        return await self._guarded("reaction", envelope, send)
+        return await self._guarded(operation, envelope, send)
+
+    async def deliver_reaction(self, envelope: ReactionEnvelope) -> DeliveryResult:
+        ref = envelope.message_ref
+        message_id = (_reply_id(ref[1], envelope.target_id)
+                      if isinstance(ref, tuple) and len(ref) == 2 and ref[0] == "id" else None)
+        reactions = envelope.reactions
+        if (not envelope.delivery_id or not self._valid_target(envelope.target_type, envelope.target_id)
+                or not message_id or not isinstance(reactions, tuple) or len(reactions) > 1
+                or any(not isinstance(emoji, str) or not emoji.strip() for emoji in reactions)):
+            return DeliveryResult(DeliveryStatus.REJECTED, reason="Invalid Telegram reaction target or state")
+        if envelope.is_removal:
+            # Only clear natively if a natively-supported reaction was removed
+            # (or no removed list was specified). Unsupported removals are ignored.
+            if envelope.removed and not any(supports_native_reaction((e,)) for e in envelope.removed):
+                return DeliveryResult(DeliveryStatus.CONFIRMED)
+            native_target = tuple(e for e in reactions if supports_native_reaction((e,)))
+            return await self._set_native_reaction(envelope, message_id, native_target)
+        if not supports_native_reaction(reactions):
+            # Replacing a native reaction with an unsupported emoji clears the
+            # old native reaction first so both don't remain visible.
+            if any(supports_native_reaction((e,)) for e in envelope.removed):
+                clear_result = await self._set_native_reaction(envelope, message_id, (), operation="reaction-clear")
+                if clear_result.status == DeliveryStatus.UNKNOWN:
+                    return clear_result
+            delivery = reaction_as_delivery(envelope, quote=self.config.reaction_quote)
+            if delivery is None:
+                return DeliveryResult(DeliveryStatus.CONFIRMED)
+            return await self.deliver(delivery)
+        return await self._set_native_reaction(envelope, message_id, reactions)
 
     async def _deliver_locked(self, envelope):
         target = envelope.target_id

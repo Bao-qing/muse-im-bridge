@@ -201,9 +201,13 @@ class ReactionCase(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(a.client.send_msg.call_count, 1)
                 await p._scan_and_dispatch([self.update(11, ['❤️'])], 's')
                 self.assertEqual(a.client.send_msg.call_count, 2)
-                self.assertEqual(a.client.send_msg.call_args.args[2][-1]['data']['text'], chr(10).join(['❤️', '👍']))
+                self.assertEqual(a.client.send_msg.call_args.args[2][-1]['data']['text'], '❤️')
                 await p._scan_and_dispatch([self.update(12, [])], 's')
+                self.assertEqual(a.client.send_msg.call_count, 2)
                 self.assertEqual(p.reference_store.reaction_state('s', 'old'), (12, []))
+                await p._scan_and_dispatch([self.update(13, ['👍'])], 's')
+                self.assertEqual(a.client.send_msg.call_count, 3)
+                self.assertEqual(a.client.send_msg.call_args.args[2][-1]['data']['text'], '👍')
 
     async def test_unquoted_group_reaction_rejection_never_falls_back_to_admin_dm(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -288,14 +292,18 @@ class QQReactionTextCase(unittest.IsolatedAsyncioTestCase):
                     await p._scan_and_dispatch([ReactionCase.update()], 's')
                     client.post_with_retry.assert_called_once()
                     await p._scan_and_dispatch([ReactionCase.update(11, [])], 's')
+                    client.post_with_retry.assert_called_once()
+                    self.assertEqual(p.reference_store.reaction_state('s', 'old'), (11, []))
+                    await p._scan_and_dispatch([ReactionCase.update(12, ['❤️'])], 's')
+                    self.assertEqual(client.post_with_retry.call_count, 2)
                     payload = client.post_with_retry.call_args.args[1]
-                    self.assertEqual(payload['content'], '👍')
+                    self.assertEqual(payload['content'], '❤️')
                     self.assertNotIn('markdown', payload)
                     if reaction_quote:
                         self.assertEqual(payload['message_reference']['message_id'], 'REFIDX_old')
                     else:
                         self.assertNotIn('message_reference', payload)
-                    self.assertEqual(p.reference_store.reaction_state('s', 'old'), (11, []))
+                    self.assertEqual(p.reference_store.reaction_state('s', 'old'), (12, ['❤️']))
 
     async def test_plain_text_is_kept_during_passive_active_retry(self):
         with tempfile.TemporaryDirectory() as tmp:

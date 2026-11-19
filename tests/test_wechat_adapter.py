@@ -566,8 +566,8 @@ class TestWeChatIntake(unittest.IsolatedAsyncioTestCase):
                             "payload": {"message_id": "answer", "reactions": emojis}}
                 await pusher._dispatch_reaction(reaction, sid)
                 await pusher._dispatch_reaction(reaction, sid)
-            self.assertEqual(client.send_message.await_count, 5)
-            self.assertEqual(client.send_message.call_args.args[0]["item_list"][0]["text_item"]["text"], "like")
+            sent_texts = [c.args[0]["item_list"][0]["text_item"]["text"] for c in client.send_message.await_args_list]
+            self.assertEqual(sent_texts, ["async answer", "like", "heart", "like"])
             self.assertEqual(pusher.reference_store.reaction_state(sid, "answer"), (13, ["like"]))
 
     async def test_reaction_quote_controls_wechat_text_quote_prefix(self):

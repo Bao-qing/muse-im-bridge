@@ -54,7 +54,10 @@ class Driver(BaseAdapter):
             envelope.target_type, envelope.target_id, (("id", f"receipt-{len(self.sent)}"),))])
 
     async def deliver_reaction(self, envelope):
-        return await self.deliver(reaction_as_delivery(envelope))
+        if envelope.is_removal:
+            return DeliveryResult(DeliveryStatus.CONFIRMED)
+        delivery = reaction_as_delivery(envelope)
+        return await self.deliver(delivery) if delivery is not None else DeliveryResult(DeliveryStatus.CONFIRMED)
 
     async def activity(self, target, token, state, *, kind="private"):
         self.signals.append((target, token, state))

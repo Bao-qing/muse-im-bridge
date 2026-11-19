@@ -409,7 +409,7 @@ QQ 与 OneBot 适配器中每个群、每个私聊用户各自绑定一个 Muse 
 - **Muse → 渠道**：官方 QQ 使用 `message_reference.message_id`，优先选择不透明的 `REFIDX`；OneBot 使用 Array `reply` 段。原生引用与 QQ 被动回复授权 `msg_id` / `msg_seq` 分开处理。每个成功发送的文本分段、图片和视频都记录消息 ID。
 - **仅原消息查不到时降级**：当前聊天没有对应原消息时，用文字标明「原消息在此聊天不可用」，不会拿另一个群或会话的文本代替。原生引用 API 报错不会改发文字引用；引用导致 Muse 返回查无消息时，也不会自动重建会话或重发。
 - **文件**：OneBot 的 `upload_*_file` 不返回可引用的聊天消息 ID，因此附发一条可原生引用的「【文件】文件名」说明。回复该说明可关联到原来的 Muse 展示卡；不把文件 ID 冒充消息 ID。
-- **点赞及其他反应**：同时处理 Muse 历史的 `reaction_emoji` 和实时 `reactions.updated`；不支持原生反应的渠道（以及 Telegram 73 个固定表情之外的回落）会将反应转换为纯文本通知发送。各适配器均可在自身配置下独立设置 `reaction_quote`（默认 `false`），用于控制回落为普通消息发送的 reaction 是否引用原消息（默认不引用，使消息列表更干净；不影响 Telegram 原生 `setMessageReaction`）。反应独立于原消息投递去重；启动基线不重放旧反应，重复和乱序的实时更新不重复推送。
+- **点赞及其他反应**：同时处理 Muse 历史的 `reaction_emoji` 和实时 `reactions.updated`，网关会将取消事件标记为 `is_removal` 一并下发给适配器处理：支持原生反应的渠道（如 Telegram 在 73 个固定表情内）直接调用原生接口贴上或摘除；不支持原生反应的渠道（以及 Telegram 列表外表情的回落）忽略纯取消并仅在新增/替换时发送新增的 emoji。各适配器均可在自身配置下独立设置 `reaction_quote`（默认 `false`），用于控制回落为普通消息发送的 reaction 是否引用原消息（默认不引用，使消息列表更干净；不影响 Telegram 原生 `setMessageReaction`）。反应独立于原消息投递去重；启动基线不重放旧反应，重复和乱序的实时更新不重复推送。
 - **持久化**：引用索引和反应状态保存在 `<routes_file>.references.local.json`，最多保留各 4096 条记录及每条 240 字符的普通消息摘要。官方 QQ 按应用隔离，OneBot 按接口地址及登录账号隔离；文件不保存凭证输入或完整原始事件，应与其他本地状态一样妥善保管，不提交仓库。
 
 ## OneBot (NapCat) 适配器
