@@ -55,7 +55,7 @@ class TestFirstRunWizard(unittest.TestCase):
                 data = json.load(f)
 
             # Check structure
-            self.assertEqual(data["gateway"]["login_through_adapter"], "qq")
+            self.assertNotIn("login_through_adapter", data["gateway"])
             self.assertIn("qq", data["adapters"])
             self.assertNotIn("onebot", data["adapters"])  # Minimal config: omitted if not selected!
 
@@ -111,7 +111,7 @@ class TestFirstRunWizard(unittest.TestCase):
             with open(out_file, "r", encoding="utf-8") as f:
                 data = json.load(f)
 
-            self.assertEqual(data["gateway"]["login_through_adapter"], "onebot")
+            self.assertNotIn("login_through_adapter", data["gateway"])
             self.assertIn("onebot", data["adapters"])
             # QQ defaults to enabled=True when omitted; wizard must explicitly disable it.
             self.assertEqual(data["adapters"]["qq"], {"enabled": False})
@@ -146,7 +146,7 @@ class TestFirstRunWizard(unittest.TestCase):
             with open(out_file, "r", encoding="utf-8") as f:
                 data = json.load(f)
 
-            self.assertEqual(data["gateway"]["login_through_adapter"], "qq")
+            self.assertNotIn("login_through_adapter", data["gateway"])
             self.assertIn("qq", data["adapters"])
             self.assertIn("onebot", data["adapters"])
 
@@ -221,14 +221,14 @@ class TestFullConfigEditor(unittest.TestCase):
         self.assertTrue(editor._modified)
 
     def test_editor_modifies_gateway_category(self):
-        cfg = {"gateway": {"login_through_adapter": "qq"}}
+        cfg = {"gateway": {"background_approval_push": ""}}
         from init_config import FullConfigEditor
         editor = FullConfigEditor(cfg, file_path="dummy.json")
 
-        with mock.patch("init_config._prompt_input", side_effect=["1", "onebot", "0"]):
+        with mock.patch("init_config._prompt_input", side_effect=["1", "onebot:12345", "0"]):
             editor._edit_gateway_category()
 
-        self.assertEqual(cfg["gateway"]["login_through_adapter"], "onebot")
+        self.assertEqual(cfg["gateway"]["background_approval_push"], "onebot:12345")
 
     def test_editor_modifies_qq_category(self):
         cfg = {"adapters": {"qq": {"enabled": False, "app_id": "111"}}}
@@ -413,7 +413,6 @@ class TestManageConsoleAndWizardV2(unittest.TestCase):
             wizard.claimed_events["telegram"] = ("424242", "group", "-100123", "77")
             wizard.first_message_event = ("telegram", "424242", "group", "-100123", "77")
             wizard.group_settings["telegram"] = {"group_trigger": "at", "bind_main_to_group": True}
-            wizard.login_through_adapter = "telegram"
             with mock.patch("builtins.print"):
                 wizard._generate_and_save_config()
 
@@ -483,7 +482,6 @@ class TestManageConsoleAndWizardV2(unittest.TestCase):
             wizard = manage.FirstRunWizard(output_file=cfg_path, existing_data=original, preserve_muse=True)
             wizard.selected_channels = ["wechat"]
             wizard.channel_configs["wechat"] = {"enabled": True}
-            wizard.login_through_adapter = "wechat"
             with mock.patch("builtins.print"):
                 wizard._generate_and_save_config()
 
@@ -493,6 +491,7 @@ class TestManageConsoleAndWizardV2(unittest.TestCase):
             self.assertEqual(updated["muse"]["session_id"], "keep-session-id")
             self.assertEqual(updated["muse"]["proxy_url"], "http://127.0.0.1:7890")
             self.assertEqual(updated["logging"]["level"], "DEBUG")
+            self.assertNotIn("login_through_adapter", updated["gateway"])
             self.assertEqual(updated["adapters"]["qq"], {"enabled": False})
             self.assertTrue(updated["adapters"]["wechat"]["enabled"])
 
@@ -506,7 +505,7 @@ class TestManageConsoleAndWizardV2(unittest.TestCase):
                         "qq": {"enabled": False},
                         "onebot": {"enabled": True, "base_url": "http://127.0.0.1:3000", "ws_url": "ws://127.0.0.1:3000", "admin_id": []},
                     },
-                    "gateway": {"login_through_adapter": "onebot"},
+                    "gateway": {},
                 }, f)
 
             import manage
@@ -650,8 +649,8 @@ class TestManageConsoleAndWizardV2(unittest.TestCase):
             editor._edit_muse_category()
         self.assertTrue(cfg["muse"]["worker"]["ws"])
 
-        # Open Gateway -> 3 (feed) -> 1 (enabled=True) -> 2 (targets=onebot=auto) -> 0 -> 0
-        with mock.patch("manage._prompt_input", side_effect=["3", "1", "y", "2", "onebot=auto", "0", "0"]), \
+        # Open Gateway -> 2 (feed) -> 1 (enabled=True) -> 2 (targets=onebot=auto) -> 0 -> 0
+        with mock.patch("manage._prompt_input", side_effect=["2", "1", "y", "2", "onebot=auto", "0", "0"]), \
              mock.patch("builtins.print"):
             editor._edit_gateway_category()
         self.assertTrue(cfg["gateway"]["feed"]["enabled"])
@@ -681,7 +680,7 @@ class TestManageConsoleAndWizardV2(unittest.TestCase):
 
         original = {
             "muse": {"session_id": "keep_me"},
-            "gateway": {"login_through_adapter": "telegram"},
+            "gateway": {},
             "adapters": {
                 "qq": {"enabled": True, "app_id": "111"},
                 "onebot": {"enabled": True, "group_trigger": "at"},

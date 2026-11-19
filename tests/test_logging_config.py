@@ -197,7 +197,7 @@ class TestLoggingConfig(unittest.TestCase):
                        "push": {"enabled": False, "catch_up_enabled": True}},
                 "onebot": {"enabled": True, "base_url": "http://localhost:3000", "target_group_id": 123},
             },
-            "gateway": {"login_through_adapter": "qq"},
+            "gateway": {},
             "overrides": {"chunk_chars": 777, "timezone": "UTC"},
         }
         baseline = self.load(data)

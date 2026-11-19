@@ -112,7 +112,7 @@ class TestWeChatCLI(unittest.TestCase):
         wizard = init_config.FirstRunWizard(str(Path(self.tmp.name) / "generated.json"))
         def configure():
             wizard._mark_channel_enabled("wechat", {"enabled": True, "session_bindings": {}}, "已启用")
-        with mock.patch.object(init_config, "_prompt_input", side_effect=["4", "n", "n"]), \
+        with mock.patch.object(init_config, "_prompt_input", side_effect=["4", "n"]), \
              mock.patch.object(wizard, "_configure_wechat", side_effect=configure), \
              mock.patch.object(wizard, "_listen_for_first_message", new_callable=mock.AsyncMock) as listen, \
              contextlib.redirect_stdout(self.output):
@@ -122,7 +122,7 @@ class TestWeChatCLI(unittest.TestCase):
         data = json.loads(Path(wizard.output_file).read_text(encoding="utf-8"))
         self.assertNotIn("admin_id", data["adapters"]["wechat"])
         self.assertEqual(data["adapters"]["wechat"]["session_bindings"], {})
-        self.assertEqual(data["gateway"]["login_through_adapter"], "")
+        self.assertNotIn("login_through_adapter", data["gateway"])
         self.assertFalse(data["adapters"]["qq"]["enabled"])
 
     def test_channel_list_allows_free_combinations_including_wechat_and_telegram(self):

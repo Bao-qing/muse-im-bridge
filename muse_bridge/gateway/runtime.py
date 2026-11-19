@@ -255,12 +255,19 @@ class UnifiedGateway:
     async def login_required(self):
         for ctx in self.contexts.values():
             ctx.enter_login_mode()
-        ctx = next((c for c in self.contexts.values() if c.name == self.config.login_through_adapter), None)
-        if ctx and ctx.notification_target():
+        for ctx in self.contexts.values():
+            if not ctx.is_enabled:
+                continue
+            target = ctx.notification_target()
+            if not target:
+                continue
             try:
-                await ctx.send_notice(ctx.notification_target(), "【系统提示】" + LOGIN_RELOGIN_NOTICE)
+                await ctx.send_notice(target, "【系统提示】" + LOGIN_RELOGIN_NOTICE)
             except Exception as exc:
-                logger.warning("Login notice delivery unconfirmed; gateway stays available. error=%s", safe_error(exc))
+                logger.warning(
+                    "Login notice delivery unconfirmed for %s; gateway stays available. error=%s",
+                    ctx.name, safe_error(exc),
+                )
 
     async def _startup_login_notice(self):
         await self._contexts_ready.wait()

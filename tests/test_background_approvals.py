@@ -432,13 +432,13 @@ class BackgroundConfigCase(unittest.TestCase):
         editor = FullConfigEditor({})
         output = io.StringIO()
         with contextlib.redirect_stdout(output):
-            with patch("builtins.input", side_effect=["2", "qq:ADMIN", "0"]):
+            with patch("builtins.input", side_effect=["1", "qq:ADMIN", "0"]):
                 editor._edit_gateway_category()
             self.assertEqual(editor.data["gateway"]["background_approval_push"], "qq:ADMIN")
-            with patch("builtins.input", side_effect=["2", "group:G", "0"]):
+            with patch("builtins.input", side_effect=["1", "group:G", "0"]):
                 editor._edit_gateway_category()
             self.assertEqual(editor.data["gateway"]["background_approval_push"], "qq:ADMIN")
-            with patch("builtins.input", side_effect=["2", "", "0"]):
+            with patch("builtins.input", side_effect=["1", "", "0"]):
                 editor._edit_gateway_category()
             self.assertEqual(editor.data["gateway"]["background_approval_push"], "")
         self.assertIn("后台审批推送", output.getvalue())

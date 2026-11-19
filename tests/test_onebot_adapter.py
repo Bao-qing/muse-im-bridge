@@ -511,14 +511,14 @@ if __name__ == "__main__":
 
 
 class TestGatewayRouting(unittest.IsolatedAsyncioTestCase):
-    def _gateway(self, qq_owns, onebot_owns, login_through="onebot"):
+    def _gateway(self, qq_owns, onebot_owns):
         from gateway_helpers import QQAdapter
         from muse_bridge.config.models import GatewayConfig, QQConfig
         from muse_bridge.gateway.runtime import UnifiedGateway
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
         service = mock.Mock()
-        gateway = UnifiedGateway(service, GatewayConfig(login_through_adapter=login_through))
+        gateway = UnifiedGateway(service, GatewayConfig())
         mounted = []
         for factory, cfg_cls, name, owns in ((QQAdapter, QQConfig, "qq", qq_owns),
                                              (OneBotAdapter, OneBotConfig, "onebot", onebot_owns)):
@@ -557,15 +557,17 @@ class TestGatewayRouting(unittest.IsolatedAsyncioTestCase):
         qq.client.send_message.assert_not_called()
         ob.client.send_msg.assert_not_called()
 
-    async def test_login_notice_uses_the_configured_adapter(self):
-        gateway, qq, ob = self._gateway(False, False, login_through="onebot")
+    async def test_login_notice_broadcasts_to_all_enabled_adapters(self):
+        gateway, qq, ob = self._gateway(False, False)
         await gateway.login_required()
         ob.send_notice.assert_awaited_once()
         self.assertEqual(ob.send_notice.await_args.args[0], "A1")
+        qq.send_notice.assert_awaited_once()
+        self.assertEqual(qq.send_notice.await_args.args[0], "A1")
         self.assertTrue(ob.ctx._in_login_fallback)
         self.assertTrue(qq.ctx._in_login_fallback)
         ob.client.send_msg.assert_called_once()
-        qq.send_notice.assert_not_awaited()
+        qq.client.send_message.assert_called_once()
 
 
 class TestOneBotTyping(unittest.IsolatedAsyncioTestCase):

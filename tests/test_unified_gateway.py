@@ -32,7 +32,7 @@ class Driver(BaseAdapter):
 
     @property
     def is_enabled(self):
-        return True
+        return bool(self.config.enabled)
 
     def account_identity(self):
         return self.account
@@ -389,7 +389,6 @@ class UnifiedGatewayCase(unittest.IsolatedAsyncioTestCase):
 
     async def test_failed_startup_login_notice_does_not_stop_gateway(self):
         driver, ctx = self.driver()
-        self.gateway.config.login_through_adapter = "qq"
         self.service.verify_connection = MagicMock(return_value=False)
         self.service.token_manager.has_credentials.return_value = False
         attempted = asyncio.Event()
@@ -417,7 +416,6 @@ class UnifiedGatewayCase(unittest.IsolatedAsyncioTestCase):
 
     async def test_login_notice_unknown_or_exception_is_best_effort(self):
         driver, ctx = self.driver()
-        self.gateway.config.login_through_adapter = "qq"
         for failure in (DeliveryStatus.UNKNOWN, OSError("test transport")):
             with self.subTest(failure=failure):
                 if isinstance(failure, Exception):
@@ -426,6 +424,22 @@ class UnifiedGatewayCase(unittest.IsolatedAsyncioTestCase):
                     ctx.send_notice = AsyncMock(side_effect=RuntimeError(failure.value))
                 await self.gateway.login_required()
                 ctx.send_notice.assert_awaited_once()
+
+    async def test_login_notice_broadcasts_to_enabled_adapters_and_isolates_failures(self):
+        _, qq_ctx = self.driver("qq", "acct-qq")
+        _, ob_ctx = self.driver("onebot", "acct-ob")
+        disabled_driver, disabled_ctx = self.driver("telegram", "acct-tg")
+        disabled_driver.config.enabled = False
+        qq_ctx.send_notice = AsyncMock(side_effect=OSError("qq transport down"))
+        ob_ctx.send_notice = AsyncMock()
+        disabled_ctx.send_notice = AsyncMock()
+        await self.gateway.login_required()
+        self.assertTrue(qq_ctx._in_login_fallback)
+        self.assertTrue(ob_ctx._in_login_fallback)
+        self.assertTrue(disabled_ctx._in_login_fallback)
+        qq_ctx.send_notice.assert_awaited_once()
+        ob_ctx.send_notice.assert_awaited_once()
+        disabled_ctx.send_notice.assert_not_awaited()
 
     async def test_distinct_routes_cannot_share_another_mutable_repository(self):
         driver, ctx = self.driver()

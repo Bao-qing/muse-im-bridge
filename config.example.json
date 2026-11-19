@@ -116,7 +116,6 @@
     }
   },
   "gateway": {
-    "login_through_adapter": "qq",
     "background_approval_push": "",
     "feed": {
       "enabled": false,

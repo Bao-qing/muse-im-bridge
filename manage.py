@@ -613,7 +613,7 @@ def get_registered_config_fields() -> Dict[str, set]:
             "timezone", "proxy", "vm_id", "approval",
         },
         "ApprovalConfig": {"mode", "notify", "sync_interval_s"},
-        "GatewayConfig": {"login_through_adapter", "background_approval_push", "feed"},
+        "GatewayConfig": {"background_approval_push", "feed"},
         "GatewayFeedConfig": {s.key for s in GATEWAY_FEED_SPECS},
         "QQConfig": chat_keys | {"app_id", "app_secret"} | {s.key for s in QQ_EXTRA_SPECS},
         "OneBotConfig": chat_keys | {"base_url", "access_token", "ws_url", "group_trigger", "typing_enabled", "qzone_feed"},
@@ -1416,33 +1416,22 @@ class FullConfigEditor:
             feed_raw = gw.get("feed") if isinstance(gw.get("feed"), dict) else {}
             feed_summary = self._submenu_summary(feed_raw, list(GATEWAY_FEED_SPECS))
             print("\n--- [2] 🚪 网关配置（直接回车不修改原值）---")
-            print(_format_menu_row("1", "login_through_adapter (登录通知适配器)", _format_field_state(gw, "login_through_adapter", gw_def.login_through_adapter, hint="[qq/onebot/telegram/wechat/clear]")))
-            print(_format_menu_row("2", "background_approval_push (后台审批推送)", _format_field_state(gw, "background_approval_push", gw_def.background_approval_push, hint="[qq:<ID> / onebot:<QQ> / 留空自动]")))
-            print(_format_menu_row("3", "▸ feed (网关动态同步配置)", feed_summary))
+            print(_format_menu_row("1", "background_approval_push (后台审批推送)", _format_field_state(gw, "background_approval_push", gw_def.background_approval_push, hint="[qq:<ID> / onebot:<QQ> / 留空自动]")))
+            print(_format_menu_row("2", "▸ feed (网关动态同步配置)", feed_summary))
             print("  [r]  重置指定字段为未配置（恢复默认）")
             print("  [0]  返回上级菜单")
 
-            c = _prompt_input("请输入选项 (0-3/r)", default="0").strip().lower()
+            c = _prompt_input("请输入选项 (0-2/r)", default="0").strip().lower()
             if c == "0":
                 break
             elif c == "r":
                 self._reset_field_prompt({
-                    "1": lambda: self._pop_key(self.data.get("gateway"), "login_through_adapter"),
-                    "2": lambda: self._pop_key(self.data.get("gateway"), "background_approval_push"),
-                    "3": lambda: self._pop_key(self.data.get("gateway"), "feed"),
+                    "1": lambda: self._pop_key(self.data.get("gateway"), "background_approval_push"),
+                    "2": lambda: self._pop_key(self.data.get("gateway"), "feed"),
                 })
                 continue
 
             if c == "1":
-                ok, val = _prompt_edit_choice(
-                    "请选择登录通知适配器",
-                    ["qq", "onebot", "telegram", "wechat", ""],
-                    _format_field_state(gw, "login_through_adapter", gw_def.login_through_adapter),
-                )
-                if ok:
-                    self.data.setdefault("gateway", {})["login_through_adapter"] = val
-                    self._modified = True
-            elif c == "2":
                 value = _prompt_input("后台审批推送目标（留空恢复最近活跃管理员私聊）")
                 try:
                     value = GatewayConfig(background_approval_push=value).background_approval_push
@@ -1451,7 +1440,7 @@ class FullConfigEditor:
                     continue
                 self.data.setdefault("gateway", {})["background_approval_push"] = value
                 self._modified = True
-            elif c == "3":
+            elif c == "2":
                 self._edit_gateway_feed()
 
     def _edit_gateway_feed(self) -> None:
@@ -2669,8 +2658,6 @@ class FirstRunWizard:
         }
         existing_muse_proxy = self.existing_data.get("muse", {}).get("proxy") if preserve_muse else None
         self.muse_proxy: str = existing_muse_proxy if existing_muse_proxy in PROXY_MODES else "worker"
-        self.login_through_adapter: Optional[str] = None
-        self.wechat_login_notifications: bool = False
         self.completed: bool = False
         self._captured_event = asyncio.Event()
 
@@ -2697,14 +2684,11 @@ class FirstRunWizard:
             asyncio.run(self._listen_for_first_message())
             self._handle_unclaimed_and_group_options(claimable)
 
-        # 3. 选择登录通知通道
-        self._choose_login_notification_channel()
-
-        # 4. 生成并写入配置文件 + 可读摘要
+        # 3. 生成并写入配置文件 + 可读摘要
         self._generate_and_save_config()
         self.completed = True
 
-        # 5. 无缝衔接 Muse 登录（仅当尚未登录时询问）
+        # 4. 无缝衔接 Muse 登录（仅当尚未登录时询问）
         if offer_muse_login:
             self._offer_muse_login()
 
@@ -2910,41 +2894,6 @@ class FirstRunWizard:
                     )
                     self.group_settings[ch] = settings
 
-    def _choose_login_notification_channel(self) -> None:
-        if not self.selected_channels:
-            self.login_through_adapter = ""
-            return
-        if len(self.selected_channels) == 1:
-            only = self.selected_channels[0]
-            if only == "wechat":
-                use_wx = _prompt_bool("将微信设为 Muse 登录通知渠道（Cookie 失效时发给当前扫码用户）", False)
-                self.wechat_login_notifications = use_wx
-                self.login_through_adapter = "wechat" if use_wx else ""
-            else:
-                self.login_through_adapter = only
-            return
-
-        print("\n--- 选择 Muse 登录通知渠道 ---")
-        print("说明：当 Muse Cookie 失效需要重新登录时，通过哪个渠道私聊提醒您？")
-        default_ch = self.first_message_event[0] if self.first_message_event else self.selected_channels[0]
-        for idx, ch in enumerate(self.selected_channels, 1):
-            tag = "（默认）" if ch == default_ch else ""
-            print(f"  [{idx}] {CHANNEL_LABELS[ch]} ({ch}) {tag}")
-        print("  [0] 暂不指定（留空）")
-
-        default_idx = str(self.selected_channels.index(default_ch) + 1)
-        while True:
-            raw = _prompt_input(f"请输入编号 (0-{len(self.selected_channels)})", default=default_idx).strip()
-            if raw == "0":
-                self.login_through_adapter = ""
-                return
-            if raw.isdigit() and 1 <= int(raw) <= len(self.selected_channels):
-                picked = self.selected_channels[int(raw) - 1]
-                self.login_through_adapter = picked
-                self.wechat_login_notifications = picked == "wechat"
-                return
-            print("❌ 无效选项，请重新输入。")
-
     @staticmethod
     def _save_session_map(map_file_path: str, chat_key: str, session_id: str) -> None:
         """预先将私聊或群聊会话绑定写入持久化文件。"""
@@ -2991,15 +2940,6 @@ class FirstRunWizard:
             if keep_key in existing_muse:
                 muse_section[keep_key] = copy.deepcopy(existing_muse[keep_key])
 
-        if self.login_through_adapter is not None:
-            notification_channel = self.login_through_adapter
-        elif self.wechat_login_notifications:
-            notification_channel = "wechat"
-        elif self.first_message_event:
-            notification_channel = self.first_message_event[0]
-        else:
-            notification_channel = ""
-
         config_data: Dict[str, Any] = {
             "network": copy.deepcopy(self.network_data),
         }
@@ -3013,7 +2953,7 @@ class FirstRunWizard:
         config_data["adapters"] = {}
         existing_gw = self.existing_data.get("gateway", {}) if self.preserve_muse else {}
         gw_section = copy.deepcopy(existing_gw) if isinstance(existing_gw, dict) else {}
-        gw_section["login_through_adapter"] = notification_channel
+        gw_section.pop("login_through_adapter", None)
         config_data["gateway"] = gw_section
 
         # 1. QQ 适配器配置（未启用 QQ 时必须显式写 enabled: False，防止 QQConfig 默认开启）
@@ -3152,10 +3092,8 @@ class FirstRunWizard:
         print(f"🎉 配置文件已生成并保存至: {self.output_file}")
         print("=" * 60)
         muse = config_data.get("muse", {})
-        gw = config_data.get("gateway", {})
         print(f"  • Muse 主会话 : {muse.get('session_id')}")
         print(f"  • Muse 代理   : {muse.get('proxy', 'worker')}")
-        print(f"  • 登录通知渠道: {gw.get('login_through_adapter') or '(未指定)'}")
         adapters = config_data.get("adapters", {})
         for ch in self.selected_channels:
             entry = adapters.get(ch, {})
@@ -3307,18 +3245,15 @@ class BridgeConsole:
 
     def _print_dashboard(self) -> None:
         muse = self.data.get("muse", {}) if isinstance(self.data.get("muse"), dict) else {}
-        gw = self.data.get("gateway", {}) if isinstance(self.data.get("gateway"), dict) else {}
         cookies_file = muse.get("cookies_file") or "cookies.json"
         cookie_state = "✅ 已登录" if os.path.exists(cookies_file) else "⚠️ 未登录"
         proxy_state = muse.get("proxy", "worker")
-        notify_ch = gw.get("login_through_adapter") or "(未设置)"
         dirty = " *未保存*" if self._modified else ""
 
         print("\n" + "=" * 68)
         print(f"  🛠️  Muse IM Bridge 控制台 ({self.file_path}){dirty}")
         print("=" * 68)
         print(_format_channel_row(None, "Muse 账号", f"{cookie_state} ({cookies_file}) | 代理: {proxy_state}"))
-        print(_format_channel_row(None, "登录通知渠道", notify_ch))
         print("-" * 68)
         for ch in CHANNEL_ORDER:
             print(_format_channel_row(None, CHANNEL_LABELS[ch], self._channel_dashboard_line(ch)))
@@ -3340,7 +3275,7 @@ class BridgeConsole:
             self._print_dashboard()
             print("请选择操作（所有修改均实时保存，随时可 Ctrl+C 直接退出）：")
             print("  [1] 渠道管理（配置 / 开关 / 发消息认领 / 单渠道测通）")
-            print("  [2] 账号登录（Muse 邮箱登录 / 微信扫码与状态 / 通知渠道）")
+            print("  [2] 账号登录（Muse 邮箱登录 / 微信扫码与状态）")
             print("  [3] 一键连通性测试（检查全部已启用渠道）")
             print("  [4] 高级设置（Muse 核心 / 审批 / 网关 / 日志 / 分块 / Qzone）")
             print("  [5] 查看当前完整配置 JSON")
@@ -3651,17 +3586,15 @@ class BridgeConsole:
     def _account_login_menu(self) -> None:
         while True:
             muse = self.data.setdefault("muse", {})
-            gw = self.data.setdefault("gateway", {})
             cookies_file = muse.get("cookies_file") or "cookies.json"
             cookie_state = "已存在" if os.path.exists(cookies_file) else "缺失"
             wx_entry = (self.data.get("adapters") or {}).get("wechat", {})
-            print("\n--- 账号登录与通知通道 ---")
+            print("\n--- 账号登录 ---")
             print(f"  [1] Muse 邮箱验证码登录（当前 {cookies_file}: {cookie_state}）")
             print(f"  [2] 微信 iLink 扫码登录（当前: {_wechat_local_status_text(wx_entry)}）")
             print("  [3] 查看微信本地登录状态（不连接微信）")
-            print(f"  [4] 设置默认登录通知渠道（当前: {gw.get('login_through_adapter') or '未设置'}）")
             print("  [0] 返回主菜单")
-            act = _prompt_input("请选择操作 (0-4)", default="0").strip()
+            act = _prompt_input("请选择操作 (0-3)", default="0").strip()
             if act == "0":
                 return
             elif act == "1":
@@ -3693,15 +3626,6 @@ class BridgeConsole:
                     run_status(cfg)
                 except Exception:
                     print("❌ 无法读取本地微信状态。")
-            elif act == "4":
-                ok, val = _prompt_edit_choice(
-                    "请选择登录通知适配器",
-                    ["qq", "onebot", "telegram", "wechat", ""],
-                    _format_field_state(gw, "login_through_adapter", ""),
-                )
-                if ok:
-                    gw["login_through_adapter"] = val
-                    self._modified = True
             else:
                 print("❌ 无效选项。")
 

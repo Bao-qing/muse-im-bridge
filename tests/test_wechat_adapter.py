@@ -886,7 +886,7 @@ class TestWeChatMuseInteractions(unittest.IsolatedAsyncioTestCase):
             service.interaction_protocol.run = mock.AsyncMock()
             adapter.state.remember_message("owner", "startup", "TO")
             gateway = adapter.runtime
-            gateway.config = GatewayConfig(login_through_adapter="wechat")
+            gateway.config = GatewayConfig()
             gateway._run_events = mock.AsyncMock()
             with mock.patch.object(adapter.ctx, "send_notice", wraps=adapter.ctx.send_notice) as notice:
                 await gateway.start()

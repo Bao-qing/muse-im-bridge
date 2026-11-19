@@ -67,9 +67,7 @@ class TestConfig(unittest.TestCase):
                             "whitelist": {"private": ["OTHER_USER"], "GRP_1": "*"}
                         }
                     },
-                    "gateway": {
-                        "login_through_adapter": "qq"
-                    }
+                    "gateway": {}
                 }, f)
             cfg = ConfigLoader.load(cfg_path)
             self.assertEqual(cfg.qq.admin_id, ["ADMIN_OPENID_1", "ADMIN_OPENID_2"])
@@ -77,7 +75,6 @@ class TestConfig(unittest.TestCase):
             self.assertFalse(cfg.qq.is_admin("OTHER_USER"))
             # Unbound sessions fall back to the first admin
             self.assertEqual(cfg.qq.admin_target(), "ADMIN_OPENID_1")
-            self.assertEqual(cfg.gateway.login_through_adapter, "qq")
             self.assertTrue(cfg.qq.admin_only)
 
     def test_admin_only_switch(self):

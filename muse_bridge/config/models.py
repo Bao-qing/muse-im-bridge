@@ -454,7 +454,6 @@ class GatewayFeedConfig:
 
 @dataclasses.dataclass
 class GatewayConfig:
-    login_through_adapter: str = ""
     background_approval_push: str = ""
     feed: GatewayFeedConfig = dataclasses.field(default_factory=GatewayFeedConfig)
 
@@ -812,7 +811,6 @@ class ConfigLoader:
         if not isinstance(gw_feed_raw, dict) or gw_feed_raw.keys() - gw_feed_fields:
             raise ValueError("gateway.feed must be an object with known fields")
         gw_cfg = GatewayConfig(
-            login_through_adapter=str(gw_raw.get("login_through_adapter", "")),
             background_approval_push=gw_raw.get("background_approval_push", ""),
             feed=GatewayFeedConfig(**gw_feed_raw),
         )
