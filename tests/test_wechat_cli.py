@@ -111,9 +111,12 @@ class TestWeChatCLI(unittest.TestCase):
     def test_wizard_only_wechat_never_listens_for_first_message(self):
         wizard = init_config.FirstRunWizard(str(Path(self.tmp.name) / "generated.json"))
         def configure():
-            wizard.channel_configs["wechat"] = {"enabled": True, "session_bindings": {}}
-        with mock.patch.object(init_config, "_prompt_input", return_value="4"), mock.patch.object(wizard, "_configure_wechat", side_effect=configure), mock.patch.object(wizard, "_listen_for_first_message", new_callable=mock.AsyncMock) as listen, contextlib.redirect_stdout(self.output):
-            wizard.run_interactive()
+            wizard._mark_channel_enabled("wechat", {"enabled": True, "session_bindings": {}}, "已启用")
+        with mock.patch.object(init_config, "_prompt_input", side_effect=["4", "n", "n"]), \
+             mock.patch.object(wizard, "_configure_wechat", side_effect=configure), \
+             mock.patch.object(wizard, "_listen_for_first_message", new_callable=mock.AsyncMock) as listen, \
+             contextlib.redirect_stdout(self.output):
+            wizard.run_interactive(offer_muse_login=False)
         listen.assert_not_called()
         self.assertIsNone(wizard.first_message_event)
         data = json.loads(Path(wizard.output_file).read_text(encoding="utf-8"))
@@ -122,12 +125,24 @@ class TestWeChatCLI(unittest.TestCase):
         self.assertEqual(data["gateway"]["login_through_adapter"], "")
         self.assertFalse(data["adapters"]["qq"]["enabled"])
 
-    def test_original_channel_menu_numbers_unchanged(self):
-        for choice, expected in (("1", ["qq"]), ("2", ["onebot"]), ("3", ["qq", "onebot"]),
-                                 ("4", ["wechat"]), ("5", ["qq", "onebot", "wechat"])):
+    def test_channel_list_allows_free_combinations_including_wechat_and_telegram(self):
+        for inputs, expected in (
+            (["1", "n"], ["qq"]),
+            (["2", "n"], ["onebot"]),
+            (["1,2", "n"], ["qq", "onebot"]),
+            (["3", "n"], ["telegram"]),
+            (["4", "n"], ["wechat"]),
+            (["2,4", "n"], ["onebot", "wechat"]),
+            (["1,2,3,4", "n"], ["qq", "onebot", "telegram", "wechat"]),
+        ):
             wizard = init_config.FirstRunWizard()
-            with mock.patch.object(init_config, "_prompt_input", return_value=choice), contextlib.redirect_stdout(self.output):
-                wizard._select_channels()
+            with mock.patch.object(init_config, "_prompt_input", side_effect=inputs), \
+                 mock.patch.object(wizard, "_configure_qq", side_effect=lambda w=wizard: w._mark_channel_enabled("qq", {"app_id": "a", "app_secret": "s"}, "ok")), \
+                 mock.patch.object(wizard, "_configure_onebot", side_effect=lambda w=wizard: w._mark_channel_enabled("onebot", {"base_url": "http://127.0.0.1:3000", "access_token": "", "ws_url": "ws://127.0.0.1:3000"}, "ok")), \
+                 mock.patch.object(wizard, "_configure_telegram", side_effect=lambda w=wizard: w._mark_channel_enabled("telegram", {"bot_token": "123:abc", "proxy_url": None}, "ok")), \
+                 mock.patch.object(wizard, "_configure_wechat", side_effect=lambda w=wizard: w._mark_channel_enabled("wechat", {"enabled": True}, "ok")), \
+                 contextlib.redirect_stdout(self.output):
+                self.assertTrue(wizard._run_channel_setup_loop())
             self.assertEqual(wizard.selected_channels, expected)
 
     def test_wechat_menu_back_does_not_modify_configuration(self):

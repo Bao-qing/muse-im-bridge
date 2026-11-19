@@ -35,8 +35,10 @@ def parse_args(argv=None):
     )
     parser.add_argument(
         "--setup",
+        "--manage",
+        dest="setup",
         action="store_true",
-        help="Run interactive configuration manager / setup wizard",
+        help="Run interactive management console / setup wizard (manage.py)",
     )
     login_modes = parser.add_mutually_exclusive_group()
     login_modes.add_argument(
@@ -74,14 +76,12 @@ def main(argv=None) -> int:
             logger.error("微信操作失败，请检查本地配置和账号状态；未输出认证详情。")
             return 1
 
-    # 0. Setup mode or auto-prompt on first run without config
+    # 0. Management console mode or auto-prompt on first run without config
     if args.setup:
-        import init_config
+        import manage
         try:
             target = args.config or "config.json"
-            sys.argv = [sys.argv[0], target]
-            init_config.main()
-            return 0
+            return manage.main([target])
         except Exception as e:
             logger.error("Setup failed: %s", safe_error(e))
             return 1
@@ -90,16 +90,25 @@ def main(argv=None) -> int:
         if not os.path.exists("config.json") and not os.path.exists("credentials.json"):
             print("💡 未检测到配置文件 (config.json)。")
             try:
-                ans = input("是否立即启动首次配置向导？(Y/n): ").strip().lower()
+                ans = input("是否立即启动首次引导配置？(Y/n): ").strip().lower()
             except (KeyboardInterrupt, EOFError):
                 ans = "n"
             if ans != "n":
-                from init_config import FirstRunWizard
+                from manage import FirstRunWizard
                 try:
-                    FirstRunWizard(output_file="config.json").run_interactive()
+                    wizard = FirstRunWizard(output_file="config.json")
+                    if not wizard.run_interactive(offer_muse_login=True):
+                        return 0
                 except Exception as e:
                     logger.error("Setup failed: %s", safe_error(e))
                     return 1
+                try:
+                    start_now = input("配置已完成，是否立即启动网桥服务？(Y/n): ").strip().lower()
+                except (KeyboardInterrupt, EOFError):
+                    start_now = "n"
+                if start_now == "n":
+                    print("ℹ️  已退出；随时可运行 python manage.py 管理配置或 python main.py 启动服务。")
+                    return 0
 
     # 1. Bootstrap safely without files; loading may already detect egress IP.
     configure_logging(LoggingConfig(file=""))
@@ -114,7 +123,11 @@ def main(argv=None) -> int:
     if args.login:
         from muse_bridge.muse.login import run_protocol_login
         try:
-            run_protocol_login(output_path=config.muse.cookies_file)
+            run_protocol_login(
+                output_path=config.muse.cookies_file,
+                worker=config.muse.worker,
+                proxy_url=config.muse.proxy_url,
+            )
             return 0
         except Exception as e:
             logger.error("[MuseLogin] 登录失败：%s", safe_error(e))

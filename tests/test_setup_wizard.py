@@ -113,7 +113,8 @@ class TestFirstRunWizard(unittest.TestCase):
 
             self.assertEqual(data["gateway"]["login_through_adapter"], "onebot")
             self.assertIn("onebot", data["adapters"])
-            self.assertNotIn("qq", data["adapters"])
+            # QQ defaults to enabled=True when omitted; wizard must explicitly disable it.
+            self.assertEqual(data["adapters"]["qq"], {"enabled": False})
 
             ob = data["adapters"]["onebot"]
             self.assertTrue(ob["enabled"])
@@ -125,7 +126,7 @@ class TestFirstRunWizard(unittest.TestCase):
             self.assertEqual(ob["whitelist"]["private"], ["10001"])
             self.assertEqual(ob["whitelist"]["groups"], [20002])
 
-    def test_generate_dual_channel_config_qq_first(self):
+    def test_generate_dual_channel_config_qq_first_no_placeholders(self):
         with tempfile.TemporaryDirectory() as tmp:
             out_file = os.path.join(tmp, "config.json")
             wizard = FirstRunWizard(output_file=out_file)
@@ -155,8 +156,9 @@ class TestFirstRunWizard(unittest.TestCase):
             ob = data["adapters"]["onebot"]
             self.assertTrue(ob["enabled"])
             self.assertEqual(ob["qzone_feed"], QZONE_DEFAULTS)
-            self.assertEqual(ob["target_group_id"], 123456789)
-            self.assertEqual(ob["whitelist"]["groups"], [123456789])
+            self.assertEqual(ob["admin_id"], [])
+            self.assertNotIn("target_group_id", ob)
+            self.assertEqual(ob["whitelist"], {"private": [], "groups": []})
 
     def test_listen_and_capture_qq_message(self):
         """Test simulated gateway startup and message capture."""
@@ -318,6 +320,478 @@ class TestFullConfigEditor(unittest.TestCase):
             with open(p, "r", encoding="utf-8") as f:
                 saved = json.load(f)
             self.assertEqual(saved["muse"]["session_id"], "test")
+
+    def test_editor_modifies_telegram_category(self):
+        cfg = {"adapters": {}}
+        from manage import FullConfigEditor
+        editor = FullConfigEditor(cfg, file_path="dummy.json")
+        with mock.patch("manage._prompt_input", side_effect=[
+            "1", "y",
+            "2", "123456:AAH_valid_token",
+            "3", "http://127.0.0.1:7890",
+            "4", "all",
+            "13", "y",
+            "0",
+        ]), mock.patch("builtins.print"):
+            editor._edit_telegram_category()
+        tg = cfg["adapters"]["telegram"]
+        self.assertTrue(tg["enabled"])
+        self.assertEqual(tg["bot_token"], "123456:AAH_valid_token")
+        self.assertEqual(tg["proxy_url"], "http://127.0.0.1:7890")
+        self.assertEqual(tg["group_trigger"], "all")
+        self.assertTrue(tg["reaction_quote"])
+
+
+class TestManageConsoleAndWizardV2(unittest.TestCase):
+    def setUp(self):
+        patcher = mock.patch.object(FirstRunWizard, "_save_session_map")
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_init_config_aliases_manage_module(self):
+        import init_config
+        import manage
+        self.assertIs(init_config, manage)
+
+    def test_normalize_http_url_and_proxy_validation(self):
+        import manage
+        self.assertEqual(manage._normalize_http_url("3000"), "http://127.0.0.1:3000")
+        self.assertEqual(manage._normalize_http_url("127.0.0.1:3001"), "http://127.0.0.1:3001")
+        self.assertEqual(manage._normalize_http_url("https://napcat.example"), "https://napcat.example")
+        self.assertEqual(manage._validate_proxy_url("127.0.0.1:7890"), "http://127.0.0.1:7890")
+        self.assertIsNone(manage._validate_proxy_url("clear"))
+        self.assertIsNone(manage._validate_proxy_url(""))
+
+    def test_qq_instant_probe_retry_and_keep(self):
+        import manage
+        with mock.patch("manage._prompt_input", side_effect=[
+            "bad_id", "bad_sec", "1",  # fail -> retry
+            "good_id", "good_sec",     # succeed
+        ]), mock.patch("manage._probe_qq", side_effect=[(False, "invalid"), (True, "ok")]), \
+             mock.patch("builtins.print"):
+            status, cfg, note = manage._configure_qq_interactive()
+        self.assertEqual(status, "ready")
+        self.assertEqual(cfg, {"app_id": "good_id", "app_secret": "good_sec"})
+        self.assertIn("good_id", note)
+
+    def test_telegram_guided_config_syncs_proxy_to_muse(self):
+        import manage
+        wizard = manage.FirstRunWizard()
+        with mock.patch("manage._prompt_input", side_effect=[
+            "123456:AAH_valid_token",
+            "http://127.0.0.1:7890",
+            "y",  # sync proxy to Muse
+        ]), mock.patch("manage._probe_telegram", return_value=(True, "ok", {"bot_id": "123456", "username": "my_bot"})), \
+             mock.patch("builtins.print"):
+            wizard._configure_telegram()
+        self.assertEqual(wizard.selected_channels, ["telegram"])
+        self.assertEqual(wizard.channel_configs["telegram"]["proxy_url"], "http://127.0.0.1:7890")
+        self.assertEqual(wizard.muse_proxy_url, "http://127.0.0.1:7890")
+
+    def test_wechat_guided_basic_settings_and_defer(self):
+        import manage
+        with mock.patch("manage._prompt_input", side_effect=[
+            "2", "y", "n",  # guided basic settings: typing=True, catch_up=False
+            "0",            # finish and return
+        ]), mock.patch("manage._wechat_local_status_text", return_value="本地未登录"), \
+             mock.patch("builtins.print"):
+            status, cfg, note = manage._configure_wechat_guided()
+        self.assertEqual(status, "ready")
+        self.assertEqual(cfg, {"enabled": True, "typing_enabled": True, "catch_up_enabled": False})
+        self.assertIn("已启用", note)
+
+    def test_telegram_only_disables_qq_and_saves_claimed_admin(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out_file = os.path.join(tmp, "config.json")
+            import manage
+            wizard = manage.FirstRunWizard(output_file=out_file)
+            wizard.selected_channels = ["telegram"]
+            wizard.channel_configs["telegram"] = {
+                "bot_token": "99999:AAH_token_xyz",
+                "proxy_url": "http://127.0.0.1:7890",
+            }
+            wizard.claimed_events["telegram"] = ("424242", "group", "-100123", "77")
+            wizard.first_message_event = ("telegram", "424242", "group", "-100123", "77")
+            wizard.group_settings["telegram"] = {"group_trigger": "at", "bind_main_to_group": True}
+            wizard.login_through_adapter = "telegram"
+            with mock.patch("builtins.print"):
+                wizard._generate_and_save_config()
+
+            with open(out_file, "r", encoding="utf-8") as f:
+                data = json.load(f)
+
+            self.assertEqual(data["adapters"]["qq"], {"enabled": False})
+            tg = data["adapters"]["telegram"]
+            self.assertTrue(tg["enabled"])
+            self.assertEqual(tg["admin_id"], ["424242"])
+            self.assertEqual(tg["whitelist"]["private"], ["424242"])
+            self.assertEqual(tg["whitelist"]["-100123"], "*")
+            self.assertEqual(tg["group_trigger"], "at")
+            self.assertEqual(tg["proxy_url"], "http://127.0.0.1:7890")
+            self.assertEqual(tg["session_bindings"]["group:-100123"], data["muse"]["session_id"])
+
+            # Generated config must load cleanly via ConfigLoader without errors
+            from muse_bridge.config.models import ConfigLoader
+            with mock.patch("muse_bridge.config.models._detect_egress_ip", return_value="127.0.0.1"):
+                loaded = ConfigLoader.load(out_file)
+            self.assertFalse(loaded.qq.enabled)
+            self.assertTrue(loaded.telegram.enabled)
+
+    def test_multi_channel_claiming_and_manual_fallback(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out_file = os.path.join(tmp, "config.json")
+            import manage
+            wizard = manage.FirstRunWizard(output_file=out_file)
+            wizard.selected_channels = ["onebot", "telegram"]
+            wizard.channel_configs["onebot"] = {
+                "base_url": "http://127.0.0.1:3000",
+                "access_token": "",
+                "ws_url": "ws://127.0.0.1:3000",
+            }
+            wizard.channel_configs["telegram"] = {
+                "bot_token": "99999:AAH_token_xyz",
+                "proxy_url": None,
+            }
+            wizard.claimed_events["onebot"] = ("10001", "private", "10001", "m1")
+            wizard.first_message_event = ("onebot", "10001", "private", "10001", "m1")
+
+            # For unclaimed telegram: pick manual ID (1) -> "888888"
+            with mock.patch("manage._prompt_input", side_effect=["1", "888888"]), \
+                 mock.patch("builtins.print"):
+                wizard._handle_unclaimed_and_group_options(["onebot", "telegram"])
+                wizard._generate_and_save_config()
+
+            with open(out_file, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            self.assertEqual(data["adapters"]["qq"], {"enabled": False})
+            self.assertEqual(data["adapters"]["onebot"]["admin_id"], ["10001"])
+            self.assertEqual(data["adapters"]["telegram"]["admin_id"], ["888888"])
+
+    def test_reinitialize_creates_backup_and_preserves_muse_and_logging(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg_path = os.path.join(tmp, "config.json")
+            original = {
+                "muse": {"session_id": "keep-session-id", "proxy_url": "http://127.0.0.1:7890", "cookies_file": "my_cookies.json"},
+                "logging": {"level": "DEBUG"},
+                "adapters": {"qq": {"enabled": True, "app_id": "old", "app_secret": "old"}},
+                "gateway": {"login_through_adapter": "qq"},
+            }
+            with open(cfg_path, "w", encoding="utf-8") as f:
+                json.dump(original, f)
+
+            import manage
+            wizard = manage.FirstRunWizard(output_file=cfg_path, existing_data=original, preserve_muse=True)
+            wizard.selected_channels = ["wechat"]
+            wizard.channel_configs["wechat"] = {"enabled": True}
+            wizard.login_through_adapter = "wechat"
+            with mock.patch("builtins.print"):
+                wizard._generate_and_save_config()
+
+            self.assertTrue(os.path.exists(f"{cfg_path}.bak"))
+            with open(cfg_path, "r", encoding="utf-8") as f:
+                updated = json.load(f)
+            self.assertEqual(updated["muse"]["session_id"], "keep-session-id")
+            self.assertEqual(updated["muse"]["proxy_url"], "http://127.0.0.1:7890")
+            self.assertEqual(updated["logging"]["level"], "DEBUG")
+            self.assertEqual(updated["adapters"]["qq"], {"enabled": False})
+            self.assertTrue(updated["adapters"]["wechat"]["enabled"])
+
+    def test_daily_console_toggle_and_daily_claim(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg_path = os.path.join(tmp, "config.json")
+            with open(cfg_path, "w", encoding="utf-8") as f:
+                json.dump({
+                    "muse": {"session_id": "s1"},
+                    "adapters": {
+                        "qq": {"enabled": False},
+                        "onebot": {"enabled": True, "base_url": "http://127.0.0.1:3000", "ws_url": "ws://127.0.0.1:3000", "admin_id": []},
+                    },
+                    "gateway": {"login_through_adapter": "onebot"},
+                }, f)
+
+            import manage
+            console = manage.BridgeConsole(file_path=cfg_path)
+            self.assertTrue(console.load())
+
+            # Simulate daily claim for onebot receiving a group message
+            fake_claim = mock.AsyncMock(return_value={"onebot": ("55555", "group", "77777", "m9")})
+            with mock.patch("manage._listen_and_claim_channels", fake_claim), \
+                 mock.patch("manage._prompt_input", side_effect=["y", "y", "y", "1"]), \
+                 mock.patch("builtins.print"):
+                console._daily_claim_for_channel("onebot")
+
+            ob = console.data["adapters"]["onebot"]
+            self.assertIn("55555", ob["admin_id"])
+            self.assertIn("55555", ob["whitelist"]["private"])
+            self.assertIn(77777, ob["whitelist"]["groups"])
+            self.assertEqual(ob["group_trigger"], "at")
+            # Real-time auto-save must have persisted changes to disk immediately
+            self.assertFalse(console._modified)
+            with open(cfg_path, "r", encoding="utf-8") as f:
+                saved = json.load(f)
+            self.assertIn("55555", saved["adapters"]["onebot"]["admin_id"])
+            self.assertIn(77777, saved["adapters"]["onebot"]["whitelist"]["groups"])
+
+    def test_daily_console_reinit_cancel_does_not_overwrite(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg_path = os.path.join(tmp, "config.json")
+            with open(cfg_path, "w", encoding="utf-8") as f:
+                json.dump({"muse": {"session_id": "orig"}, "adapters": {"qq": {"enabled": False}}}, f)
+
+            import manage
+            console = manage.BridgeConsole(file_path=cfg_path)
+            console.load()
+            with mock.patch("manage._prompt_input", return_value="n"), mock.patch("builtins.print"):
+                console._reinitialize_flow()
+            self.assertFalse(os.path.exists(f"{cfg_path}.bak"))
+            self.assertEqual(console.data["muse"]["session_id"], "orig")
+
+    def test_muse_protocol_login_respects_proxy_and_worker_isolation(self):
+        from muse_bridge.config.models import WorkerConfig
+        from muse_bridge.muse.login import MuseProtocolLogin
+
+        with mock.patch("muse_bridge.muse.login.httpx.Client") as mock_client:
+            MuseProtocolLogin(proxy_url="http://127.0.0.1:7890")
+            self.assertEqual(mock_client.call_args.kwargs.get("proxy"), "http://127.0.0.1:7890")
+
+        with mock.patch("muse_bridge.muse.login.httpx.Client") as mock_client:
+            MuseProtocolLogin(
+                worker=WorkerConfig(base="https://worker.example.com", login=True),
+                proxy_url="http://127.0.0.1:7890",
+            )
+            self.assertNotIn("proxy", mock_client.call_args.kwargs)
+
+    def test_all_model_dataclass_fields_registered_in_manage(self):
+        import dataclasses
+        import manage
+        from muse_bridge.config import models
+
+        registered = manage.get_registered_config_fields()
+        target_classes = (
+            models.MuseConfig,
+            models.ApprovalConfig,
+            models.WorkerConfig,
+            models.GatewayConfig,
+            models.GatewayFeedConfig,
+            models.QQConfig,
+            models.OneBotConfig,
+            models.QzoneFeedConfig,
+            models.TelegramConfig,
+            models.WeChatConfig,
+            models.LoggingConfig,
+        )
+        for cls in target_classes:
+            expected = {f.name for f in dataclasses.fields(cls)}
+            actual = registered.get(cls.__name__, set())
+            missing = expected - actual
+            self.assertEqual(missing, set(), f"{cls.__name__} missing fields in manage.py: {missing}")
+
+    def test_cjk_alignment_and_unconfigured_default_markers(self):
+        import manage
+
+        rows = [
+            manage._format_channel_row(str(i), manage.CHANNEL_LABELS[ch], "STATUS")
+            for i, ch in enumerate(manage.CHANNEL_ORDER, 1)
+        ]
+        # Display column before "STATUS" must be identical across all 4 mixed CJK/ASCII rows
+        status_cols = [manage._display_width(row.split("STATUS")[0]) for row in rows]
+        self.assertEqual(len(set(status_cols)), 1, f"Misaligned channel rows: {rows}")
+
+        menu_rows = [
+            manage._format_menu_row("1", "enabled (是否启用)", "已启用"),
+            manage._format_menu_row("10", "whitelist.private (私聊白名单)", "[]"),
+            manage._format_menu_row("35", "file_ref_threshold_bytes (大文件引用阈值字节)", "未配置（默认: 2097152 (2MB)）"),
+        ]
+        colon_cols = [manage._display_width(row.split(" : ")[0]) for row in menu_rows]
+        self.assertEqual(len(set(colon_cols)), 1, f"Misaligned menu rows: {menu_rows}")
+
+        # Unset vs configured display markers
+        self.assertEqual(
+            manage._format_field_state({}, "poll_timeout_s", 30, hint="[1-50]"),
+            "未配置（默认: 30） [1-50]",
+        )
+        self.assertEqual(
+            manage._format_field_state({"poll_timeout_s": 45}, "poll_timeout_s", 30, hint="[1-50]"),
+            "45 [1-50]",
+        )
+
+    def test_telegram_editor_shows_all_unset_defaults_and_supports_edit_and_reset(self):
+        import contextlib
+        import io
+        import manage
+
+        cfg = {"adapters": {"telegram": {"enabled": True, "bot_token": "12345:AAH_valid_tok"}}}
+        editor = manage.FullConfigEditor(cfg, file_path="dummy.json")
+
+        # Enter submenu 14 (group whitelist/perms/interact), edit item 3 (seed_main_session -> True),
+        # reset item 3 via 'r', exit submenu 0, enter submenu 16 (chunk/media), exit 0, exit 0.
+        buf = io.StringIO()
+        with mock.patch("manage._prompt_input", side_effect=[
+            "14", "3", "y", "r", "3", "0",
+            "16", "0",
+            "0",
+        ]), contextlib.redirect_stdout(buf):
+            editor._edit_telegram_category()
+        out = buf.getvalue()
+        self.assertIn("未配置（默认:", out)
+        self.assertIn("seed_main_session", out)
+        self.assertIn("file_ref_threshold_bytes", out)
+        # After reset, seed_main_session is removed back to unconfigured
+        self.assertNotIn("seed_main_session", cfg["adapters"]["telegram"])
+
+    def test_muse_worker_and_gateway_feed_submenus(self):
+        import manage
+
+        cfg = {"muse": {}, "gateway": {}}
+        editor = manage.FullConfigEditor(cfg, file_path="dummy.json")
+        # Open Muse -> 13 (worker) -> 2 (ws=True) -> 0 -> 0
+        with mock.patch("manage._prompt_input", side_effect=["13", "2", "y", "0", "0"]), \
+             mock.patch("builtins.print"):
+            editor._edit_muse_category()
+        self.assertTrue(cfg["muse"]["worker"]["ws"])
+
+        # Open Gateway -> 3 (feed) -> 1 (enabled=True) -> 2 (targets=onebot=auto) -> 0 -> 0
+        with mock.patch("manage._prompt_input", side_effect=["3", "1", "y", "2", "onebot=auto", "0", "0"]), \
+             mock.patch("builtins.print"):
+            editor._edit_gateway_category()
+        self.assertTrue(cfg["gateway"]["feed"]["enabled"])
+        self.assertEqual(cfg["gateway"]["feed"]["targets"], {"onebot": "auto"})
+
+    def test_wechat_editor_supports_extra_conversation_fields(self):
+        import contextlib
+        import io
+        import manage
+
+        cfg = {"adapters": {"wechat": {"enabled": True}}}
+        editor = manage.FullConfigEditor(cfg, file_path="dummy.json")
+        buf = io.StringIO()
+        # Enter submenu 14 (交互与离线补发参数) -> item 3 (reaction_quote -> y) -> 0 -> 0
+        with mock.patch("manage._prompt_input", side_effect=["14", "3", "y", "0", "0"]), \
+             contextlib.redirect_stdout(buf):
+            editor._edit_wechat_category()
+        out = buf.getvalue()
+        self.assertTrue(cfg["adapters"]["wechat"]["reaction_quote"])
+        self.assertIn("未配置（默认:", out)
+        for forbidden in ("管理员", "白名单", "申请"):
+            self.assertNotIn(forbidden, out)
+
+    def test_enter_leaves_configured_and_unconfigured_fields_unchanged(self):
+        import copy
+        import manage
+
+        original = {
+            "muse": {"session_id": "keep_me"},
+            "gateway": {"login_through_adapter": "telegram"},
+            "adapters": {
+                "qq": {"enabled": True, "app_id": "111"},
+                "onebot": {"enabled": True, "group_trigger": "at"},
+                "telegram": {"enabled": True, "bot_token": "12345:AAH_valid_tok"},
+                "wechat": {"enabled": True, "state_dir": "custom-wx"},
+            },
+            "logging": {"level": "INFO"},
+            "overrides": {"chunk_chars": 1500},
+        }
+        data = copy.deepcopy(original)
+        editor = manage.FullConfigEditor(data, file_path="dummy.json")
+
+        # Enter fields and press Enter ("") across every category and a 2nd-level submenu
+        with mock.patch("builtins.input", side_effect=[
+            # Muse: 1 (configured str), 7 (unconfigured proxy), 11 (unconfigured bool), 0
+            "1", "", "7", "", "11", "", "0",
+            # QQ: 2 (configured str), 5 (unconfigured bool), 16 (submenu) -> 1 (proxy) -> "" -> 0, 0
+            "2", "", "5", "", "16", "1", "", "0", "0",
+            # Telegram: 2 (token), 3 (proxy), 4 (choice), 12 (int), 0
+            "2", "", "3", "", "4", "", "12", "", "0",
+            # WeChat: 4 (str), 5 (bool), 7 (int), 10 (float), 14 (submenu) -> 1 -> "" -> 0, 0
+            "4", "", "5", "", "7", "", "10", "", "14", "1", "", "0", "0",
+            # Logging: 1 (choice), 3 (nullable_str), 6 (int), 0
+            "1", "", "3", "", "6", "", "0",
+            # Overrides: 1 (int), 6 (str), 0
+            "1", "", "6", "", "0",
+        ]), mock.patch("builtins.print"):
+            editor._edit_muse_category()
+            editor._edit_qq_category()
+            editor._edit_telegram_category()
+            editor._edit_wechat_category()
+            editor._edit_logging_category()
+            editor._edit_overrides_category()
+
+        self.assertEqual(data, original)
+        self.assertFalse(editor._modified)
+
+    def test_enable_channel_prompts_credentials_and_auto_saves(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg_path = os.path.join(tmp, "config.json")
+            with open(cfg_path, "w", encoding="utf-8") as f:
+                json.dump({
+                    "muse": {"session_id": "s1"},
+                    "adapters": {
+                        "qq": {"enabled": False},
+                        "onebot": {"enabled": False},
+                        "telegram": {"enabled": False, "bot_token": "12345:AAH_valid_tok", "admin_id": ["99"]},
+                    },
+                }, f)
+
+            import manage
+            console = manage.BridgeConsole(file_path=cfg_path)
+            console.load()
+
+            # 1) Enabling OneBot without credentials & saying No keeps it disabled
+            with mock.patch("manage._prompt_input", side_effect=["n"]), mock.patch("builtins.print"):
+                console._enable_channel_flow("onebot")
+            self.assertFalse(console.data["adapters"]["onebot"]["enabled"])
+
+            # 2) Enabling OneBot without credentials & saying Yes runs guided setup and auto-saves
+            with mock.patch("manage._prompt_input", side_effect=[
+                "y",       # enter guided setup
+                "3000",    # base_url -> http://127.0.0.1:3000
+                "tok",     # access_token
+                "",        # default ws_url
+                "n",       # skip claiming admin for now
+            ]), mock.patch("manage._probe_onebot", return_value=(True, "ok", {"bot_id": "100"})), \
+                 mock.patch("builtins.print"):
+                console._enable_channel_flow("onebot")
+
+            with open(cfg_path, "r", encoding="utf-8") as f:
+                saved = json.load(f)
+            self.assertTrue(saved["adapters"]["onebot"]["enabled"])
+            self.assertEqual(saved["adapters"]["onebot"]["base_url"], "http://127.0.0.1:3000")
+            self.assertEqual(saved["adapters"]["onebot"]["access_token"], "tok")
+
+            # 3) Enabling Telegram with existing credentials & saying No to reconfigure enables immediately
+            with mock.patch("manage._prompt_input", side_effect=["n"]), mock.patch("builtins.print"):
+                console._enable_channel_flow("telegram")
+            with open(cfg_path, "r", encoding="utf-8") as f:
+                saved = json.load(f)
+            self.assertTrue(saved["adapters"]["telegram"]["enabled"])
+
+    def test_auto_save_persists_deep_submenu_edit_even_on_ctrl_c(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg_path = os.path.join(tmp, "config.json")
+            initial = {"adapters": {"telegram": {"enabled": True, "bot_token": "12345:AAH_valid_tok"}}}
+            with open(cfg_path, "w", encoding="utf-8") as f:
+                json.dump(initial, f)
+
+            import manage
+            editor = manage.FullConfigEditor(initial, file_path=cfg_path, auto_save=True)
+            # Enter submenu 16 (chunk/media) -> item 1 (chunk_chars) -> "2000" -> then Ctrl+C (SystemExit)
+            with mock.patch("builtins.input", side_effect=["16", "1", "2000", KeyboardInterrupt]), \
+                 mock.patch("builtins.print"):
+                with self.assertRaises(SystemExit):
+                    editor._edit_telegram_category()
+
+            # Even though user hit Ctrl+C without pressing 0, the edit was already saved to disk!
+            with open(cfg_path, "r", encoding="utf-8") as f:
+                saved = json.load(f)
+            self.assertEqual(saved["adapters"]["telegram"]["chunk_chars"], 2000)
+
+    def test_empty_enter_cancels_channel_credential_prompts(self):
+        import manage
+
+        with mock.patch("builtins.input", return_value=""), mock.patch("builtins.print"):
+            self.assertEqual(manage._configure_qq_interactive(), ("cancel", None, ""))
+            self.assertEqual(manage._configure_onebot_interactive(), ("cancel", None, ""))
+            self.assertEqual(manage._configure_telegram_interactive(), ("cancel", None, ""))
 
 
 if __name__ == "__main__":

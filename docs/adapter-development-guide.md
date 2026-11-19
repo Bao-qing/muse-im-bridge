@@ -223,9 +223,9 @@ class DeliveryEnvelope:
      self.adapters.append(self.gateway.mount(<Platform>Adapter(config.<platform>)))
      ```
    - 保持 `BridgeEngine` 仅做装配，不向适配器注入 `MuseService` 或 `SessionMapper`。
-3. **CLI 检查与配置向导（[main.py](../main.py)、[init_config.py](../init_config.py)）**：
+3. **CLI 检查与配置控制台（[main.py](../main.py)、[manage.py](../manage.py)）**：
    - 在 `main.py --check` 输出中补充新适配器的脱敏摘要；
-   - 按需在 `init_config.py` 中补充交互式编辑菜单。
+   - 按需在 `manage.py` 中补充渠道引导、探针与交互式编辑菜单。
 
 ---
 

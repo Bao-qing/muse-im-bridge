@@ -41,12 +41,21 @@ _BASE_HEADERS = {
 
 
 class MuseProtocolLogin:
-    def __init__(self, base_url: str = "https://muse.ai", *, worker: WorkerConfig | None = None):
+    def __init__(
+        self,
+        base_url: str = "https://muse.ai",
+        *,
+        worker: WorkerConfig | None = None,
+        proxy_url: Optional[str] = None,
+    ):
         self.worker = worker or WorkerConfig()
         self.real_base_url = base_url.rstrip("/")
         self.base_url = http_base(base_url, self.worker, login=True)
+        client_kwargs = dict(worker_http_options(self.worker, login=True))
+        if proxy_url and not self.worker.login:
+            client_kwargs["proxy"] = proxy_url
         self.client = httpx.Client(http2=True, follow_redirects=True, timeout=25.0,
-                                   **worker_http_options(self.worker, login=True))
+                                   **client_kwargs)
         self.waterfall_id = str(uuid.uuid4())
         self.csrf_token: Optional[str] = None
 
@@ -171,7 +180,9 @@ class MuseProtocolLogin:
 def run_protocol_login(
     email: Optional[str] = None,
     output_path: str = "cookies.json",
-    *, worker: WorkerConfig | None = None,
+    *,
+    worker: WorkerConfig | None = None,
+    proxy_url: Optional[str] = None,
 ) -> dict:
     """Interactive protocol login runner."""
     if not email:
@@ -180,7 +191,12 @@ def run_protocol_login(
         raise ValueError("邮箱地址不能为空")
 
     print(f"[MuseLogin] 正在请求发送验证码至 {email}...")
-    auth = MuseProtocolLogin(**({"worker": worker} if worker and worker.login else {}))
+    login_kwargs = {}
+    if worker and worker.login:
+        login_kwargs["worker"] = worker
+    elif proxy_url:
+        login_kwargs["proxy_url"] = proxy_url
+    auth = MuseProtocolLogin(**login_kwargs)
     auth.send_otp(email)
     print(f"[MuseLogin] 验证码已成功发送至 {email}，请查收邮件！")
 
