@@ -428,7 +428,7 @@ class BackgroundConfigCase(unittest.TestCase):
                   gateway=GatewayConfig(background_approval_push="qq:ADMIN"))
 
     def test_gateway_editor_can_set_clear_and_reject_invalid_destination(self):
-        from init_config import FullConfigEditor
+        from manage import FullConfigEditor
         editor = FullConfigEditor({})
         output = io.StringIO()
         with contextlib.redirect_stdout(output):

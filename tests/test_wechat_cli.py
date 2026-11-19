@@ -11,7 +11,7 @@ import unittest
 from unittest import mock
 
 import main
-import init_config
+import manage
 from muse_bridge.config import WeChatConfig
 from muse_bridge.adapters.wechat import cli
 
@@ -51,7 +51,8 @@ class TestWeChatCLI(unittest.TestCase):
         self.auth_cls.assert_called_once_with(self.client)
         self.state.save_account.assert_called_once_with(self.credentials)
         self.client.aclose.assert_awaited_once()
-        self.client_cls.assert_called_once_with(channel_version="2.4.6", route_tag="", timeout=10)
+        from muse_bridge.network import DIRECT_ROUTE
+        self.client_cls.assert_called_once_with(channel_version="2.4.6", route_tag="", timeout=10, route=DIRECT_ROUTE)
         args = self.auth.login.call_args
         self.assertEqual(args.args, (self.state.accounts.return_value,))
         self.assertIs(args.kwargs["display"], cli.display_qr)
@@ -109,10 +110,10 @@ class TestWeChatCLI(unittest.TestCase):
         self.assertTrue(main.parse_args(["--login"]).login)
 
     def test_wizard_only_wechat_never_listens_for_first_message(self):
-        wizard = init_config.FirstRunWizard(str(Path(self.tmp.name) / "generated.json"))
+        wizard = manage.FirstRunWizard(str(Path(self.tmp.name) / "generated.json"))
         def configure():
             wizard._mark_channel_enabled("wechat", {"enabled": True, "session_bindings": {}}, "已启用")
-        with mock.patch.object(init_config, "_prompt_input", side_effect=["4", "n"]), \
+        with mock.patch.object(manage, "_prompt_input", side_effect=["4", "n"]), \
              mock.patch.object(wizard, "_configure_wechat", side_effect=configure), \
              mock.patch.object(wizard, "_listen_for_first_message", new_callable=mock.AsyncMock) as listen, \
              contextlib.redirect_stdout(self.output):
@@ -135,8 +136,8 @@ class TestWeChatCLI(unittest.TestCase):
             (["2,4", "n"], ["onebot", "wechat"]),
             (["1,2,3,4", "n"], ["qq", "onebot", "telegram", "wechat"]),
         ):
-            wizard = init_config.FirstRunWizard()
-            with mock.patch.object(init_config, "_prompt_input", side_effect=inputs), \
+            wizard = manage.FirstRunWizard()
+            with mock.patch.object(manage, "_prompt_input", side_effect=inputs), \
                  mock.patch.object(wizard, "_configure_qq", side_effect=lambda w=wizard: w._mark_channel_enabled("qq", {"app_id": "a", "app_secret": "s"}, "ok")), \
                  mock.patch.object(wizard, "_configure_onebot", side_effect=lambda w=wizard: w._mark_channel_enabled("onebot", {"base_url": "http://127.0.0.1:3000", "access_token": "", "ws_url": "ws://127.0.0.1:3000"}, "ok")), \
                  mock.patch.object(wizard, "_configure_telegram", side_effect=lambda w=wizard: w._mark_channel_enabled("telegram", {"bot_token": "123:abc", "proxy_url": None}, "ok")), \
@@ -148,9 +149,9 @@ class TestWeChatCLI(unittest.TestCase):
     def test_wechat_menu_back_does_not_modify_configuration(self):
         for settings in (None, {"enabled": True, "chunk_chars": 3000}):
             data = {"adapters": {} if settings is None else {"wechat": settings.copy()}}
-            editor = init_config.FullConfigEditor(data)
+            editor = manage.FullConfigEditor(data)
             before = json.loads(json.dumps(editor.data))
-            with mock.patch.object(init_config, "_prompt_input", return_value="0") as prompt, contextlib.redirect_stdout(self.output):
+            with mock.patch.object(manage, "_prompt_input", return_value="0") as prompt, contextlib.redirect_stdout(self.output):
                 editor._edit_wechat_category()
             prompt.assert_called_once()
             self.assertEqual(editor.data, before)
@@ -160,8 +161,8 @@ class TestWeChatCLI(unittest.TestCase):
 
     def test_wechat_menu_can_login_immediately_without_editing_settings(self):
         settings = {"enabled": True, "state_dir": "chosen-state", "chunk_chars": 3000}
-        editor = init_config.FullConfigEditor({"adapters": {"wechat": settings.copy()}})
-        with mock.patch.object(init_config, "_prompt_input", side_effect=["2", "0"]) as prompt, mock.patch.object(init_config, "_prompt_bool", side_effect=AssertionError("unrelated setting")), mock.patch.object(cli, "run_login", return_value={"user_id": "scanner"}) as login, contextlib.redirect_stdout(self.output):
+        editor = manage.FullConfigEditor({"adapters": {"wechat": settings.copy()}})
+        with mock.patch.object(manage, "_prompt_input", side_effect=["2", "0"]) as prompt, mock.patch.object(manage, "_prompt_bool", side_effect=AssertionError("unrelated setting")), mock.patch.object(cli, "run_login", return_value={"user_id": "scanner"}) as login, contextlib.redirect_stdout(self.output):
             editor._edit_wechat_category()
         self.assertEqual(prompt.call_count, 2)
         login.assert_called_once()
@@ -170,8 +171,8 @@ class TestWeChatCLI(unittest.TestCase):
         self.assertFalse(editor._modified)
 
     def test_wechat_menu_status_is_independent_from_login_and_settings(self):
-        editor = init_config.FullConfigEditor({"adapters": {"wechat": {"enabled": True}}})
-        with mock.patch.object(init_config, "_prompt_input", side_effect=["3", "0"]), mock.patch.object(cli, "run_status") as status, mock.patch.object(cli, "run_login") as login, contextlib.redirect_stdout(self.output):
+        editor = manage.FullConfigEditor({"adapters": {"wechat": {"enabled": True}}})
+        with mock.patch.object(manage, "_prompt_input", side_effect=["3", "0"]), mock.patch.object(cli, "run_status") as status, mock.patch.object(cli, "run_login") as login, contextlib.redirect_stdout(self.output):
             editor._edit_wechat_category()
         status.assert_called_once()
         login.assert_not_called()
@@ -179,51 +180,51 @@ class TestWeChatCLI(unittest.TestCase):
 
     def test_wechat_menu_changes_only_selected_field(self):
         original = {"enabled": True, "state_dir": "same", "chunk_chars": 3000, "max_chunks": 4}
-        editor = init_config.FullConfigEditor({"adapters": {"wechat": original.copy()}})
-        with mock.patch.object(init_config, "_prompt_input", side_effect=["5", "0"]), mock.patch.object(init_config, "_prompt_bool", return_value=True) as boolean, contextlib.redirect_stdout(self.output):
+        editor = manage.FullConfigEditor({"adapters": {"wechat": original.copy()}})
+        with mock.patch.object(manage, "_prompt_input", side_effect=["5", "0"]), mock.patch.object(manage, "_prompt_bool", return_value=True) as boolean, contextlib.redirect_stdout(self.output):
             editor._edit_wechat_category()
         boolean.assert_called_once_with("输入状态提示", False)
         self.assertEqual(editor.data["adapters"]["wechat"], {**original, "typing_enabled": True})
         self.assertTrue(editor._modified)
 
     def test_wechat_menu_login_failure_can_return_without_changes(self):
-        editor = init_config.FullConfigEditor({"adapters": {"wechat": {"enabled": True}}})
-        with mock.patch.object(init_config, "_prompt_input", side_effect=["2", "0"]), mock.patch.object(cli, "run_login", side_effect=RuntimeError("SECRET")), contextlib.redirect_stdout(self.output):
+        editor = manage.FullConfigEditor({"adapters": {"wechat": {"enabled": True}}})
+        with mock.patch.object(manage, "_prompt_input", side_effect=["2", "0"]), mock.patch.object(cli, "run_login", side_effect=RuntimeError("SECRET")), contextlib.redirect_stdout(self.output):
             editor._edit_wechat_category()
         self.assertEqual(editor.data["adapters"]["wechat"], {"enabled": True})
         self.assertFalse(editor._modified)
         self.assertNotIn("SECRET", self.output.getvalue())
 
     def test_wechat_menu_numeric_validation_stays_on_selected_field(self):
-        editor = init_config.FullConfigEditor({"adapters": {"wechat": {"enabled": True}}})
-        with mock.patch.object(init_config, "_prompt_input", side_effect=["7", "0"]), mock.patch.object(init_config, "_prompt_int", side_effect=[4001, 2000]) as number, contextlib.redirect_stdout(self.output):
+        editor = manage.FullConfigEditor({"adapters": {"wechat": {"enabled": True}}})
+        with mock.patch.object(manage, "_prompt_input", side_effect=["7", "0"]), mock.patch.object(manage, "_prompt_int", side_effect=[4001, 2000]) as number, contextlib.redirect_stdout(self.output):
             editor._edit_wechat_category()
         self.assertEqual(number.call_count, 2)
         self.assertEqual(editor.data["adapters"]["wechat"], {"enabled": True, "chunk_chars": 2000})
 
     def test_wechat_menu_preserves_fractional_timeout_and_rejects_nonfinite(self):
-        editor = init_config.FullConfigEditor({"adapters": {"wechat": {"enabled": True, "http_timeout_s": 0.5}}})
-        with mock.patch.object(init_config, "_prompt_input", side_effect=["10", "nan", "10", "0.5", "0"]), contextlib.redirect_stdout(self.output):
+        editor = manage.FullConfigEditor({"adapters": {"wechat": {"enabled": True, "http_timeout_s": 0.5}}})
+        with mock.patch.object(manage, "_prompt_input", side_effect=["10", "nan", "10", "0.5", "0"]), contextlib.redirect_stdout(self.output):
             editor._edit_wechat_category()
         self.assertEqual(editor.data["adapters"]["wechat"], {"enabled": True, "http_timeout_s": 0.5})
         self.assertFalse(editor._modified)
 
     def test_wechat_menu_session_bindings_rejects_malformed_input(self):
-        editor = init_config.FullConfigEditor({"adapters": {"wechat": {"enabled": True}}})
-        with mock.patch.object(init_config, "_prompt_input", side_effect=["11", "invalid", "11", "private:owner=session", "0"]), contextlib.redirect_stdout(self.output):
+        editor = manage.FullConfigEditor({"adapters": {"wechat": {"enabled": True}}})
+        with mock.patch.object(manage, "_prompt_input", side_effect=["11", "invalid", "11", "private:owner=session", "0"]), contextlib.redirect_stdout(self.output):
             editor._edit_wechat_category()
         self.assertEqual(editor.data["adapters"]["wechat"], {"enabled": True, "session_bindings": {"private:owner": "session"}})
 
     def test_engine_connects_wechat_without_starting_login(self):
         from muse_bridge import engine
-        from muse_bridge.config.models import AppConfig, QQConfig
+        from muse_bridge.config.models import AppConfig, MuseConfig, QQConfig
         adapter_cls = mock.Mock()
         module = types.SimpleNamespace(WeChatAdapter=adapter_cls)
-        cfg = AppConfig(qq=QQConfig(enabled=False), wechat=WeChatConfig(enabled=True))
+        cfg = AppConfig(muse=MuseConfig(proxy="none"), qq=QQConfig(enabled=False), wechat=WeChatConfig(enabled=True))
         with mock.patch.dict(sys.modules, {"muse_bridge.adapters.wechat.adapter": module}), mock.patch.object(engine, "MuseTokenManager"), mock.patch.object(engine, "MuseService") as service, mock.patch.object(engine, "UnifiedGateway") as gateway:
             gateway.return_value.mount.side_effect = lambda adapter: adapter
             instance = engine.BridgeEngine(cfg)
-        adapter_cls.assert_called_once_with(cfg.wechat)
+        adapter_cls.assert_called_once_with(cfg.wechat, network=cfg.network)
         gateway.assert_called_once_with(service.return_value, cfg.gateway)
         gateway.return_value.mount.assert_called_once_with(adapter_cls.return_value)
         self.assertEqual(instance.adapters, [adapter_cls.return_value])

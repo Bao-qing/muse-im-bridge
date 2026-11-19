@@ -59,9 +59,9 @@ class TestOneBotConfig(unittest.TestCase):
                 "adapters": {"qq": {"enabled": False}, "onebot": {"enabled": True, "typing_enabled": True}},
             }), encoding="utf-8")
             self.assertTrue(ConfigLoader.load(str(path)).onebot.typing_enabled)
-        from init_config import FullConfigEditor
+        from manage import FullConfigEditor
         editor = FullConfigEditor({"adapters": {"onebot": {}}})
-        with mock.patch("init_config._prompt_input", side_effect=["16", "y", "0"]), mock.patch("builtins.print"):
+        with mock.patch("manage._prompt_input", side_effect=["16", "y", "0"]), mock.patch("builtins.print"):
             editor._edit_onebot_category()
         self.assertTrue(editor.data["adapters"]["onebot"]["typing_enabled"])
 

@@ -1,4 +1,4 @@
-"""Tests for first-run setup wizard (init_config.py)."""
+"""Tests for first-run setup wizard (manage.py)."""
 
 import asyncio
 import json
@@ -8,7 +8,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from init_config import FirstRunWizard, _default_ws_url
+from manage import FirstRunWizard, _default_ws_url
 
 
 QZONE_DEFAULTS = {
@@ -210,11 +210,11 @@ class TestFirstRunWizard(unittest.TestCase):
 class TestFullConfigEditor(unittest.TestCase):
     def test_editor_modifies_muse_category(self):
         cfg = {"muse": {"session_id": "old_sid", "cookies_file": "old.json"}}
-        from init_config import FullConfigEditor
+        from manage import FullConfigEditor
         editor = FullConfigEditor(cfg, file_path="dummy.json")
 
         # Mock user input to change session_id (option 1) then exit category (option 0)
-        with mock.patch("init_config._prompt_input", side_effect=["1", "new_custom_sid", "0"]):
+        with mock.patch("manage._prompt_input", side_effect=["1", "new_custom_sid", "0"]):
             editor._edit_muse_category()
 
         self.assertEqual(cfg["muse"]["session_id"], "new_custom_sid")
@@ -222,21 +222,21 @@ class TestFullConfigEditor(unittest.TestCase):
 
     def test_editor_modifies_gateway_category(self):
         cfg = {"gateway": {"background_approval_push": ""}}
-        from init_config import FullConfigEditor
+        from manage import FullConfigEditor
         editor = FullConfigEditor(cfg, file_path="dummy.json")
 
-        with mock.patch("init_config._prompt_input", side_effect=["1", "onebot:12345", "0"]):
+        with mock.patch("manage._prompt_input", side_effect=["1", "onebot:12345", "0"]):
             editor._edit_gateway_category()
 
         self.assertEqual(cfg["gateway"]["background_approval_push"], "onebot:12345")
 
     def test_editor_modifies_qq_category(self):
         cfg = {"adapters": {"qq": {"enabled": False, "app_id": "111"}}}
-        from init_config import FullConfigEditor
+        from manage import FullConfigEditor
         editor = FullConfigEditor(cfg, file_path="dummy.json")
 
         # Option 1: enabled -> True, Option 2: app_id -> 222, Option 0: exit
-        with mock.patch("init_config._prompt_input", side_effect=["1", "y", "2", "222", "0"]):
+        with mock.patch("manage._prompt_input", side_effect=["1", "y", "2", "222", "0"]):
             editor._edit_qq_category()
 
         self.assertTrue(cfg["adapters"]["qq"]["enabled"])
@@ -244,17 +244,17 @@ class TestFullConfigEditor(unittest.TestCase):
 
     def test_editor_modifies_onebot_category(self):
         cfg = {"adapters": {"onebot": {"enabled": True, "base_url": "http://127.0.0.1:3000"}}}
-        from init_config import FullConfigEditor
+        from manage import FullConfigEditor
         editor = FullConfigEditor(cfg, file_path="dummy.json")
 
         # Option 5: group_trigger -> at, Option 0: exit
-        with mock.patch("init_config._prompt_input", side_effect=["5", "at", "0"]):
+        with mock.patch("manage._prompt_input", side_effect=["5", "at", "0"]):
             editor._edit_onebot_category()
 
         self.assertEqual(cfg["adapters"]["onebot"]["group_trigger"], "at")
 
     def test_editor_qzone_defaults_stay_disabled(self):
-        from init_config import FullConfigEditor
+        from manage import FullConfigEditor
         editor = FullConfigEditor({})
         # Enter item 15, accept every default, then return to the parent.
         with mock.patch("builtins.input", side_effect=["15"] + [""] * 10 + ["0"]):
@@ -263,11 +263,11 @@ class TestFullConfigEditor(unittest.TestCase):
         self.assertTrue(editor._modified)
 
     def test_editor_qzone_edits_validate_and_preserve_other_settings(self):
-        from init_config import FullConfigEditor
+        from manage import FullConfigEditor
         original = {**QZONE_DEFAULTS, "poll_interval_s": 900}
         ob = {"base_url": "http://localhost:3000", "qzone_feed": original}
         editor = FullConfigEditor({"adapters": {"onebot": ob}})
-        with mock.patch("init_config._prompt_input", side_effect=[
+        with mock.patch("manage._prompt_input", side_effect=[
             "15", "y", "bad", "0", "-1", "600", "7200", "100", "7",
             "120", "1800", "9", "2", "64", "data/custom.json", "0",
         ]):
@@ -281,9 +281,9 @@ class TestFullConfigEditor(unittest.TestCase):
         self.assertEqual(ob["base_url"], "http://localhost:3000")
 
     def test_editor_qzone_bounds_and_visibility_labels(self):
-        from init_config import FullConfigEditor
+        from manage import FullConfigEditor
         editor = FullConfigEditor({})
-        with mock.patch("init_config._prompt_input", side_effect=[
+        with mock.patch("manage._prompt_input", side_effect=[
             "15", "n", "300", "3600", "101", "2", "3", "2", "60", "3600", "5", "64", "data/custom.json", "0",
         ]) as prompted, mock.patch("builtins.print"):
             editor._edit_onebot_category()
@@ -299,21 +299,21 @@ class TestFullConfigEditor(unittest.TestCase):
 
     def test_editor_modifies_logging_and_overrides(self):
         cfg = {"logging": {"level": "INFO"}, "overrides": {"chunk_chars": 1200}}
-        from init_config import FullConfigEditor
+        from manage import FullConfigEditor
         editor = FullConfigEditor(cfg, file_path="dummy.json")
 
-        with mock.patch("init_config._prompt_input", side_effect=["1", "DEBUG", "0"]):
+        with mock.patch("manage._prompt_input", side_effect=["1", "DEBUG", "0"]):
             editor._edit_logging_category()
         self.assertEqual(cfg["logging"]["level"], "DEBUG")
 
-        with mock.patch("init_config._prompt_input", side_effect=["1", "1500", "0"]):
+        with mock.patch("manage._prompt_input", side_effect=["1", "1500", "0"]):
             editor._edit_overrides_category()
         self.assertEqual(cfg["overrides"]["chunk_chars"], 1500)
 
     def test_editor_save_file(self):
         with tempfile.TemporaryDirectory() as tmp:
             p = os.path.join(tmp, "test_config.json")
-            from init_config import FullConfigEditor
+            from manage import FullConfigEditor
             editor = FullConfigEditor({"muse": {"session_id": "test"}}, file_path=p)
             editor.save()
 
@@ -328,7 +328,7 @@ class TestFullConfigEditor(unittest.TestCase):
         with mock.patch("manage._prompt_input", side_effect=[
             "1", "y",
             "2", "123456:AAH_valid_token",
-            "3", "http://127.0.0.1:7890",
+            "3", "http",
             "4", "all",
             "13", "y",
             "0",
@@ -337,7 +337,7 @@ class TestFullConfigEditor(unittest.TestCase):
         tg = cfg["adapters"]["telegram"]
         self.assertTrue(tg["enabled"])
         self.assertEqual(tg["bot_token"], "123456:AAH_valid_token")
-        self.assertEqual(tg["proxy_url"], "http://127.0.0.1:7890")
+        self.assertEqual(tg["proxy"], "http")
         self.assertEqual(tg["group_trigger"], "all")
         self.assertTrue(tg["reaction_quote"])
 
@@ -347,11 +347,6 @@ class TestManageConsoleAndWizardV2(unittest.TestCase):
         patcher = mock.patch.object(FirstRunWizard, "_save_session_map")
         patcher.start()
         self.addCleanup(patcher.stop)
-
-    def test_init_config_aliases_manage_module(self):
-        import init_config
-        import manage
-        self.assertIs(init_config, manage)
 
     def test_normalize_http_url_and_proxy_validation(self):
         import manage
@@ -379,14 +374,14 @@ class TestManageConsoleAndWizardV2(unittest.TestCase):
         wizard = manage.FirstRunWizard()
         with mock.patch("manage._prompt_input", side_effect=[
             "123456:AAH_valid_token",
+            "http",
             "http://127.0.0.1:7890",
-            "y",  # sync proxy to Muse
         ]), mock.patch("manage._probe_telegram", return_value=(True, "ok", {"bot_id": "123456", "username": "my_bot"})), \
              mock.patch("builtins.print"):
             wizard._configure_telegram()
         self.assertEqual(wizard.selected_channels, ["telegram"])
-        self.assertEqual(wizard.channel_configs["telegram"]["proxy_url"], "http://127.0.0.1:7890")
-        self.assertEqual(wizard.muse_proxy_url, "http://127.0.0.1:7890")
+        self.assertEqual(wizard.channel_configs["telegram"]["proxy"], "http")
+        self.assertEqual(wizard.network_data["proxy_url"], "http://127.0.0.1:7890")
 
     def test_wechat_guided_basic_settings_and_defer(self):
         import manage
@@ -406,9 +401,11 @@ class TestManageConsoleAndWizardV2(unittest.TestCase):
             import manage
             wizard = manage.FirstRunWizard(output_file=out_file)
             wizard.selected_channels = ["telegram"]
+            wizard.muse_proxy = "http"
+            wizard.network_data["proxy_url"] = "http://127.0.0.1:7890"
             wizard.channel_configs["telegram"] = {
                 "bot_token": "99999:AAH_token_xyz",
-                "proxy_url": "http://127.0.0.1:7890",
+                "proxy": "http",
             }
             wizard.claimed_events["telegram"] = ("424242", "group", "-100123", "77")
             wizard.first_message_event = ("telegram", "424242", "group", "-100123", "77")
@@ -426,7 +423,8 @@ class TestManageConsoleAndWizardV2(unittest.TestCase):
             self.assertEqual(tg["whitelist"]["private"], ["424242"])
             self.assertEqual(tg["whitelist"]["-100123"], "*")
             self.assertEqual(tg["group_trigger"], "at")
-            self.assertEqual(tg["proxy_url"], "http://127.0.0.1:7890")
+            self.assertEqual(tg["proxy"], "http")
+            self.assertEqual(data["network"]["proxy_url"], "http://127.0.0.1:7890")
             self.assertEqual(tg["session_bindings"]["group:-100123"], data["muse"]["session_id"])
 
             # Generated config must load cleanly via ConfigLoader without errors
@@ -470,7 +468,8 @@ class TestManageConsoleAndWizardV2(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             cfg_path = os.path.join(tmp, "config.json")
             original = {
-                "muse": {"session_id": "keep-session-id", "proxy_url": "http://127.0.0.1:7890", "cookies_file": "my_cookies.json"},
+                "network": {"proxy_url": "http://127.0.0.1:7890"},
+                "muse": {"session_id": "keep-session-id", "proxy": "http", "cookies_file": "my_cookies.json"},
                 "logging": {"level": "DEBUG"},
                 "adapters": {"qq": {"enabled": True, "app_id": "old", "app_secret": "old"}},
                 "gateway": {"login_through_adapter": "qq"},
@@ -489,7 +488,8 @@ class TestManageConsoleAndWizardV2(unittest.TestCase):
             with open(cfg_path, "r", encoding="utf-8") as f:
                 updated = json.load(f)
             self.assertEqual(updated["muse"]["session_id"], "keep-session-id")
-            self.assertEqual(updated["muse"]["proxy_url"], "http://127.0.0.1:7890")
+            self.assertEqual(updated["muse"]["proxy"], "http")
+            self.assertEqual(updated["network"]["proxy_url"], "http://127.0.0.1:7890")
             self.assertEqual(updated["logging"]["level"], "DEBUG")
             self.assertNotIn("login_through_adapter", updated["gateway"])
             self.assertEqual(updated["adapters"]["qq"], {"enabled": False})
@@ -546,17 +546,22 @@ class TestManageConsoleAndWizardV2(unittest.TestCase):
             self.assertEqual(console.data["muse"]["session_id"], "orig")
 
     def test_muse_protocol_login_respects_proxy_and_worker_isolation(self):
-        from muse_bridge.config.models import WorkerConfig
         from muse_bridge.muse.login import MuseProtocolLogin
+        from muse_bridge.network import NetworkRoute
 
-        with mock.patch("muse_bridge.muse.login.httpx.Client") as mock_client:
-            MuseProtocolLogin(proxy_url="http://127.0.0.1:7890")
+        with mock.patch("muse_bridge.network.httpx.Client") as mock_client:
+            MuseProtocolLogin(route=NetworkRoute(mode="http", proxy_url="http://127.0.0.1:7890"))
             self.assertEqual(mock_client.call_args.kwargs.get("proxy"), "http://127.0.0.1:7890")
 
-        with mock.patch("muse_bridge.muse.login.httpx.Client") as mock_client:
+        with mock.patch("muse_bridge.network.httpx.Client") as mock_client:
             MuseProtocolLogin(
-                worker=WorkerConfig(base="https://worker.example.com", login=True),
-                proxy_url="http://127.0.0.1:7890",
+                route=NetworkRoute(
+                    mode="worker",
+                    proxy_url="http://127.0.0.1:7890",
+                    worker_base="https://worker.example.com",
+                    worker_http=True,
+                    worker_ws=True,
+                ),
             )
             self.assertNotIn("proxy", mock_client.call_args.kwargs)
 
@@ -641,13 +646,13 @@ class TestManageConsoleAndWizardV2(unittest.TestCase):
     def test_muse_worker_and_gateway_feed_submenus(self):
         import manage
 
-        cfg = {"muse": {}, "gateway": {}}
+        cfg = {"network": {}, "gateway": {}}
         editor = manage.FullConfigEditor(cfg, file_path="dummy.json")
-        # Open Muse -> 13 (worker) -> 2 (ws=True) -> 0 -> 0
-        with mock.patch("manage._prompt_input", side_effect=["13", "2", "y", "0", "0"]), \
+        # Open Network -> 2 (worker) -> 2 (ws=True) -> 0 -> 0
+        with mock.patch("manage._prompt_input", side_effect=["2", "2", "y", "0", "0"]), \
              mock.patch("builtins.print"):
-            editor._edit_muse_category()
-        self.assertTrue(cfg["muse"]["worker"]["ws"])
+            editor._edit_network_category()
+        self.assertTrue(cfg["network"]["worker"]["ws"])
 
         # Open Gateway -> 2 (feed) -> 1 (enabled=True) -> 2 (targets=onebot=auto) -> 0 -> 0
         with mock.patch("manage._prompt_input", side_effect=["2", "1", "y", "2", "onebot=auto", "0", "0"]), \
@@ -664,8 +669,8 @@ class TestManageConsoleAndWizardV2(unittest.TestCase):
         cfg = {"adapters": {"wechat": {"enabled": True}}}
         editor = manage.FullConfigEditor(cfg, file_path="dummy.json")
         buf = io.StringIO()
-        # Enter submenu 14 (交互与离线补发参数) -> item 3 (reaction_quote -> y) -> 0 -> 0
-        with mock.patch("manage._prompt_input", side_effect=["14", "3", "y", "0", "0"]), \
+        # Enter submenu 14 (交互与离线补发参数) -> item 4 (reaction_quote -> y) -> 0 -> 0
+        with mock.patch("manage._prompt_input", side_effect=["14", "4", "y", "0", "0"]), \
              contextlib.redirect_stdout(buf):
             editor._edit_wechat_category()
         out = buf.getvalue()
