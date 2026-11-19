@@ -66,6 +66,6 @@ MuseEventPump 对会话取并集，每个账号上下文有独立投递队列。
 
 回退不是简单删除 sidecar：旧代码不能理解新投递账本，回退可能重发未知/部分完成的消息，也可能使用过期会话映射。必须停进程并核对运行期间的映射与投递结果，必要时恢复升级前整套状态并人工处理升级后消息；不要只还原其中一个文件。
 
-## 验证范围
+## 契约测试
 
-离线合同在 `tests/test_unified_gateway.py`、`tests/test_platform_delivery.py` 和原有回归测试中；QQ 官方机器人另外做私聊/群聊真机验证。OneBot/微信真机验证及真实登录验证由维护者执行，不能用共用业务代码或离线测试替代。
+核心网关与发送器离线契约测试位于 `tests/test_unified_gateway.py` 与 `tests/test_platform_delivery.py`；各平台真实连接与登录行为需在对应平台环境中手动验证。
