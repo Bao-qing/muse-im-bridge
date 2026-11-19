@@ -9,7 +9,6 @@ import httpx
 
 from muse_bridge.adapters.wechat.auth import WeChatAuth, login
 from muse_bridge.adapters.wechat.client import DEFAULT_API, WeChatClient, WeChatError
-from muse_bridge.adapters.wechat.security import WeChatSecurityError
 
 CONFIRMED = {
     "status": "confirmed", "bot_token": "new-token", "baseurl": DEFAULT_API,
@@ -98,18 +97,17 @@ class TestWeChatAuth(unittest.IsolatedAsyncioTestCase):
             with self.assertRaises(WeChatError):
                 await auth.login([], display=lambda s: None, verify=lambda: "")
 
-    async def test_untrusted_redirect_and_confirmed_baseurl_fail_safely(self):
+    async def test_malformed_redirect_and_confirmed_baseurl_fail_safely(self):
         for state in (
-            {"status": "scaned_but_redirect", "redirect_host": "unverified.weixin.qq.com"},
             {"status": "scaned_but_redirect", "redirect_host": "user:secret@ilinkai.weixin.qq.com"},
+            {"status": "scaned_but_redirect", "redirect_host": "ilinkai.weixin.qq.com/secret"},
             {"status": "scaned_but_redirect"},
-            {**CONFIRMED, "baseurl": "https://evil.qq.com/secret"},
+            {**CONFIRMED, "baseurl": "   "},
         ):
             auth = self.auth([state])
-            with self.assertRaises(WeChatSecurityError) as caught:
+            with self.assertRaises(WeChatError) as caught:
                 await auth.login([], display=lambda s: None, verify=lambda: "")
             self.assertNotIn("secret", repr(caught.exception))
-            self.assertNotIn("unverified", repr(caught.exception))
 
     async def test_cancellation_preserves_input_credentials(self):
         accounts = copy.deepcopy(LOCAL)

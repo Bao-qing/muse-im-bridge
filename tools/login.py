@@ -18,6 +18,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from muse_bridge.config.models import ConfigLoader, LoggingConfig
 from muse_bridge.muse.login import run_protocol_login
+from muse_bridge.network import resolve_route
 from muse_bridge.observability import configure_logging, get_logger, safe_error
 
 
@@ -40,10 +41,11 @@ def main(argv=None):
     configure_logging(config.logging, legacy_debug=config.debug)
 
     try:
+        muse_route = resolve_route(config.muse.proxy, config.network, section="muse")
         run_protocol_login(
             email=args.email,
             output_path=args.output,
-            worker=config.muse.worker,
+            route=muse_route,
         )
     except KeyboardInterrupt:
         print("\n[MuseLogin] 用户取消登录。")

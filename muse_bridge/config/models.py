@@ -20,6 +20,7 @@ from typing import Any, ClassVar, Dict, List, Optional, Union
 from urllib.parse import urlsplit
 
 from . import constants
+from ..network import validate_proxy_mode, validate_proxy_url, validate_worker_base
 
 
 def _env_bool(name: str, default: bool = False) -> bool:
@@ -69,36 +70,26 @@ class ApprovalConfig:
 
 @dataclasses.dataclass
 class WorkerConfig:
-    base: str = "https://your-worker.example.com"
-    ws: bool = False
-    http: bool = False
-    login: bool = False
-    login_origin: str = "real"
-    ws_permessage_deflate: bool = True
+    base: str = ""
+    ws: bool = True
+    http: bool = True
 
     def __post_init__(self):
-        for name in ("ws", "http", "login", "ws_permessage_deflate"):
+        for name in ("ws", "http"):
             if type(getattr(self, name)) is not bool:
-                raise ValueError(f"muse.worker.{name} must be a boolean")
-        if self.login_origin not in {"real", "worker"}:
-            raise ValueError("muse.worker.login_origin must be real or worker")
-        if not isinstance(self.base, str):
-            raise ValueError("muse.worker.base must be an HTTPS origin")
-        try:
-            parsed = urlsplit(self.base)
-            valid = (parsed.scheme == "https" and parsed.hostname and not parsed.username
-                     and not parsed.password and parsed.port in (None, 443)
-                     and parsed.path in ("", "/") and not parsed.query and not parsed.fragment)
-        except ValueError:
-            valid = False
-        if not valid:
-            # WS transport intentionally retains its fixed TLS port 443.
-            raise ValueError("muse.worker.base must be an HTTPS origin on port 443")
-        self.base = self.base.rstrip("/")
+                raise ValueError(f"network.worker.{name} must be a boolean")
+        self.base = validate_worker_base(self.base)
 
-    @property
-    def enabled(self) -> bool:
-        return self.ws or self.http or self.login
+
+@dataclasses.dataclass
+class NetworkConfig:
+    proxy_url: str = dataclasses.field(default="", repr=False)
+    worker: WorkerConfig = dataclasses.field(default_factory=WorkerConfig)
+
+    def __post_init__(self):
+        if not isinstance(self.worker, WorkerConfig):
+            raise ValueError("network.worker must be a WorkerConfig")
+        self.proxy_url = validate_proxy_url(self.proxy_url)
 
 
 @dataclasses.dataclass
@@ -110,10 +101,11 @@ class MuseConfig:
     host: str = constants.DEFAULT_MUSE_HOST
     client_ip: str = ""
     timezone: str = constants.DEFAULT_MUSE_TIMEZONE
-    proxy_url: Optional[str] = None
-    direct: bool = constants.DEFAULT_MUSE_DIRECT
+    proxy: str = "worker"
     approval: ApprovalConfig = dataclasses.field(default_factory=ApprovalConfig)
-    worker: WorkerConfig = dataclasses.field(default_factory=WorkerConfig)
+
+    def __post_init__(self):
+        self.proxy = validate_proxy_mode(self.proxy, "muse")
 
 
 @dataclasses.dataclass
@@ -159,6 +151,7 @@ class ConversationConfig:
     section: ClassVar[str] = "adapters.chat"
 
     enabled: bool = True
+    proxy: str = "none"
     credentials_in_place: bool = constants.DEFAULT_CREDENTIALS_IN_PLACE
     approvals_in_place: bool = constants.DEFAULT_APPROVALS_IN_PLACE
     reaction_quote: bool = constants.DEFAULT_REACTION_QUOTE
@@ -202,6 +195,7 @@ class ConversationConfig:
     download_timeout_s: int = constants.DEFAULT_DOWNLOAD_TIMEOUT_S
 
     def __post_init__(self):
+        self.proxy = validate_proxy_mode(self.proxy, self.section)
         for name in ("credentials_in_place", "approvals_in_place", "reaction_quote"):
             if type(getattr(self, name)) is not bool:
                 raise ValueError(f"{self.section}.{name} must be a boolean")
@@ -245,7 +239,6 @@ class QQConfig(ChatConfig):
 
     app_id: str = ""
     app_secret: str = ""
-    proxy_url: Optional[str] = None
     download_proxy: str = ""
     # Active (non-reply) messages per outbound item; QQ limits active sends.
     max_active_chunks: int = constants.DEFAULT_MAX_ACTIVE_CHUNKS
@@ -331,6 +324,7 @@ class TelegramConfig(ChatConfig):
     section: ClassVar[str] = "adapters.telegram"
 
     enabled: bool = False
+    proxy: str = "worker"
     seed_main_session: bool = False
     access_requests: AccessRequestsConfig = dataclasses.field(
         default_factory=lambda: AccessRequestsConfig(state_file="data/telegram_access.local.json"))
@@ -340,7 +334,6 @@ class TelegramConfig(ChatConfig):
     routes_file: str = "data/telegram_routes.json"
 
     bot_token: str = dataclasses.field(default="", repr=False)
-    proxy_url: Optional[str] = dataclasses.field(default=None, repr=False)
     group_trigger: str = "at"
     poll_timeout_s: int = 30
 
@@ -353,14 +346,6 @@ class TelegramConfig(ChatConfig):
         if not isinstance(self.bot_token, str) or ((self.enabled or self.bot_token)
                 and not re.fullmatch(r"[1-9][0-9]*:[A-Za-z0-9_-]+", self.bot_token)):
             raise ValueError("adapters.telegram requires a valid bot_token (or TELEGRAM_BOT_TOKEN)")
-        if self.proxy_url is not None:
-            try:
-                proxy = urlsplit(self.proxy_url)
-                valid_proxy = proxy.scheme in {"http", "https"} and bool(proxy.hostname) and proxy.port != 0
-            except (TypeError, ValueError, AttributeError):
-                valid_proxy = False
-            if not valid_proxy:
-                raise ValueError("adapters.telegram.proxy_url must be an HTTP(S) proxy URL")
         if self.group_trigger not in ("all", "at", "prefix"):
             raise ValueError("adapters.telegram.group_trigger must be all, at, or prefix")
         if type(self.poll_timeout_s) is not int or not 1 <= self.poll_timeout_s <= 50:
@@ -388,6 +373,7 @@ class WeChatConfig(ConversationConfig):
     routes_file: str = "data/wechat/routes.json"
 
     def __post_init__(self):
+        self.proxy = validate_proxy_mode(self.proxy, self.section)
         # WeChat preserves raw types instead of the legacy adapters' coercion.
         for field in dataclasses.fields(self):
             value = getattr(self, field.name)
@@ -533,6 +519,7 @@ class AppConfig:
     logging: LoggingConfig = dataclasses.field(default_factory=LoggingConfig)
     wechat: WeChatConfig = dataclasses.field(default_factory=WeChatConfig)
     telegram: TelegramConfig = dataclasses.field(default_factory=TelegramConfig)
+    network: NetworkConfig = dataclasses.field(default_factory=NetworkConfig)
 
     def __post_init__(self):
         if self.gateway.background_approval_push:
@@ -540,6 +527,12 @@ class AppConfig:
             adapter = getattr(self, platform)
             if not adapter.enabled or not adapter.is_admin(target) or target == "*":
                 raise ValueError("gateway.background_approval_push must name an enabled adapter's configured administrator")
+        if self.muse.proxy == "http" and not self.network.proxy_url:
+            raise ValueError("muse.proxy='http' requires network.proxy_url")
+        for name in ("qq", "onebot", "wechat", "telegram"):
+            adapter = getattr(self, name)
+            if adapter.enabled and adapter.proxy == "http" and not self.network.proxy_url:
+                raise ValueError(f"adapters.{name}.proxy='http' requires network.proxy_url")
 
 
 class ConfigLoader:
@@ -609,10 +602,37 @@ class ConfigLoader:
         if not isinstance(overrides, dict):
             raise ValueError("overrides must be an object")
         # Preserve raw types: unlike legacy adapters no bool()/int() coercion.
-        for key in fields - {"enabled", "session_bindings"}:
+        for key in fields - {"enabled", "proxy", "session_bindings"}:
             if key in overrides and overrides[key] is not None:
                 values[key] = overrides[key]
         return WeChatConfig(**values)
+
+    @classmethod
+    def _network_from_raw(cls, raw_data: dict) -> NetworkConfig:
+        net_raw = raw_data.get("network", {})
+        if not isinstance(net_raw, dict):
+            raise ValueError("network must be an object")
+        net_fields = {f.name for f in dataclasses.fields(NetworkConfig)}
+        if net_raw.keys() - net_fields:
+            raise ValueError("network contains unknown configuration fields")
+        worker_raw = net_raw.get("worker", {})
+        if not isinstance(worker_raw, dict):
+            raise ValueError("network.worker must be an object")
+        worker_fields = {f.name for f in dataclasses.fields(WorkerConfig)}
+        if worker_raw.keys() - worker_fields:
+            raise ValueError("network.worker contains unknown configuration fields")
+        proxy_url = net_raw.get("proxy_url", "")
+        if proxy_url is None:
+            proxy_url = ""
+        return NetworkConfig(
+            proxy_url=proxy_url,
+            worker=WorkerConfig(**worker_raw),
+        )
+
+    @classmethod
+    def load_network(cls, config_path: Optional[str] = None) -> NetworkConfig:
+        """Offline CLI loader for the top-level network configuration."""
+        return cls._network_from_raw(cls._read_raw(config_path))
 
     @classmethod
     def load_wechat(cls, config_path: Optional[str] = None) -> WeChatConfig:
@@ -622,6 +642,7 @@ class ConfigLoader:
     @classmethod
     def load(cls, config_path: Optional[str] = None) -> AppConfig:
         raw_data = cls._read_raw(config_path)
+        network_cfg = cls._network_from_raw(raw_data)
         wechat_cfg = cls._wechat_from_raw(raw_data)
         overrides = raw_data.get("overrides", {})
 
@@ -634,6 +655,8 @@ class ConfigLoader:
 
         # 1. Muse config
         m_raw = raw_data.get("muse", {})
+        if not isinstance(m_raw, dict):
+            raise ValueError("muse must be an object")
         approval_raw = m_raw.get("approval", {})
         if not isinstance(approval_raw, dict):
             raise ValueError("muse.approval must be an object")
@@ -642,12 +665,7 @@ class ConfigLoader:
             notify=approval_raw.get("notify", True),
             sync_interval_s=approval_raw.get("sync_interval_s", 180),
         )
-        worker_raw = m_raw.get("worker", {})
-        if not isinstance(worker_raw, dict):
-            raise ValueError("muse.worker must be an object")
-        worker_cfg = WorkerConfig(**worker_raw)
         muse_cfg = MuseConfig(
-            worker=worker_cfg,
             approval=approval_cfg,
             mint_file=_get_val(m_raw, "mint_file", os.environ.get("MUSE_MINT_FILE") or ".mint.json"),
             cookies_file=_get_val(m_raw, "cookies_file", os.environ.get("MUSE_COOKIES_FILE") or "cookies.json"),
@@ -656,17 +674,21 @@ class ConfigLoader:
             host=_get_val(m_raw, "host", os.environ.get("MUSE_HOST") or constants.DEFAULT_MUSE_HOST),
             client_ip=_get_val(m_raw, "client_ip", os.environ.get("MUSE_CLIENT_IP") or ""),
             timezone=_get_val(m_raw, "timezone", os.environ.get("MUSE_TIMEZONE") or constants.DEFAULT_MUSE_TIMEZONE),
-            proxy_url=_get_val(m_raw, "proxy_url", os.environ.get("MUSE_PROXY_URL")),
-            direct=_get_val(m_raw, "direct", constants.DEFAULT_MUSE_DIRECT),
+            proxy=m_raw.get("proxy", "worker"),
         )
 
         # Worker egress is not the bridge's egress. Never probe third parties in
-        # any Worker mode. Empty client_ip acceptance is pending live validation;
-        # set muse.client_ip explicitly to test a supplied value instead.
-        if not muse_cfg.client_ip and not muse_cfg.worker.enabled:
-            detected = _detect_egress_ip(muse_cfg.proxy_url, muse_cfg.direct)
-            if detected:
-                muse_cfg.client_ip = detected
+        # Worker mode; set muse.client_ip explicitly if needed.
+        if not muse_cfg.client_ip and muse_cfg.proxy != "worker":
+            if muse_cfg.proxy == "http":
+                if network_cfg.proxy_url:
+                    detected = _detect_egress_ip(network_cfg.proxy_url, False)
+                    if detected:
+                        muse_cfg.client_ip = detected
+            else:
+                detected = _detect_egress_ip(None, True)
+                if detected:
+                    muse_cfg.client_ip = detected
 
         # 2. Group-capable adapters share one field set.
         adapters_raw = raw_data.get("adapters", {})
@@ -700,6 +722,7 @@ class ConfigLoader:
             return dict(
                 access_requests=access_cfg,
                 enabled=raw.get("enabled", defaults["enabled"]),
+                proxy=raw.get("proxy", defaults["proxy"]),
                 admin_id=admin_ids,
                 admin_only=bool(_get_val(raw, "admin_only", constants.DEFAULT_ADMIN_ONLY)),
                 seed_main_session=_get_val(raw, "seed_main_session", defaults["seed_main_session"]),
@@ -737,7 +760,6 @@ class ConfigLoader:
             **_chat_fields(q_raw, QQConfig),
             app_id=str(q_raw.get("app_id") or os.environ.get("QQ_APP_ID") or ""),
             app_secret=str(q_raw.get("app_secret") or os.environ.get("QQ_APP_SECRET") or ""),
-            proxy_url=q_raw.get("proxy_url") or muse_cfg.proxy_url,
             download_proxy=q_raw.get("download_proxy") or "",
             debug=q_raw.get("debug", False) or _env_bool("QQ_DEBUG", False),
             max_active_chunks=int(_get_val(q_raw, "max_active_chunks", constants.DEFAULT_MAX_ACTIVE_CHUNKS)),
@@ -777,7 +799,6 @@ class ConfigLoader:
         telegram_cfg = TelegramConfig(
             **_chat_fields(tg_raw, TelegramConfig),
             bot_token=tg_raw.get("bot_token") or os.environ.get("TELEGRAM_BOT_TOKEN", ""),
-            proxy_url=tg_raw.get("proxy_url") or None,
             group_trigger=tg_raw.get("group_trigger", "at"),
             poll_timeout_s=tg_raw.get("poll_timeout_s", 30),
         )
@@ -815,4 +836,5 @@ class ConfigLoader:
             gateway=gw_cfg,
             debug=debug,
             logging=logging_cfg,
+            network=network_cfg,
         )

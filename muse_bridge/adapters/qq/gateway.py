@@ -12,6 +12,7 @@ import time
 from typing import Any, Callable, Coroutine, Optional
 
 from ...config import constants
+from ...network import DIRECT_ROUTE, NetworkRoute
 from ...observability import get_logger, new_id, safe_error, safe_url, trace_event
 from .client import QQClient
 from .ws_transport import QQWebSocket, QQWSClosed
@@ -40,14 +41,18 @@ class QQGateway:
         self,
         client: QQClient,
         on_event: Callable[[str, dict], Coroutine[Any, Any, None]],
-        proxy_url: Optional[str] = None,
         debug: bool = False,
         ws_guid: str = constants.DEFAULT_WS_GUID,
         user_agent: str = constants.DEFAULT_USER_AGENT,
+        *,
+        route: NetworkRoute | None = None,
     ):
         self.client = client
         self.on_event = on_event
-        self.proxy_url = proxy_url
+        client_route = getattr(client, "route", None)
+        self.route = route if isinstance(route, NetworkRoute) else (
+            client_route if isinstance(client_route, NetworkRoute) else DIRECT_ROUTE
+        )
         self.debug = debug
         self.ws_guid = ws_guid
         self.user_agent = user_agent
@@ -67,13 +72,13 @@ class QQGateway:
             connection_id = new_id()
             started = time.perf_counter()
             try:
-                gateway_url = self.client.get_gateway_url()
+                gateway_url = self.route.ws_url(self.client.get_gateway_url())
                 if self.debug:
                     logger.debug("Connecting to QQ gateway %s", safe_url(gateway_url))
                 _trace_gateway("connect.start", connection_id, url=safe_url(gateway_url))
                 self._ws = await QQWebSocket.connect(
                     gateway_url,
-                    proxy_url=self.proxy_url,
+                    proxy_url=self.route.ws_proxy,
                     ws_guid=self.ws_guid,
                     user_agent=self.user_agent,
                 )

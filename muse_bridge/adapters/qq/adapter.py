@@ -15,6 +15,7 @@ from ...core.delivery import DeliveryResult, DeliveryStatus, ReactionEnvelope, r
 from ...core.identity import valid_id
 from ...core.message import Attachment, InboundMessage, MessageSource
 from ..base import BaseAdapter
+from ...network import DIRECT_ROUTE, resolve_route
 from ...observability import get_logger
 from .client import QQClient
 from .gateway import QQGateway
@@ -26,12 +27,20 @@ MESSAGE_EVENTS = frozenset({"C2C_MESSAGE_CREATE", "GROUP_AT_MESSAGE_CREATE", "GR
 
 
 class QQAdapter(BaseAdapter):
-    def __init__(self, config: QQConfig, *, client=None):
+    def __init__(self, config: QQConfig, *, network=None, route=None, client=None):
         self.config = config
+        if route is not None:
+            active_route = route
+        elif network is not None or client is None:
+            active_route = resolve_route(config.proxy, network, section="adapters.qq")
+        else:
+            active_route = DIRECT_ROUTE
+        self.route = active_route
         self.client = client or QQClient(
             app_id=config.app_id, app_secret=config.app_secret,
-            proxy_url=config.proxy_url, download_proxy=config.download_proxy,
-            user_agent=config.user_agent)
+            download_proxy=config.download_proxy,
+            user_agent=config.user_agent,
+            route=active_route)
         self.sender = QQSender(config, self.client)
         self._running = False
 
@@ -39,10 +48,10 @@ class QQAdapter(BaseAdapter):
         self.gateway = QQGateway(
             client=self.client,
             on_event=self.handle_event,
-            proxy_url=self.config.proxy_url,
             debug=self.config.debug,
             ws_guid=self.config.ws_guid,
             user_agent=self.config.user_agent,
+            route=active_route,
         )
 
     def account_identity(self):

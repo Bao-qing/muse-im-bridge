@@ -6,8 +6,7 @@ import inspect
 from time import monotonic
 from collections.abc import Mapping
 
-from .client import WeChatClient, WeChatError
-from .security import DEFAULT_API, redirect_base, validate_url
+from .client import DEFAULT_API, WeChatClient, WeChatError
 
 
 async def _callback(callback, *args):
@@ -30,9 +29,12 @@ def _normalize(account: Mapping) -> dict[str, str]:
         raise WeChatError("WeChat login omitted bot ID")
     if not isinstance(user_id, str):
         raise WeChatError("Invalid WeChat login user ID")
+    baseurl = account.get("baseurl") or DEFAULT_API
+    if not isinstance(baseurl, str) or not baseurl.strip():
+        raise WeChatError("Invalid WeChat login base URL")
     return {
         "bot_token": token.strip(), "bot_id": bot_id, "user_id": user_id,
-        "baseurl": validate_url(account.get("baseurl") or DEFAULT_API, base=True),
+        "baseurl": baseurl.strip().rstrip("/"),
     }
 
 
@@ -117,7 +119,10 @@ class WeChatAuth:
                 elif status == "scaned":
                     code = ""
                 elif status == "scaned_but_redirect":
-                    base_url = redirect_base(response.get("redirect_host"))
+                    host = response.get("redirect_host")
+                    if not isinstance(host, str) or not host.strip() or any(c in host for c in "/?#@\\ \t\r\n"):
+                        raise WeChatError("Invalid WeChat redirect host")
+                    base_url = "https://" + host.strip()
                 # The service can return immediately; wait/scaned polls start
                 # at least one second apart without adding delay to a long poll.
                 delay = max(0, 1 - (monotonic() - poll_started)) if status in {"wait", "scaned"} else 0
@@ -125,9 +130,9 @@ class WeChatAuth:
         raise WeChatError("WeChat QR limit reached (three codes total)")
 
 
-async def login(local_accounts, *, display, verify, on_status=None) -> dict[str, str]:
+async def login(local_accounts, *, display, verify, on_status=None, route=None) -> dict[str, str]:
     """Convenience login using a temporary, unauthenticated protocol client."""
-    client = WeChatClient()
+    client = WeChatClient(route=route)
     try:
         return await WeChatAuth(client).login(
             local_accounts, display=display, verify=verify, on_status=on_status,

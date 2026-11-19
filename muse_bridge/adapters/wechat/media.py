@@ -12,8 +12,7 @@ from urllib.parse import urlencode
 from cryptography.hazmat.primitives import padding
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 
-from .client import WeChatClient
-from .security import DEFAULT_CDN, WeChatSecurityError, validate_url
+from .client import DEFAULT_CDN, WeChatClient, WeChatError
 
 # A local resource guard, not a claim about the server's upload-size policy.
 MAX_UPLOAD_BYTES = 100 * 1024 * 1024
@@ -37,13 +36,13 @@ def parse_key(value: str | bytes) -> bytes:
             return bytes.fromhex(decoded.decode("ascii"))
     except (ValueError, UnicodeError, binascii.Error):
         pass
-    raise WeChatSecurityError("Invalid WeChat AES-128 key")
+    raise WeChatError("Invalid WeChat AES-128 key")
 
 
 def encrypt(data: bytes, key: str | bytes) -> bytes:
     """AES-128-ECB with PKCS7 padding, including an extra full aligned block."""
     if not isinstance(data, bytes):
-        raise WeChatSecurityError("Invalid WeChat plaintext bytes")
+        raise WeChatError("Invalid WeChat plaintext bytes")
     padder = padding.PKCS7(128).padder()
     padded = padder.update(data) + padder.finalize()
     cipher = Cipher(algorithms.AES(parse_key(key)), modes.ECB()).encryptor()
@@ -53,7 +52,7 @@ def encrypt(data: bytes, key: str | bytes) -> bytes:
 def decrypt(data: bytes, key: str | bytes) -> bytes:
     """Reject truncated or incorrectly padded ciphertext without echoing it."""
     if not isinstance(data, bytes) or not data or len(data) % 16:
-        raise WeChatSecurityError("Invalid WeChat AES ciphertext size")
+        raise WeChatError("Invalid WeChat AES ciphertext size")
     parsed = parse_key(key)
     try:
         cipher = Cipher(algorithms.AES(parsed), modes.ECB()).decryptor()
@@ -61,7 +60,7 @@ def decrypt(data: bytes, key: str | bytes) -> bytes:
         unpadder = padding.PKCS7(128).unpadder()
         return unpadder.update(padded) + unpadder.finalize()
     except ValueError:
-        raise WeChatSecurityError("Invalid WeChat AES padding") from None
+        raise WeChatError("Invalid WeChat AES padding") from None
 
 
 class WeChatMedia:
@@ -75,37 +74,36 @@ class WeChatMedia:
         Only images explicitly allow missing keys (plain CDN media).
         """
         if type(max_bytes) is not int or max_bytes < 0 or not isinstance(descriptor, Mapping):
-            raise WeChatSecurityError("Invalid WeChat media download arguments")
+            raise WeChatError("Invalid WeChat media download arguments")
         media = descriptor.get("media", {})
         if not isinstance(media, Mapping):
-            raise WeChatSecurityError("Invalid WeChat media descriptor")
+            raise WeChatError("Invalid WeChat media descriptor")
         image_key = descriptor.get("aeskey") if image else None
         value = image_key if image_key not in (None, "") else media.get("aes_key")
         key = parse_key(value) if value not in (None, "") else None
         if key is None and not image:
-            raise WeChatSecurityError("WeChat encrypted media omitted AES key")
+            raise WeChatError("WeChat encrypted media omitted AES key")
         url = media.get("full_url") or descriptor.get("full_url") or (descriptor.get("url") if image else None)
         if not url:
             param = media.get("encrypt_query_param")
             if not isinstance(param, str) or not param:
-                raise WeChatSecurityError("WeChat media omitted CDN reference")
+                raise WeChatError("WeChat media omitted CDN reference")
             url = DEFAULT_CDN + "/download?" + urlencode({"encrypted_query_param": param})
-        validate_url(url, cdn=True)
         wire_limit = (max_bytes // 16 + 1) * 16 if key is not None else max_bytes
         data = await self.client.cdn_download(url, wire_limit)
         plain = decrypt(data, key) if key is not None else data
         if len(plain) > max_bytes:
-            raise WeChatSecurityError("WeChat media exceeds plaintext byte limit")
+            raise WeChatError("WeChat media exceeds plaintext byte limit")
         return plain
 
     async def upload(self, data: bytes, user_id: str, kind: str, filename: str = "") -> dict:
         """Return an image/file/video MessageItem; sending remains caller-owned."""
         if not isinstance(data, bytes) or len(data) > MAX_UPLOAD_BYTES:
-            raise WeChatSecurityError("WeChat upload exceeds byte limit or is not bytes")
+            raise WeChatError("WeChat upload exceeds byte limit or is not bytes")
         if not isinstance(kind, str) or kind not in {"image", "file", "video"}:
-            raise WeChatSecurityError("Unsupported WeChat upload kind")
+            raise WeChatError("Unsupported WeChat upload kind")
         if not isinstance(filename, str) or not isinstance(user_id, str) or not user_id:
-            raise WeChatSecurityError("Invalid WeChat upload arguments")
+            raise WeChatError("Invalid WeChat upload arguments")
         key, filekey = secrets.token_bytes(16), secrets.token_hex(16)
         encrypted = encrypt(data, key)
         md5 = hashlib.md5(data, usedforsecurity=False).hexdigest()
@@ -118,11 +116,10 @@ class WeChatMedia:
         if not url:
             param = response.get("upload_param")
             if not isinstance(param, str) or not param:
-                raise WeChatSecurityError("WeChat upload omitted signed CDN reference")
+                raise WeChatError("WeChat upload omitted signed CDN reference")
             url = DEFAULT_CDN + "/upload?" + urlencode({
                 "encrypted_query_param": param, "filekey": filekey,
             })
-        validate_url(url, cdn=True)
         param = await self.client.cdn_upload(url, encrypted)
         media = {
             "encrypt_query_param": param,

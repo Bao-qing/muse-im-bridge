@@ -7,9 +7,8 @@ from unittest import mock
 
 import httpx
 
-from muse_bridge.adapters.wechat.client import WeChatClient, WeChatError
+from muse_bridge.adapters.wechat.client import DEFAULT_CDN, WeChatClient, WeChatError
 from muse_bridge.adapters.wechat.media import WeChatMedia, decrypt, encrypt, parse_key
-from muse_bridge.adapters.wechat.security import DEFAULT_CDN, WeChatSecurityError
 
 KEY = bytes.fromhex("2b7e151628aed2a6abf7158809cf4f3c")
 
@@ -36,11 +35,11 @@ class TestWeChatAES(unittest.TestCase):
     def test_invalid_keys_padding_and_truncation_are_sanitized(self):
         for value in (None, {}, "secret", "z" * 32, base64.b64encode(bytes(15)).decode(),
                       base64.b64encode(b"g" * 32).decode()):
-            with self.subTest(value=value), self.assertRaises(WeChatSecurityError) as caught:
+            with self.subTest(value=value), self.assertRaises(WeChatError) as caught:
                 parse_key(value)
             self.assertNotIn("secret", str(caught.exception))
         for value in (b"", b"short", bytes(16)):
-            with self.assertRaises(WeChatSecurityError):
+            with self.assertRaises(WeChatError):
                 decrypt(value, bytes(16))
 
 
@@ -128,14 +127,14 @@ class TestWeChatMedia(unittest.IsolatedAsyncioTestCase):
         media = self.media(lambda r: httpx.Response(200, content=b"image"))
         for descriptor in ({"media": {"encrypt_query_param": "q"}}, {"url": DEFAULT_CDN + "/plain"}):
             self.assertEqual(await media.download(descriptor, 5, image=True), b"image")
-        with self.assertRaises(WeChatSecurityError):
+        with self.assertRaises(WeChatError):
             await media.download({"media": {"encrypt_query_param": "q"}}, 5)
 
     async def test_encrypted_plaintext_limit_and_wire_limit(self):
         descriptor = {"media": {"encrypt_query_param": "q", "aes_key": base64.b64encode(KEY).decode()}}
         for data, limit in ((b"123456", 5), (b"x" * 17, 3)):
             media = self.media(lambda r: httpx.Response(200, content=encrypt(data, KEY)))
-            with self.assertRaises(WeChatSecurityError):
+            with self.assertRaises(WeChatError):
                 await media.download(descriptor, limit)
         media = self.media(lambda r: httpx.Response(200, content=encrypt(b"", KEY)))
         self.assertEqual(await media.download(descriptor, 0), b"")
@@ -146,37 +145,22 @@ class TestWeChatMedia(unittest.IsolatedAsyncioTestCase):
         for descriptor, limit, image in (({}, 10, False), ({"media": []}, 10, False),
                                          ({}, -1, True), ({}, True, True),
                                          ({"aeskey": "secret", "url": DEFAULT_CDN + "/plain"}, 5, True)):
-            with self.assertRaises(WeChatSecurityError):
+            with self.assertRaises(WeChatError):
                 await media.download(descriptor, limit, image=image)
         for args in (("not-bytes", "user", "file"), (b"x", "user", "voice"), (b"x", "", "image")):
-            with self.assertRaises(WeChatSecurityError):
+            with self.assertRaises(WeChatError):
                 await media.upload(*args)
         with mock.patch("muse_bridge.adapters.wechat.media.MAX_UPLOAD_BYTES", 3):
-            with self.assertRaises(WeChatSecurityError):
+            with self.assertRaises(WeChatError):
                 await media.upload(b"1234", "user", "file")
         handler.assert_not_called()
-
-    async def test_untrusted_full_urls_are_not_replaced_by_fallback(self):
-        handler = mock.Mock()
-        media = self.media(handler)
-        for url in ("https://evil.qq.com/secret", "http://novac2c.cdn.weixin.qq.com/x",
-                    "https://user:secret@novac2c.cdn.weixin.qq.com/x"):
-            with self.assertRaises(WeChatSecurityError) as caught:
-                await media.download({"media": {"full_url": url, "encrypt_query_param": "valid"}}, 5, image=True)
-            self.assertNotIn("secret", repr(caught.exception))
-        handler.assert_not_called()
-        media = self.media(lambda r: httpx.Response(200, json={
-            "upload_full_url": "https://evil.qq.com/secret", "upload_param": "fallback",
-        }))
-        with self.assertRaises(WeChatSecurityError):
-            await media.upload(b"x", "user", "image")
 
     async def test_upload_requires_encrypted_param_and_download_rejects_bad_padding(self):
         media = self.media(lambda r: httpx.Response(200, json={"upload_param": "p"}))
         with self.assertRaises(WeChatError):
             await media.upload(b"x", "user", "file")
         media = self.media(lambda r: httpx.Response(200, content=bytes(16)))
-        with self.assertRaises(WeChatSecurityError):
+        with self.assertRaises(WeChatError):
             await media.download({"media": {"encrypt_query_param": "p", "aes_key": base64.b64encode(bytes(16)).decode()}}, 100)
 
 

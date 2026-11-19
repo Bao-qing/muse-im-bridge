@@ -1,69 +1,74 @@
-"""Opt-in Muse Worker routing. No automatic direct fallback on any channel."""
+"""Muse-specific URL, cookie, and redirect guards on top of the shared network layer."""
 from __future__ import annotations
 
 from urllib.parse import urlsplit
 
-from ..config.models import WorkerConfig
+import httpx
 
-def worker_url(url: str, worker: WorkerConfig) -> str:
-    """Prefix without parsing/re-encoding the path or credential query."""
-    scheme, rest = url.split("://", 1)
-    if scheme not in {"https", "wss"}:
-        raise ValueError("Worker route requires HTTPS or WSS")
-    base = worker.base
-    if scheme == "wss":
-        base = "wss://" + urlsplit(base).netloc
-    return f"{base}/{scheme}/{rest}"
+from ..network import DIRECT_ROUTE, NetworkRoute
 
 
-def http_base(base_url: str, worker: WorkerConfig, *, login: bool = False) -> str:
-    base = base_url.rstrip("/")
-    return worker_url(base, worker) if (worker.login if login else worker.http) else base
+def http_base(base_url: str, route: NetworkRoute | None = None) -> str:
+    active = route or DIRECT_ROUTE
+    return active.http_url(base_url.rstrip("/"))
 
 
-def auth_url(base_url: str, worker: WorkerConfig) -> str:
+def auth_url(base_url: str, route: NetworkRoute | None = None) -> str:
     real = base_url.rstrip("/")
-    # Keep the legacy direct URL (including the unescaped origin) unchanged.
     auth = f"https://auth.{real.split('://')[-1]}/aymh/"
-    if not worker.login:
+    active = route or DIRECT_ROUTE
+    if not active.use_worker_http:
         return f"{auth}?origin={real}"
-    # Pending live SSO validation: default to the real origin, but some redirect
-    # flows may require the prefixed origin. Switch with worker.login_origin.
-    origin = http_base(real, worker, login=True) if worker.login_origin == "worker" else real
-    return f"{worker_url(auth, worker)}?origin={origin}"
+    return f"{active.http_url(auth)}?origin={real}"
 
 
-def cookie_domain(domain: str, worker: WorkerConfig | None = None) -> str | None:
-    """Accept only Muse domains (not substring matches), plus the active proxy.
-
-    Return the canonical persistence domain, never the Worker domain. Subdomains
-    such as auth.muse.ai preserve the old login cookie extraction semantics.
-    """
+def cookie_domain(domain: str, route: NetworkRoute | None = None) -> str | None:
+    """Accept only Muse domains, plus the active Worker proxy hostname."""
     domain = domain.lower().lstrip(".")
     if domain == "muse.ai" or domain.endswith(".muse.ai"):
         return "muse.ai"
-    if worker and worker.enabled and domain == urlsplit(worker.base).hostname:
-        return "muse.ai"
+    if route and route.mode == "worker" and route.worker_base:
+        if domain == urlsplit(route.worker_base).hostname:
+            return "muse.ai"
     return None
 
 
-def worker_http_options(worker: WorkerConfig, *, login: bool = False) -> dict:
-    """Ignore local proxies and reject redirect escape before the next send.
-
-    Worker rewrites Location; this guard is not a substitute for that rewrite.
-    follow_redirects stays enabled at the caller. No retry to a real origin.
-    """
-    if not (worker.login if login else worker.http):
-        return {}
-    base = urlsplit(worker.base)
+def muse_http_hooks(route: NetworkRoute | None = None) -> dict | None:
+    """Reject redirects that escape the configured Worker relay."""
+    active = route or DIRECT_ROUTE
+    if not active.use_worker_http:
+        return None
+    base = urlsplit(active.worker_base)
 
     def require_worker(request):
         url = request.url
-        if (url.scheme != "https" or url.host != base.hostname
-                or url.port not in (None, 443)
-                or not any(url.path.startswith(f"/{scheme}/{host}/")
-                           for scheme in ("https", "http")
-                           for host in ("muse.ai", "auth.muse.ai"))):
+        if (
+            url.scheme != "https"
+            or url.host != base.hostname
+            or url.port not in (None, 443)
+            or not any(
+                url.path.startswith(f"/{scheme}/{host}/")
+                for scheme in ("https", "http")
+                for host in ("muse.ai", "auth.muse.ai")
+            )
+        ):
             raise RuntimeError("Muse Worker redirect escaped the configured relay")
 
-    return {"trust_env": False, "event_hooks": {"request": [require_worker]}}
+    return {"request": [require_worker]}
+
+
+def muse_http_client(
+    route: NetworkRoute | None = None,
+    *,
+    timeout: float = 20.0,
+    follow_redirects: bool = False,
+    transport=None,
+) -> httpx.Client:
+    active = route or DIRECT_ROUTE
+    return active.httpx_client(
+        http2=True,
+        timeout=timeout,
+        follow_redirects=follow_redirects,
+        transport=transport,
+        event_hooks=muse_http_hooks(active),
+    )

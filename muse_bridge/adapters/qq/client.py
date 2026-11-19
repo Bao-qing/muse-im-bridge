@@ -21,6 +21,7 @@ from typing import Any, Dict, Optional, Tuple
 
 from ...config import constants
 from ...config.constants import BLOCKED_DOWNLOAD_HOST
+from ...network import DIRECT_ROUTE, NetworkRoute
 from ...observability import get_logger, new_id, safe_error, safe_url, trace_event
 
 logger = get_logger(__name__)
@@ -87,13 +88,14 @@ class QQClient:
         self,
         app_id: str,
         app_secret: str,
-        proxy_url: Optional[str] = None,
         download_proxy: str = "",
         user_agent: str = constants.DEFAULT_USER_AGENT,
+        *,
+        route: NetworkRoute | None = None,
     ):
         self.app_id = app_id
         self.app_secret = app_secret
-        self.proxy_url = proxy_url
+        self.route = route or DIRECT_ROUTE
         self.download_proxy = download_proxy
         self.user_agent = user_agent
 
@@ -106,7 +108,7 @@ class QQClient:
         if not force_refresh and self._token and now < self._token_expires_at - 120:
             return self._token
 
-        url = "https://bots.qq.com/app/getAppAccessToken"
+        url = self.route.http_url("https://bots.qq.com/app/getAppAccessToken")
         body = json.dumps({"appId": self.app_id, "clientSecret": self.app_secret}).encode("utf-8")
         req = urllib.request.Request(
             url,
@@ -118,7 +120,7 @@ class QQClient:
         _trace_http("start", request_id, started, method="POST", url=url,
                     payload=body, sensitive=True, headers=_trace_headers(req.headers))
         try:
-            with urllib.request.urlopen(req, timeout=15) as resp:
+            with self.route.open_url(req, timeout=15) as resp:
                 raw = resp.read()
                 _trace_http("response", request_id, started, method="POST", url=url,
                             payload=raw, sensitive=True, response=resp)
@@ -140,7 +142,7 @@ class QQClient:
 
     def get_gateway_url(self) -> str:
         token = self.get_access_token()
-        url = "https://api.sgroup.qq.com/gateway/bot"
+        url = self.route.http_url("https://api.sgroup.qq.com/gateway/bot")
         req = urllib.request.Request(
             url,
             headers={"Authorization": f"QQBot {token}", "User-Agent": self.user_agent},
@@ -149,7 +151,7 @@ class QQClient:
         _trace_http("start", request_id, started, method="GET", url=url,
                     headers=_trace_headers(req.headers))
         try:
-            with urllib.request.urlopen(req, timeout=15) as resp:
+            with self.route.open_url(req, timeout=15) as resp:
                 raw = resp.read()
                 _trace_http("response", request_id, started, method="GET", url=url, payload=raw, response=resp)
                 data = json.loads(raw.decode("utf-8"))
@@ -168,27 +170,28 @@ class QQClient:
         timeout: int = 25,
     ) -> Tuple[int, dict]:
         token = self.get_access_token()
+        target_url = self.route.http_url(url)
         body = json.dumps(payload).encode("utf-8") if payload is not None else None
         headers = {
             "Authorization": f"QQBot {token}",
             "Content-Type": "application/json",
             "User-Agent": self.user_agent,
         }
-        req = urllib.request.Request(url, data=body, method=method, headers=headers)
+        req = urllib.request.Request(target_url, data=body, method=method, headers=headers)
         request_id, started = new_id(), time.perf_counter()
-        _trace_http("start", request_id, started, method=method, url=url, payload=payload,
+        _trace_http("start", request_id, started, method=method, url=target_url, payload=payload,
                     headers=_trace_headers(headers))
         try:
-            with urllib.request.urlopen(req, timeout=timeout) as resp:
+            with self.route.open_url(req, timeout=timeout) as resp:
                 raw = resp.read()
-                _trace_http("response", request_id, started, method=method, url=url, payload=raw, response=resp)
+                _trace_http("response", request_id, started, method=method, url=target_url, payload=raw, response=resp)
                 try:
                     return resp.status, json.loads(raw.decode("utf-8"))
                 except Exception:
                     return resp.status, {"raw": raw.decode("utf-8", "ignore")}
         except urllib.error.HTTPError as e:
             raw = e.read()
-            _trace_http("error", request_id, started, method=method, url=url,
+            _trace_http("error", request_id, started, method=method, url=target_url,
                         payload=raw, response=e, error=e)
             try:
                 body_json = json.loads(raw.decode("utf-8"))
@@ -196,9 +199,9 @@ class QQClient:
                 body_json = {"raw": raw.decode("utf-8", "ignore")}
             return e.code, body_json
         except Exception as e:
-            _trace_http("error", request_id, started, method=method, url=url, error=e)
+            _trace_http("error", request_id, started, method=method, url=target_url, error=e)
             logger.error("QQ HTTP request failed: %s", safe_error(e))
-            raise RuntimeError(f"request to {url} failed: {e}")
+            raise RuntimeError(f"request to {target_url} failed: {e}")
 
     def post_with_retry(self, url: str, payload: dict, timeout: int = 25) -> Tuple[int, dict]:
         code, body = self._http_json("POST", url, payload, timeout=timeout)
@@ -290,17 +293,8 @@ class QQClient:
     def download_bytes(self, url: str, max_bytes: int = 8 * 1024 * 1024, timeout: int = 60) -> bytes:
         """Download bytes from QQ CDN or external URL without Connection: close."""
         target_url = self.proxied_url(url)
-        p = urllib.parse.urlparse(target_url)
-        host = p.hostname
-        port = p.port or (443 if p.scheme == "https" else 80)
-        path = p.path + ("?" + p.query if p.query else "")
-
-        ctx = ssl.create_default_context() if p.scheme == "https" else None
-        conn: http.client.HTTPConnection
-        if p.scheme == "https":
-            conn = http.client.HTTPSConnection(host, port, timeout=timeout, context=ctx)
-        else:
-            conn = http.client.HTTPConnection(host, port, timeout=timeout)
+        conn, path = self.route.http_connection(target_url, timeout=timeout)
+        traced_url = self.route.http_url(target_url)
 
         request_id, started = new_id(), time.perf_counter()
         connection_id = new_id()
@@ -309,11 +303,11 @@ class QQClient:
                 "User-Agent": self.user_agent,
                 "Accept": "*/*",
             }
-            _trace_http("start", request_id, started, method="GET", url=target_url,
+            _trace_http("start", request_id, started, method="GET", url=traced_url,
                         connection_id=connection_id, headers=_trace_headers(headers))
             conn.request("GET", path, headers=headers)
             resp = conn.getresponse()
-            _trace_http("response", request_id, started, method="GET", url=target_url,
+            _trace_http("response", request_id, started, method="GET", url=traced_url,
                         connection_id=connection_id, response=resp)
             if resp.status not in (200, 206):
                 raise RuntimeError(f"HTTP {resp.status} {resp.reason}")
@@ -322,7 +316,7 @@ class QQClient:
             expected_len = int(content_len_hdr) if content_len_hdr else None
 
             data = resp.read(max_bytes + 1)
-            _trace_http("body", request_id, started, method="GET", url=target_url,
+            _trace_http("body", request_id, started, method="GET", url=traced_url,
                         connection_id=connection_id, payload={"omitted": "binary_download", "bytes": len(data)})
             if len(data) > max_bytes:
                 raise RuntimeError(f"download exceeded limit ({max_bytes} bytes)")
@@ -337,10 +331,10 @@ class QQClient:
             if data[:8] == PNG_MAGIC and not data.endswith(PNG_IEND):
                 raise RuntimeError("truncated PNG: missing IEND marker")
 
-            _trace_http("end", request_id, started, method="GET", url=target_url, connection_id=connection_id)
+            _trace_http("end", request_id, started, method="GET", url=traced_url, connection_id=connection_id)
             return data
         except BaseException as e:
-            _trace_http("error", request_id, started, method="GET", url=target_url,
+            _trace_http("error", request_id, started, method="GET", url=traced_url,
                         connection_id=connection_id, error=e)
             raise
         finally:

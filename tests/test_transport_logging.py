@@ -102,7 +102,7 @@ class HTTPLoggingTests(unittest.TestCase):
         calls = []
         for enabled in (False, True):
             response = Response(json.dumps(body).encode())
-            with capture(enabled) as cap, patch.object(qq_client.urllib.request, "urlopen", return_value=response) as open_:
+            with capture(enabled) as cap, patch("muse_bridge.network.NetworkRoute.open_url", return_value=response) as open_:
                 result = cached_qq()._http_json("POST", "https://api.test/messages?sig=private-query", payload, timeout=27)
             self.assertEqual(result, (200, body))
             response.read.assert_called_once_with()
@@ -129,7 +129,7 @@ class HTTPLoggingTests(unittest.TestCase):
                 error = urllib.error.HTTPError("https://api.test/", 401, "private-error-reason",
                                                {"Set-Cookie": "private-cookie-value"}, io.BytesIO(raw))
                 error.read = Mock(wraps=error.read)
-                with capture(enabled) as cap, patch.object(qq_client.urllib.request, "urlopen", side_effect=error) as open_:
+                with capture(enabled) as cap, patch("muse_bridge.network.NetworkRoute.open_url", side_effect=error) as open_:
                     result = cached_qq()._http_json("POST", "https://api.test/", {"content": "private-chat"})
                 self.assertEqual(result, (401, expected))
                 error.read.assert_called_once_with()
@@ -144,7 +144,7 @@ class HTTPLoggingTests(unittest.TestCase):
         for enabled in (False, True):
             response = Response(b'{"access_token":"private-new-token","expires_in":7200}')
             client = cached_qq()
-            with capture(enabled) as cap, patch.object(qq_client.urllib.request, "urlopen", return_value=response) as open_:
+            with capture(enabled) as cap, patch("muse_bridge.network.NetworkRoute.open_url", return_value=response) as open_:
                 self.assertEqual(client.get_access_token(force_refresh=True), "private-new-token")
                 self.assertEqual(client.get_access_token(), "private-new-token")
             response.read.assert_called_once_with()
@@ -158,7 +158,7 @@ class HTTPLoggingTests(unittest.TestCase):
             stream = io.BytesIO(b'private-auth-error-body')
             error = urllib.error.HTTPError("https://bots.qq.com/app/getAppAccessToken", 403, "denied", {}, stream)
             error.read = Mock(wraps=error.read)
-            with capture(enabled), patch.object(qq_client.urllib.request, "urlopen", side_effect=error):
+            with capture(enabled), patch("muse_bridge.network.NetworkRoute.open_url", side_effect=error):
                 with self.assertRaisesRegex(RuntimeError, "failed to acquire QQ access token: HTTP Error 403: denied"):
                     client.get_access_token(force_refresh=True)
             error.read.assert_not_called()
@@ -168,7 +168,7 @@ class HTTPLoggingTests(unittest.TestCase):
             responses = [Response(b'{"message":"expired"}', 401),
                          Response(b'{"access_token":"refreshed","expires_in":7200}'),
                          Response(b'{"id":"reply-id"}')]
-            with capture(enabled) as cap, patch.object(qq_client.urllib.request, "urlopen", side_effect=responses) as open_:
+            with capture(enabled) as cap, patch("muse_bridge.network.NetworkRoute.open_url", side_effect=responses) as open_:
                 self.assertEqual(cached_qq().post_with_retry("https://api.test/messages", {"content": "private-chat"}, timeout=29),
                                  (200, {"id": "reply-id"}))
             self.assertEqual(open_.call_count, 3)
@@ -186,14 +186,14 @@ class HTTPLoggingTests(unittest.TestCase):
     def test_qq_gateway_lookup_preserves_success_and_fallback(self):
         for enabled in (False, True):
             response = Response(b'{"url":"wss://gateway.test/ws?sign=private-ws-sign"}')
-            with capture(enabled) as cap, patch.object(qq_client.urllib.request, "urlopen", return_value=response) as open_:
+            with capture(enabled) as cap, patch("muse_bridge.network.NetworkRoute.open_url", return_value=response) as open_:
                 self.assertEqual(cached_qq().get_gateway_url(), "wss://gateway.test/ws?sign=private-ws-sign")
             response.read.assert_called_once_with()
             self.assertEqual(open_.call_args.kwargs, {"timeout": 15})
             self.assert_hidden(cap, "private-ws-sign")
             error = urllib.error.HTTPError("https://api.test/", 403, "denied", {}, io.BytesIO(b'private-body'))
             error.read = Mock(wraps=error.read)
-            with capture(enabled), patch.object(qq_client.urllib.request, "urlopen", side_effect=error):
+            with capture(enabled), patch("muse_bridge.network.NetworkRoute.open_url", side_effect=error):
                 self.assertEqual(cached_qq().get_gateway_url(), "wss://api.sgroup.qq.com/websocket")
             error.read.assert_not_called()
 
@@ -202,7 +202,7 @@ class HTTPLoggingTests(unittest.TestCase):
         encoded = base64.b64encode(binary).decode()
         for enabled in (False, True):
             response = Response(b'{"file_info":"private-file-info"}')
-            with capture(enabled) as cap, patch.object(qq_client.urllib.request, "urlopen", return_value=response) as open_:
+            with capture(enabled) as cap, patch("muse_bridge.network.NetworkRoute.open_url", return_value=response) as open_:
                 result = cached_qq().upload_media("private", "target", binary, file_type=4, file_name="private-name.txt")
             self.assertEqual(result, "private-file-info")
             self.assertEqual(json.loads(open_.call_args.args[0].data)["file_data"], encoded)
@@ -256,11 +256,11 @@ class HTTPLoggingTests(unittest.TestCase):
         for enabled in (False, True):
             response = Response(b'{"retcode":0,"data":{"message":"private-history","resolved":"private-quote"}}')
             client = ob_client.OneBotClient("https://onebot.test", "private-ob-token")
-            with capture(enabled) as cap, patch.object(ob_client.urllib.request, "urlopen", return_value=response) as open_:
+            with capture(enabled) as cap, patch("muse_bridge.network.NetworkRoute.open_url", return_value=response) as open_:
                 result = client._post("/send_private_msg", {"user_id": 42, "message": [{"data": {"text": "private-chat"}}]}, timeout=31)
             self.assertEqual(result["retcode"], 0)
             response.read.assert_called_once_with()
-            self.assertIs(open_.call_args.kwargs["context"], client._ssl_ctx)
+            self.assertIs(open_.call_args.kwargs["ssl_context"], client._ssl_ctx)
             call = wire_request(open_.call_args)
             calls.append(call[:-1] + ({"timeout": call[-1]["timeout"]},))
             if enabled:
@@ -276,7 +276,7 @@ class HTTPLoggingTests(unittest.TestCase):
         for enabled in (False, True):
             error = urllib.error.HTTPError("https://onebot.test/", 403, "denied", {}, io.BytesIO(b'private-error-body'))
             error.read = Mock(wraps=error.read)
-            with capture(enabled) as cap, patch.object(ob_client.urllib.request, "urlopen", side_effect=error) as open_:
+            with capture(enabled) as cap, patch("muse_bridge.network.NetworkRoute.open_url", side_effect=error) as open_:
                 with self.assertRaisesRegex(RuntimeError, "OneBot API request to /action failed: HTTP Error 403: denied") as raised:
                     ob_client.OneBotClient("https://onebot.test", "private-ob-token")._post("/action", {})
             self.assertIs(raised.exception.__context__, error)
@@ -290,7 +290,7 @@ class HTTPLoggingTests(unittest.TestCase):
                 (ob_client, ob_client.OneBotClient("https://onebot.test", "token"), lambda c: c._post("/action", {}))):
             response = Response(b'{}')
             with patch.object(module, "trace_event", side_effect=OSError("log destination failed")), \
-                    patch.object(module.urllib.request, "urlopen", return_value=response) as open_:
+                    patch("muse_bridge.network.NetworkRoute.open_url", return_value=response) as open_:
                 invoke(client)
             open_.assert_called_once()
             response.read.assert_called_once_with()
@@ -411,10 +411,13 @@ class GatewayLoggingTests(unittest.IsolatedAsyncioTestCase):
                 self.assertTrue(all("payload" not in e for e in cap.events))
 
     async def test_qq_reconnect_backoff_and_connection_arguments_are_unchanged(self):
+        from muse_bridge.network import NetworkRoute
         for enabled in (False, True):
             client = Mock()
             client.get_gateway_url.return_value = "wss://gateway.test/ws?sig=private-signature"
-            gateway = qq_gateway.QQGateway(client, AsyncMock(), proxy_url="http://proxy.test", debug=True)
+            gateway = qq_gateway.QQGateway(
+                client, AsyncMock(), route=NetworkRoute(mode="http", proxy_url="http://proxy.test"), debug=True
+            )
             delays = []
             async def sleep(delay):
                 delays.append(delay)

@@ -16,6 +16,7 @@ import urllib.error
 import urllib.request
 from typing import Any, Dict, List, Optional
 
+from ...network import DIRECT_ROUTE, NetworkRoute
 from ...observability import get_logger, new_id, safe_error, safe_url, trace_event
 
 logger = get_logger(__name__)
@@ -86,15 +87,16 @@ def media_segment(kind: str, data: bytes) -> dict:
 
 
 class OneBotClient:
-    def __init__(self, base_url: str, access_token: str):
+    def __init__(self, base_url: str, access_token: str, *, route: NetworkRoute | None = None):
         self.base_url = base_url.rstrip("/")
         self.access_token = access_token
+        self.route = route or DIRECT_ROUTE
         self._ssl_ctx = ssl.create_default_context()
         self._ssl_ctx.check_hostname = False
         self._ssl_ctx.verify_mode = ssl.CERT_NONE
 
     def _post(self, path: str, payload: dict, timeout: int = 15, *, quiet: bool = False) -> dict:
-        url = f"{self.base_url}{path}"
+        url = self.route.http_url(f"{self.base_url}{path}")
         body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
         headers = {
             "Authorization": f"Bearer {self.access_token}",
@@ -106,7 +108,7 @@ class OneBotClient:
         _trace_http("start", request_id, started, url=url, payload=payload,
                     headers=_trace_headers(headers))
         try:
-            with urllib.request.urlopen(req, context=self._ssl_ctx, timeout=timeout) as resp:
+            with self.route.open_url(req, ssl_context=self._ssl_ctx, timeout=timeout) as resp:
                 raw = resp.read()
                 _trace_http("response", request_id, started, url=url, payload=raw, response=resp)
                 return json.loads(raw.decode("utf-8"))
@@ -237,11 +239,10 @@ class OneBotClient:
                 logger.debug("get_group_file_url unavailable: %s", safe_error(e))
         return {}
 
-    @staticmethod
-    def download_bytes(url: str, max_bytes: int, timeout: int = 60) -> bytes:
+    def download_bytes(self, url: str, max_bytes: int, timeout: int = 60) -> bytes:
         """Download media (QQ CDN URLs carry their own rkey) with a size cap."""
-        req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
+        req = urllib.request.Request(self.route.http_url(url), headers={"User-Agent": USER_AGENT})
+        with self.route.open_url(req, timeout=timeout) as resp:
             length = resp.headers.get("Content-Length")
             if length and length.isdigit() and int(length) > max_bytes:
                 raise ValueError(f"超过 {max_bytes // (1024 * 1024)}MB 上限")

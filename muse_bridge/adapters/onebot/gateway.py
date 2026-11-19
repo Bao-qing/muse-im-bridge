@@ -15,6 +15,7 @@ import time
 from typing import Any, Callable, Coroutine, Optional
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
+from ...network import DIRECT_ROUTE, NetworkRoute
 from ...observability import get_logger, new_id, safe_error, safe_url, trace_event
 
 logger = get_logger(__name__)
@@ -51,10 +52,13 @@ class OneBotGateway:
         ws_url: str,
         access_token: str,
         on_message: Callable[[dict], Coroutine[Any, Any, None]],
+        *,
+        route: NetworkRoute | None = None,
     ):
         self.ws_url = ws_url.rstrip("/")
         self.access_token = access_token
         self.on_message = on_message
+        self.route = route or DIRECT_ROUTE
         self.self_id: Optional[str] = None
         self._running = False
         self._ws = None
@@ -69,7 +73,7 @@ class OneBotGateway:
         ssl_ctx.check_hostname = False
         ssl_ctx.verify_mode = ssl.CERT_NONE
 
-        url = connect_url(self.ws_url, self.access_token)
+        url = self.route.ws_url(connect_url(self.ws_url, self.access_token))
         backoff = 1.0
 
         while self._running:
@@ -77,7 +81,11 @@ class OneBotGateway:
             started = time.perf_counter()
             try:
                 _trace_gateway("connect.start", connection_id, url=safe_url(url))
-                async with websockets.connect(url, ssl=ssl_ctx if url.startswith("wss") else None) as ws:
+                async with websockets.connect(
+                    url,
+                    ssl=ssl_ctx if url.startswith("wss") else None,
+                    proxy=self.route.ws_proxy,
+                ) as ws:
                     self._ws = ws
                     backoff = 1.0
                     logger.info("Connected to OneBot WS at %s", safe_url(self.ws_url))

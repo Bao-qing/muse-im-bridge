@@ -15,6 +15,7 @@ import sys
 
 from muse_bridge.config.models import ConfigLoader, LoggingConfig
 from muse_bridge.engine import BridgeEngine
+from muse_bridge.network import resolve_route, validate_app_network
 from muse_bridge.observability import configure_logging, get_logger, safe_error
 
 
@@ -66,7 +67,11 @@ def main(argv=None) -> int:
         try:
             from muse_bridge.adapters.wechat.cli import run_login, run_status
             wechat_config = ConfigLoader.load_wechat(args.config)
-            (run_login if args.wechat_login else run_status)(wechat_config)
+            if args.wechat_login:
+                network_config = ConfigLoader.load_network(args.config)
+                run_login(wechat_config, network=network_config)
+            else:
+                run_status(wechat_config)
             return 0
         except (KeyboardInterrupt, EOFError):
             print("微信操作已取消。")
@@ -123,10 +128,10 @@ def main(argv=None) -> int:
     if args.login:
         from muse_bridge.muse.login import run_protocol_login
         try:
+            muse_route = resolve_route(config.muse.proxy, config.network, section="muse")
             run_protocol_login(
                 output_path=config.muse.cookies_file,
-                worker=config.muse.worker,
-                proxy_url=config.muse.proxy_url,
+                route=muse_route,
             )
             return 0
         except Exception as e:
@@ -135,8 +140,15 @@ def main(argv=None) -> int:
 
     # 3. Check mode: print sanitized status
     if args.check:
+        try:
+            validate_app_network(config)
+        except Exception as e:
+            logger.error("Network configuration error: %s", safe_error(e))
+            return 1
         print("=== Muse Bridge Configuration Check ===")
-        print(f"Muse Host:      {config.muse.host}")
+        print(f"Network Proxy:  {'configured' if config.network.proxy_url else '(not set)'}")
+        print(f"Network Worker: {config.network.worker.base or '(not set)'} (ws={config.network.worker.ws}, http={config.network.worker.http})")
+        print(f"Muse Host:      {config.muse.host} (proxy={config.muse.proxy})")
         print(f"Client IP:      {config.muse.client_ip or '(not set)'}")
         print(f"Cookies File:   {config.muse.cookies_file} ({'exists' if os.path.exists(config.muse.cookies_file) else 'missing'})")
         print(f"Mint File:      {config.muse.mint_file} ({'exists' if os.path.exists(config.muse.mint_file) else 'missing'})")

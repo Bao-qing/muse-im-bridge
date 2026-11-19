@@ -396,18 +396,18 @@ class TestGateCatchUp(unittest.TestCase):
 
 
 class TestOneBotClient(unittest.TestCase):
-    @mock.patch("urllib.request.urlopen")
-    def test_send_group_msg_array_format(self, mock_urlopen):
+    @mock.patch("muse_bridge.network.NetworkRoute.open_url")
+    def test_send_group_msg_array_format(self, mock_open_url):
         mock_resp = mock.Mock()
         mock_resp.read.return_value = json.dumps({"status": "ok", "retcode": 0, "data": {"message_id": 999}}).encode()
-        mock_urlopen.return_value.__enter__.return_value = mock_resp
+        mock_open_url.return_value.__enter__.return_value = mock_resp
 
         client = OneBotClient(base_url="http://127.0.0.1:3000", access_token="test_tok")
         res = client.send_group_msg(group_id=10001, text="Hello NapCat!")
         self.assertEqual(res["retcode"], 0)
 
         # Inspect request payload
-        req = mock_urlopen.call_args[0][0]
+        req = mock_open_url.call_args[0][0]
         self.assertEqual(req.headers["Authorization"], "Bearer test_tok")
         payload = json.loads(req.data.decode("utf-8"))
         self.assertEqual(payload["group_id"], 10001)

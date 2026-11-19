@@ -11,6 +11,7 @@ import time
 from ...core.delivery import DeliveryResult, DeliveryStatus, ReactionEnvelope, reaction_as_delivery
 from ...core.message import Attachment, InboundMessage, MessageSource
 from ..base import BaseAdapter
+from ...network import DIRECT_ROUTE, resolve_route
 from ...observability import get_logger, safe_error
 from .client import WeChatClient
 from .gateway import WeChatGateway
@@ -153,18 +154,25 @@ class IntakeRetryable(Exception):
 
 
 class WeChatAdapter(BaseAdapter):
-    def __init__(self, config, *, state=None, client=None):
+    def __init__(self, config, *, network=None, route=None, state=None, client=None):
         self.state = state or WeChatState(config.state_dir)
         if not self.state.credentials:
             raise WeChatStateError("WeChat is not logged in; run python main.py --wechat-login")
         self.state.recover_inputs()
         config = config.for_account(self.state.bot_id)
+        if route is not None:
+            active_route = route
+        elif network is not None or client is None:
+            active_route = resolve_route(config.proxy, network, section="adapters.wechat")
+        else:
+            active_route = DIRECT_ROUTE
+        self.route = active_route
         credentials = self.state.credentials
         self.client = client or WeChatClient(
             credentials["bot_token"], credentials["baseurl"],
             channel_version=config.channel_version, route_tag=config.route_tag,
             timeout=config.http_timeout_s, cooling_until=lambda: self.state.cooldown_until,
-            on_session_invalid=self.state.pause)
+            on_session_invalid=self.state.pause, route=active_route)
         self.media = WeChatMedia(self.client)
         self._media_descriptors = {}
         self.sender = WeChatSender(self.client, self.state, config, self.media)

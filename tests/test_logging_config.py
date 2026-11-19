@@ -46,7 +46,10 @@ class TestLoggingConfig(unittest.TestCase):
         self.assertFalse(cfg.debug)
         self.assertFalse(cfg.qq.debug)
         self.assertFalse(Path("logs").exists())
-        self.detect.assert_called_once_with(cfg.muse.proxy_url, cfg.muse.direct)
+        self.detect.assert_not_called()
+        cfg_direct = self.load({"muse": {"proxy": "none"}})
+        self.assertEqual(cfg_direct.muse.client_ip, "203.0.113.7")
+        self.detect.assert_called_once_with(None, True)
 
     def test_legacy_positional_app_config_construction(self):
         muse, qq, onebot, gateway = MuseConfig(), QQConfig(), OneBotConfig(), GatewayConfig()

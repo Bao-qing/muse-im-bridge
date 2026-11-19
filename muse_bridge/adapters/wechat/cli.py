@@ -6,6 +6,7 @@ import getpass
 import json
 
 from ...config.models import WeChatConfig
+from ...network import DIRECT_ROUTE, resolve_route
 
 
 def display_qr(content: str) -> None:
@@ -29,14 +30,15 @@ def show_status(*_args, **_kwargs) -> None:
     print("微信登录状态已更新，请按终端或微信提示继续。")
 
 
-async def _login(config: WeChatConfig) -> dict:
+async def _login(config: WeChatConfig, network=None) -> dict:
     from .auth import WeChatAuth
     from .client import WeChatClient
     from .state import WeChatState
 
+    route = resolve_route(config.proxy, network, section="adapters.wechat") if network is not None else DIRECT_ROUTE
     state = WeChatState(config.state_dir)
     client = WeChatClient(channel_version=config.channel_version, route_tag=config.route_tag,
-                          timeout=config.http_timeout_s)
+                          timeout=config.http_timeout_s, route=route)
     try:
         credentials = await WeChatAuth(client).login(
             state.accounts(), display=display_qr, verify=verify_code, on_status=show_status)
@@ -48,9 +50,9 @@ async def _login(config: WeChatConfig) -> dict:
     return state.status()
 
 
-def run_login(config: WeChatConfig) -> dict:
+def run_login(config: WeChatConfig, network=None) -> dict:
     """Run login only on an explicit CLI or wizard request."""
-    return asyncio.run(_login(config))
+    return asyncio.run(_login(config, network=network))
 
 
 def run_status(config: WeChatConfig) -> dict:

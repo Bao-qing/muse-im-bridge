@@ -8,12 +8,8 @@ from unittest import mock
 import httpx
 
 from muse_bridge.adapters.wechat.client import (
-    DEFAULT_API, DeliveryUnknownError, SessionCoolingError,
+    DEFAULT_API, DEFAULT_CDN, DeliveryUnknownError, SessionCoolingError,
     WeChatAPIError, WeChatClient, WeChatError,
-)
-from muse_bridge.adapters.wechat.security import (
-    DEFAULT_CDN, PinnedTransport, WeChatSecurityError, redirect_base,
-    validate_url,
 )
 
 
@@ -196,8 +192,6 @@ class TestWeChatClient(unittest.IsolatedAsyncioTestCase):
         for request in requests:
             for name in ("authorization", "authorizationtype", "x-wechat-uin", "ilink-app-id", "skrouteTag", "cookie"):
                 self.assertNotIn(name, request.headers)
-        with self.assertRaises(WeChatSecurityError):
-            await client.cdn_download("https://example.com/media", 2)
 
     async def test_size_limits_streamed_and_declared(self):
         for response in (httpx.Response(200, stream=Chunks()),
@@ -206,7 +200,7 @@ class TestWeChatClient(unittest.IsolatedAsyncioTestCase):
                          httpx.Response(200, content=b"", headers={"content-length": "bad"}),
                          httpx.Response(200, content=b"", headers={"content-encoding": "gzip"})):
             client = self.client(lambda r: response)
-            with self.assertRaises(WeChatSecurityError):
+            with self.assertRaises(WeChatError):
                 await client.cdn_download(DEFAULT_CDN + "/download", 5)
 
     async def test_redirects_are_never_followed(self):
@@ -237,51 +231,6 @@ class TestWeChatClient(unittest.IsolatedAsyncioTestCase):
         response.aclose = mock.AsyncMock(side_effect=httpx.ReadError("secret"))
         client = self.client(lambda r: response)
         self.assertEqual(await client.send_message({}), {"ret": 0})
-
-    async def test_production_transport_cannot_be_replaced(self):
-        with self.assertRaises(WeChatSecurityError):
-            WeChatClient(transport=object())
-
-
-class TestWeChatURLPolicy(unittest.IsolatedAsyncioTestCase):
-    def test_api_url_negative_cases(self):
-        for url in (
-            "http://ilinkai.weixin.qq.com", "https://evil.qq.com", "https://ilinkai.weixin.qq.com.evil.test",
-            "https://u:secret@ilinkai.weixin.qq.com", "https://ilinkai.weixin.qq.com:444",
-            "https://127.0.0.1", "https://[::1]", "https://ilinkai.weixin.qq.com/#secret",
-            "https://ilinkai.weixin.qq.com\\@evil.test", "https://ilinkai.weixin.qq.com\n",
-            "https://ilinkai.weixin.qq.com/%0a", "https://ilinkai.weixin.qq.com/?secret=1",
-        ):
-            with self.subTest(url=url), self.assertRaises(WeChatSecurityError) as caught:
-                validate_url(url, base=True)
-            self.assertNotIn("secret", str(caught.exception))
-        self.assertEqual(validate_url(DEFAULT_API + ":443/", base=True), DEFAULT_API)
-        self.assertEqual(redirect_base("ilinkai.weixin.qq.com"), DEFAULT_API)
-        for host in ("unknown.weixin.qq.com", "evil.qq.com", "user@ilinkai.weixin.qq.com", "ilinkai.weixin.qq.com/path", None):
-            with self.assertRaises(WeChatSecurityError):
-                redirect_base(host)
-
-    def test_public_url_negative_cases(self):
-        for url in ("http://example.com", "file:///tmp/x",
-                    "https://user:secret@example.com", "https://example.com:8443/x"):
-            with self.subTest(url=url), self.assertRaises(WeChatSecurityError):
-                validate_url(url, public=True)
-
-    async def test_transport_validates_url_and_uses_standard_https(self):
-        transport = PinnedTransport()
-        pool = mock.Mock()
-        pool.handle_async_request = mock.AsyncMock(return_value=httpx.Response(200))
-        pool.aclose = mock.AsyncMock()
-        with mock.patch("muse_bridge.adapters.wechat.security.httpx.AsyncHTTPTransport", return_value=pool) as factory:
-            req = httpx.Request("GET", DEFAULT_API + "/path?q=secret")
-            await transport.handle_async_request(req)
-            sent = pool.handle_async_request.call_args.args[0]
-            self.assertEqual(sent.url.host, "ilinkai.weixin.qq.com")
-            self.assertEqual(sent.url.params["q"], "secret")
-            self.assertTrue(factory.call_args.kwargs["verify"])
-            self.assertTrue(factory.call_args.kwargs["trust_env"])
-            await transport.aclose()
-        pool.aclose.assert_awaited_once()
 
 
 if __name__ == "__main__":

@@ -92,9 +92,9 @@ def _emoji_reactions(value):
 
 
 class TelegramAdapter(BaseAdapter):
-    def __init__(self, config, *, transport=None):
+    def __init__(self, config, *, network=None, route=None, transport=None):
         self.config = config
-        self.client = TelegramClient(config, transport=transport)
+        self.client = TelegramClient(config, network=network, route=route, transport=transport)
         self.sender = TelegramSender(config, self.client)
         self._bot_id = 0
         self._username = ""

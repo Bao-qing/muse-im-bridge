@@ -6,6 +6,8 @@ import re
 
 import httpx
 
+from ...network import DIRECT_ROUTE, NetworkRoute, resolve_route
+
 
 HOST = "https://api.telegram.org"
 DOWNLOAD_CAP = 20 * 1024 * 1024
@@ -26,12 +28,23 @@ class TelegramAPIError(RuntimeError):
 
 
 class TelegramClient:
-    def __init__(self, config, *, transport=None):
-        self._api_prefix = f"{HOST}/bot{config.bot_token}"
-        self._file_prefix = f"{HOST}/file/bot{config.bot_token}"
+    def __init__(self, config, *, network=None, route: NetworkRoute | None = None, transport=None):
+        if route is not None:
+            active_route = route
+        elif network is not None:
+            active_route = resolve_route(config.proxy, network, section="adapters.telegram")
+        elif transport is not None:
+            active_route = DIRECT_ROUTE
+        else:
+            active_route = resolve_route(config.proxy, None, section="adapters.telegram")
+        self.route = active_route
+        api_host = self.route.http_url(HOST)
+        self._api_prefix = f"{api_host}/bot{config.bot_token}"
+        self._file_prefix = f"{api_host}/file/bot{config.bot_token}"
         self._download_timeout = config.download_timeout_s
-        self._http = httpx.AsyncClient(transport=transport, proxy=config.proxy_url,
-                                      trust_env=False, follow_redirects=False, timeout=30)
+        self._http = self.route.async_httpx_client(
+            transport=transport, follow_redirects=False, timeout=30,
+        )
 
     async def close(self):
         await self._http.aclose()

@@ -92,7 +92,7 @@ class TestOneBotClient(unittest.TestCase):
 
     def test_call_raises_on_refused_action_with_first_line_only(self):
         refused = {"status": "failed", "retcode": 1200, "message": "send failed\n at stack (napcat.mjs:1)"}
-        with mock.patch("urllib.request.urlopen", return_value=_response(refused)):
+        with mock.patch("muse_bridge.network.NetworkRoute.open_url", return_value=_response(refused)):
             with self.assertRaises(OneBotAPIError) as raised:
                 self.client.send_msg("group", "1", [{"type": "text", "data": {"text": "x"}}])
         self.assertEqual(raised.exception.retcode, 1200)
@@ -100,7 +100,7 @@ class TestOneBotClient(unittest.TestCase):
 
     def test_send_msg_payload_user_agent_and_message_id(self):
         ok = {"status": "ok", "retcode": 0, "data": {"message_id": 99}}
-        with mock.patch("urllib.request.urlopen", return_value=_response(ok)) as open_:
+        with mock.patch("muse_bridge.network.NetworkRoute.open_url", return_value=_response(ok)) as open_:
             data = self.client.send_msg("private", "42", [{"type": "text", "data": {"text": "hi"}}])
         req = open_.call_args.args[0]
         self.assertEqual(req.full_url, "https://onebot.test/send_private_msg")
@@ -109,13 +109,13 @@ class TestOneBotClient(unittest.TestCase):
         self.assertEqual(data, {"message_id": 99})
 
     def test_legacy_send_group_msg_raises_instead_of_reporting_success(self):
-        with mock.patch("urllib.request.urlopen", return_value=_response({"status": "failed", "retcode": 100})):
+        with mock.patch("muse_bridge.network.NetworkRoute.open_url", return_value=_response({"status": "failed", "retcode": 100})):
             with self.assertRaises(OneBotAPIError):
                 self.client.send_group_msg(1, "x")
 
     def test_set_input_status_validates_params_and_stays_quiet_on_error(self):
         ok = {"status": "ok", "retcode": 0, "data": {}}
-        with mock.patch("urllib.request.urlopen", return_value=_response(ok)) as open_:
+        with mock.patch("muse_bridge.network.NetworkRoute.open_url", return_value=_response(ok)) as open_:
             self.client.set_input_status("42", 1)
         req = open_.call_args.args[0]
         self.assertEqual(req.full_url, "https://onebot.test/set_input_status")
@@ -126,7 +126,7 @@ class TestOneBotClient(unittest.TestCase):
         for bad_type in (3, -1, True, "1"):
             with self.assertRaises(ValueError):
                 self.client.set_input_status(42, bad_type)
-        with mock.patch("urllib.request.urlopen", side_effect=OSError("offline")), \
+        with mock.patch("muse_bridge.network.NetworkRoute.open_url", side_effect=OSError("offline")), \
              mock.patch("muse_bridge.adapters.onebot.client.logger.error") as err_log:
             with self.assertRaises(RuntimeError):
                 self.client.set_input_status(42, 1)
@@ -135,12 +135,12 @@ class TestOneBotClient(unittest.TestCase):
     def test_file_source_prefers_base64_then_http_url_and_skips_local_paths(self):
         answers = [{"status": "ok", "retcode": 0, "data": {"url": "/app/temp/a.txt"}},
                    {"status": "ok", "retcode": 0, "data": {"url": "https://cdn.test/a.txt"}}]
-        with mock.patch("urllib.request.urlopen", side_effect=[_response(a) for a in answers]):
+        with mock.patch("muse_bridge.network.NetworkRoute.open_url", side_effect=[_response(a) for a in answers]):
             self.assertEqual(self.client.file_source("/fid", group_id="7"), {"url": "https://cdn.test/a.txt"})
-        with mock.patch("urllib.request.urlopen",
+        with mock.patch("muse_bridge.network.NetworkRoute.open_url",
                         return_value=_response({"status": "ok", "retcode": 0, "data": {"base64": "QQ=="}})):
             self.assertEqual(self.client.file_source("/fid"), {"base64": "QQ=="})
-        with mock.patch("urllib.request.urlopen",
+        with mock.patch("muse_bridge.network.NetworkRoute.open_url",
                         return_value=_response({"status": "ok", "retcode": 0, "data": {"url": "/app/a"}})):
             self.assertEqual(self.client.file_source("/fid"), {})
 

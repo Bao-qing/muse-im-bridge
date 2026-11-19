@@ -7,7 +7,6 @@ can be overridden via user configuration (`config.json`) if desired.
 # Muse Gateway Defaults
 DEFAULT_MUSE_HOST = "hatch.metaaivm.com"
 DEFAULT_MUSE_TIMEZONE = "Asia/Shanghai"
-DEFAULT_MUSE_DIRECT = True
 
 # Egress IP Detection Services
 EGRESS_IP_SERVICES = (

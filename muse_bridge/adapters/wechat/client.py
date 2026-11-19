@@ -15,12 +15,19 @@ from typing import Any
 
 import httpx
 
-from .security import DEFAULT_API, PinnedTransport, WeChatError, WeChatSecurityError, validate_url
+from ...network import DIRECT_ROUTE, NetworkRoute
+
+DEFAULT_API = "https://ilinkai.weixin.qq.com"
+DEFAULT_CDN = "https://novac2c.cdn.weixin.qq.com/c2c"
 
 __all__ = [
     "WeChatClient", "WeChatError", "WeChatAPIError", "SessionCoolingError",
-    "DeliveryUnknownError", "DEFAULT_API",
+    "DeliveryUnknownError", "DEFAULT_API", "DEFAULT_CDN",
 ]
+
+
+class WeChatError(Exception):
+    """Base for sanitized protocol errors (never include remote messages)."""
 
 
 class WeChatAPIError(WeChatError):
@@ -49,11 +56,14 @@ class WeChatClient:
     def __init__(
         self, token: str = "", base_url: str = DEFAULT_API, *,
         channel_version: str = "2.4.6", route_tag: str = "", transport=None,
+        route: NetworkRoute | None = None,
         cooling_until: Callable[[], float] | None = None,
         on_session_invalid: Callable[[], None] | None = None, timeout: float = 35,
         on_debug: Callable[[str], None] | None = None,
     ) -> None:
-        self.base_url = validate_url(base_url, base=True)
+        if not isinstance(base_url, str) or not base_url.strip():
+            raise WeChatError("Invalid WeChat base URL")
+        self.base_url = base_url.strip().rstrip("/")
         try:
             parts = [int(part) for part in channel_version.split(".")]
             if len(parts) != 3 or any(p < 0 for p in parts):
@@ -64,21 +74,23 @@ class WeChatClient:
             raise WeChatError("Invalid WeChat token encoding")
         if not isinstance(route_tag, str) or any(ord(c) < 32 or ord(c) > 126 for c in route_tag):
             raise WeChatError("Invalid WeChat route tag encoding")
-        if transport is not None and not isinstance(transport, httpx.MockTransport):
-            raise WeChatSecurityError("Only MockTransport test injection is supported")
         self._token = token
         self.channel_version = channel_version
         self._version = str(((parts[0] & 255) << 16) | ((parts[1] & 255) << 8) | (parts[2] & 255))
         self._route_tag = route_tag
+        self.route = route or DIRECT_ROUTE
         self._cooling_until = cooling_until
         self._on_session_invalid = on_session_invalid
         self._on_debug = on_debug
         self._invalid_until = 0.0
         self._timeout = timeout
-        # MockTransport skips real DNS only; the URL policy still applies.
-        self._api_transport = transport if transport is not None else PinnedTransport()
-        self._cdn_transport = transport if transport is not None else PinnedTransport()
-        self._public_transport = transport if transport is not None else PinnedTransport(public=True)
+        self._transport = (
+            transport if transport is not None
+            else self.route.async_httpx_transport(
+                verify=True, retries=0,
+                limits=httpx.Limits(max_connections=8, max_keepalive_connections=2),
+            )
+        )
 
     def _headers(self, *, post: bool, authenticated: bool) -> dict[str, str]:
         headers = {
@@ -139,22 +151,20 @@ class WeChatClient:
 
     @staticmethod
     async def _read_limited(response: httpx.Response, max_bytes: int) -> bytes:
-        # We request identity encoding and reject compressed responses instead
-        # of allocating unbounded decompression buffers for hostile payloads.
         if response.headers.get("content-encoding", "identity").lower() != "identity":
-            raise WeChatSecurityError("Unexpected compressed WeChat response")
+            raise WeChatError("Unexpected compressed WeChat response")
         length = response.headers.get("content-length")
         if length is not None:
             try:
                 size = int(length)
             except ValueError:
-                raise WeChatSecurityError("Invalid WeChat response size") from None
+                raise WeChatError("Invalid WeChat response size") from None
             if size < 0 or size > max_bytes:
-                raise WeChatSecurityError("WeChat response exceeds byte limit")
+                raise WeChatError("WeChat response exceeds byte limit")
         chunks = bytearray()
         async for chunk in response.aiter_bytes(chunk_size=65536):
             if len(chunks) + len(chunk) > max_bytes:
-                raise WeChatSecurityError("WeChat response exceeds byte limit")
+                raise WeChatError("WeChat response exceeds byte limit")
             chunks.extend(chunk)
         return bytes(chunks)
 
@@ -174,7 +184,7 @@ class WeChatClient:
         sending: bool = False,
     ) -> dict:
         self._check_cooling()
-        base = validate_url(base_url or self.base_url, base=True)
+        base = (base_url or self.base_url).rstrip("/")
         payload = dict(body or {})
         if business and method == "POST":
             payload["base_info"] = {
@@ -182,7 +192,7 @@ class WeChatClient:
                 "bot_agent": "MuseBridge/0.1.0 (python)",
             }
         request = httpx.Request(
-            method, base + "/ilink/bot/" + endpoint, params=params,
+            method, self.route.http_url(base + "/ilink/bot/" + endpoint), params=params,
             headers=self._headers(post=method == "POST", authenticated=authenticated),
             json=payload if method == "POST" else None,
             extensions={"timeout": httpx.Timeout(
@@ -191,7 +201,7 @@ class WeChatClient:
         )
         response = None
         try:
-            response = await self._api_transport.handle_async_request(request)
+            response = await self._transport.handle_async_request(request)
             data = await self._read_limited(response, 8 * 1024 * 1024)
             try:
                 result = json.loads(data)
@@ -289,15 +299,15 @@ class WeChatClient:
 
     async def _download(self, url: str, max_bytes: int, *, public: bool) -> bytes:
         self._check_cooling()
-        validate_url(url, cdn=not public, public=public)
+        if not isinstance(url, str) or not url.strip():
+            raise WeChatError("Invalid WeChat download URL")
         if type(max_bytes) is not int or max_bytes < 0:
-            raise WeChatSecurityError("Invalid WeChat download byte limit")
+            raise WeChatError("Invalid WeChat download byte limit")
         response = None
         try:
-            request = httpx.Request("GET", url, headers={"Accept-Encoding": "identity"},
+            request = httpx.Request("GET", self.route.http_url(url), headers={"Accept-Encoding": "identity"},
                                     extensions={"timeout": httpx.Timeout(self._timeout).as_dict()})
-            transport = self._public_transport if public else self._cdn_transport
-            response = await transport.handle_async_request(request)
+            response = await self._transport.handle_async_request(request)
             if not 200 <= response.status_code < 300:
                 self._debug(f"CDN download failed: host={request.url.host} status={response.status_code}")
                 raise WeChatError(f"WeChat media download failed (status={response.status_code})")
@@ -318,13 +328,14 @@ class WeChatClient:
     async def cdn_upload(self, url: str, data: bytes) -> str:
         """Upload ciphertext and return x-encrypted-param (no business headers)."""
         self._check_cooling()
-        validate_url(url, cdn=True)
+        if not isinstance(url, str) or not url.strip():
+            raise WeChatError("Invalid WeChat upload URL")
         response = None
         try:
-            request = httpx.Request("POST", url, content=data, headers={
+            request = httpx.Request("POST", self.route.http_url(url), content=data, headers={
                 "Content-Type": "application/octet-stream", "Accept-Encoding": "identity",
             }, extensions={"timeout": httpx.Timeout(self._timeout).as_dict()})
-            response = await self._cdn_transport.handle_async_request(request)
+            response = await self._transport.handle_async_request(request)
             if not 200 <= response.status_code < 300:
                 self._debug(f"CDN upload failed: host={request.url.host} status={response.status_code}")
                 raise WeChatError(f"WeChat CDN upload failed (status={response.status_code})")
@@ -347,8 +358,4 @@ class WeChatClient:
                 await self._close_response(response)
 
     async def aclose(self) -> None:
-        await self._api_transport.aclose()
-        if self._cdn_transport is not self._api_transport:
-            await self._cdn_transport.aclose()
-        if self._public_transport is not self._api_transport:
-            await self._public_transport.aclose()
+        await self._transport.aclose()

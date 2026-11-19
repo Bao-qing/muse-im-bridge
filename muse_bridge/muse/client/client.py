@@ -59,8 +59,7 @@ from .protocol import (
 )
 from .transport import WS, noise_handshake
 from urllib.parse import quote
-from ...config.models import WorkerConfig
-from ..routing import worker_url
+from ...network import DIRECT_ROUTE, NetworkRoute
 
 DEFAULT_CAPABILITIES = [
     "hotel_results",
@@ -200,7 +199,7 @@ class PushSubscription:
 class MuseClient:
     def __init__(self, token, notary_token, vm_id, client_ip,
                  host="hatch.metaaivm.com",
-                 timezone="Asia/Shanghai", proxy_url=None, direct=False, worker=None):
+                 timezone="Asia/Shanghai", *, route: NetworkRoute | None = None):
         # vm_id and client_ip are required, with no defaults: they are
         # deployment values (your VM, your egress IP), not library
         # constants. host is the shared service endpoint and timezone a
@@ -211,9 +210,7 @@ class MuseClient:
         self.host = host
         self.client_ip = client_ip
         self.timezone = timezone
-        self.proxy_url = proxy_url
-        self.direct = direct
-        self.worker = worker or WorkerConfig()
+        self.route = route or DIRECT_ROUTE
         self._ws = None
         self._send_cs = None
         self._recv_cs = None
@@ -289,14 +286,13 @@ class MuseClient:
             f"request_id={uuid.uuid4()}",
         ]
         url = f"wss://{self.host}/v1/noise?" + "&".join(params)
-        ws_options = {"proxy_url": self.proxy_url, "direct": self.direct}
-        if self.worker.ws:
-            url = worker_url(url, self.worker)
+        if self.route.use_worker_ws:
+            url = self.route.ws_url(url)
             ws_options = {"direct": True}
-            # Pending live validation: disable only for Worker if its upstream
-            # fetch Upgrade cannot negotiate permessage-deflate correctly.
-            if not self.worker.ws_permessage_deflate:
-                ws_options["permessage_deflate"] = False
+        elif self.route.ws_proxy:
+            ws_options = {"proxy_url": self.route.ws_proxy, "direct": False}
+        else:
+            ws_options = {"direct": True}
         ws = None
         try:
             ws = WS(url, **ws_options)

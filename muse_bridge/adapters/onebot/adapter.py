@@ -19,6 +19,7 @@ from ...core.delivery import DeliveryResult, DeliveryStatus, FeedEnvelope, React
 from ...core.identity import valid_id
 from ...core.message import Attachment, InboundMessage, MessageSource
 from ..base import BaseAdapter
+from ...network import DIRECT_ROUTE, resolve_route
 from ...observability import get_logger, safe_error
 from .client import OneBotAPIError, OneBotClient
 from .gateway import OneBotGateway
@@ -93,15 +94,24 @@ def parse_segments(message, self_id: Optional[str], *, strip_text: bool = True) 
 
 
 class OneBotAdapter(BaseAdapter):
-    def __init__(self, config: OneBotConfig, *, client=None):
+    def __init__(self, config: OneBotConfig, *, network=None, route=None, client=None):
         self.config = config
-        self.client = client or OneBotClient(base_url=config.base_url, access_token=config.access_token)
+        if route is not None:
+            active_route = route
+        elif network is not None or client is None:
+            active_route = resolve_route(config.proxy, network, section="adapters.onebot")
+        else:
+            active_route = DIRECT_ROUTE
+        self.route = active_route
+        self.client = client or OneBotClient(
+            base_url=config.base_url, access_token=config.access_token, route=active_route)
         self.sender = OneBotSender(config, self.client)
         self._running = False
         self.gateway = OneBotGateway(
             ws_url=config.ws_url or _default_ws_url(config.base_url),
             access_token=config.access_token,
             on_message=self.handle_event,
+            route=active_route,
         )
         self.self_id: Optional[str] = None
         # file_id -> group id of a received group file (get_group_file_url needs it).

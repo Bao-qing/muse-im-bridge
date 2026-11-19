@@ -17,6 +17,7 @@ from .client.errors import HandshakeError, TurnCancelled, LoginRequired, is_runt
 from ..config.models import MuseConfig
 from ..core.interactions import InteractionManager
 from ..core.message import Attachment
+from ..network import DIRECT_ROUTE, NetworkRoute
 from ..observability import get_logger, trace_event
 from .token_manager import MuseTokenManager
 from .interactions import ApprovalBlocked, MuseInteractions
@@ -26,9 +27,13 @@ logger = get_logger(__name__)
 
 
 class MuseService:
-    def __init__(self, config: MuseConfig, token_manager: MuseTokenManager):
+    def __init__(self, config: MuseConfig, token_manager: MuseTokenManager, *, route: NetworkRoute | None = None):
         self.config = config
         self.token_manager = token_manager
+        token_route = getattr(token_manager, "route", None)
+        self.route = route if isinstance(route, NetworkRoute) else (
+            token_route if isinstance(token_route, NetworkRoute) else DIRECT_ROUTE
+        )
         self.interactions = InteractionManager()
         self.interaction_protocol = MuseInteractions(self)
         if config.session_id:
@@ -59,9 +64,7 @@ class MuseService:
             host=self.config.host,
             client_ip=self.config.client_ip,
             timezone=self.config.timezone,
-            proxy_url=self.config.proxy_url,
-            direct=self.config.direct,
-            **({"worker": self.config.worker} if self.config.worker.ws else {}),
+            route=self.route,
         )
 
         orig_connect = client.connect

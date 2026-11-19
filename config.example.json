@@ -1,13 +1,16 @@
 {
+  "network": {
+    "proxy_url": "",
+    "worker": {
+      "base": "https://your-worker.example.com",
+      "ws": true,
+      "http": true
+    }
+  },
   "muse": {
     "cookies_file": "cookies.json",
     "session_id": "YOUR_MUSE_SESSION_ID",
-    "worker": {
-      "base": "https://your-worker.example.com",
-      "ws": false,
-      "http": false,
-      "login": false
-    },
+    "proxy": "worker",
     "approval": {
       "mode": "manual",
       "notify": true,
@@ -17,6 +20,7 @@
   "adapters": {
     "qq": {
       "enabled": true,
+      "proxy": "none",
       "app_id": "YOUR_QQ_APP_ID",
       "app_secret": "YOUR_QQ_APP_SECRET",
       "admin_id": [
@@ -48,6 +52,7 @@
     },
     "onebot": {
       "enabled": false,
+      "proxy": "none",
       "base_url": "https://onebot.example.com",
       "access_token": "YOUR_ONEBOT_TOKEN",
       "ws_url": "wss://onebot.example.com",
@@ -80,6 +85,7 @@
     },
     "wechat": {
       "enabled": false,
+      "proxy": "none",
       "state_dir": "data/wechat",
       "channel_version": "2.4.6",
       "route_tag": "",
@@ -94,8 +100,8 @@
     },
     "telegram": {
       "enabled": false,
+      "proxy": "worker",
       "bot_token": "",
-      "proxy_url": "",
       "poll_timeout_s": 30,
       "admin_id": [],
       "seed_main_session": false,
