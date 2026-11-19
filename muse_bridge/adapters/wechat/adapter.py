@@ -8,7 +8,7 @@ import os
 import random
 import time
 
-from ...core.delivery import ReactionEnvelope, reaction_as_delivery
+from ...core.delivery import DeliveryResult, DeliveryStatus, ReactionEnvelope, reaction_as_delivery
 from ...core.message import Attachment, InboundMessage, MessageSource
 from ..base import BaseAdapter
 from ...observability import get_logger, safe_error
@@ -198,7 +198,15 @@ class WeChatAdapter(BaseAdapter):
         return await self.transport.deliver(envelope)
 
     async def deliver_reaction(self, envelope: ReactionEnvelope):
-        return await self.deliver(reaction_as_delivery(envelope))
+        if envelope.is_removal:
+            return DeliveryResult(DeliveryStatus.CONFIRMED)
+        delivery = reaction_as_delivery(envelope, quote=self.config.reaction_quote)
+        if delivery is None:
+            return DeliveryResult(DeliveryStatus.CONFIRMED)
+        if self.config.reaction_quote and delivery.quote and not delivery.quote_fallback:
+            excerpt = delivery.quote.excerpt or "[非文本消息]"
+            delivery.quote_fallback = "【引用】" + excerpt.replace("\n", "\n> ") + "\n"
+        return await self.deliver(delivery)
 
     def activity_started(self, target, token, *, kind="private"):
         if kind != "private" or not self.config.typing_enabled:

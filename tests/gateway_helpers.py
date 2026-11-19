@@ -171,4 +171,7 @@ class FakeAdapter(BaseAdapter):
             DeliveryReceipt(envelope.target_type, envelope.target_id, (("id", "local-reply"),))])
 
     async def deliver_reaction(self, envelope):
-        return await self.deliver(reaction_as_delivery(envelope))
+        if envelope.is_removal:
+            return DeliveryResult(DeliveryStatus.CONFIRMED)
+        delivery = reaction_as_delivery(envelope)
+        return await self.deliver(delivery) if delivery is not None else DeliveryResult(DeliveryStatus.CONFIRMED)

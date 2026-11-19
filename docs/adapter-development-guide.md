@@ -170,8 +170,8 @@ class DeliveryEnvelope:
    async def deliver_reaction(self, envelope: ReactionEnvelope) -> DeliveryResult
    ```
    - **入站**：只有在你确实能解析出「谁、在哪条平台消息上加/减了什么」时才调用 `emit_reaction()`；`message_ref` 使用与引用一致的 `("id", "<chat_id>:<message_id>")` 形式。网关会自行做白名单校验、会话归属与 Muse 消息映射，找不到归属时返回 `"ignored"`，**适配器不要自己判断权限或猜测会话**。
-   - **出站**：`ReactionEnvelope.reactions` 是**完整目标状态**（空表示清除）。`supports_native_reactions()` 返回 `True` 时网关会走原生反应；否则网关调用你的 `deliver_reaction()`，你可以直接用 `reaction_as_delivery(envelope)` 生成「引用原消息的纯文本通知」交给 `deliver()`（`qq` / `onebot` / `wechat` 即如此）。
-   - **部分支持也算不支持**：若平台只接受固定表情列表（如 Telegram Bot API 仅 73 种），必须在 `deliver_reaction()` 内先判断，列表外就走引用文本兜底，不能静默丢弃（参照 [telegram/outbound.py](../muse_bridge/adapters/telegram/outbound.py) 的 `supports_native_reaction`）。
+   - **出站**：`ReactionEnvelope.reactions` 是**完整目标状态**（空表示清除），纯取消时 `envelope.is_removal` 为 `True`。`supports_native_reactions()` 返回 `True` 时网关仍会下发取消事件，适配器仅在被取消表情属于平台原生支持列表时调用原生清除，否则直接返回 `CONFIRMED` 忽略；不支持原生反应的平台（`qq` / `onebot` / `wechat`）遇到 `envelope.is_removal` 直接返回 `CONFIRMED` 忽略，其余场景用 `reaction_as_delivery(envelope, quote=self.config.reaction_quote)` 仅将新增 emoji 渲染为纯文本通知交给 `deliver()`（`reaction_quote` 默认 `False`，仅控制回落为普通消息时是否引用原消息，不影响原生 reaction）。
+   - **部分支持也算不支持**：若平台只接受固定表情列表（如 Telegram Bot API 仅 73 种），必须在 `deliver_reaction()` 内先判断：列表外的新增走 `reaction_as_delivery(envelope, quote=self.config.reaction_quote)` 纯文本兜底（若替换掉的是原生支持表情，可先原生清空再发兜底文本）；列表外的纯取消直接忽略，不能静默丢弃新增也不能把取消再发成文本（参照 [telegram/outbound.py](../muse_bridge/adapters/telegram/outbound.py)）。
    - **不要回显自触发**：把用户反应同步到上游后，上游可能回推同一条反应；网关已用 `reaction_lock` + 本地快照抑制这种回环，适配器无需自行去重。
 
 ---

@@ -1214,12 +1214,9 @@ class OutboundDispatcher:
         return mid, seq, emojis
 
     async def _deliver_reaction(self, target_type, target_id, emojis, additions, removals, delivery=None):
-        parts = []
-        if additions:
-            parts.append(" ".join(additions))
-        if removals:
-            parts.append(" ".join(removals))
-        text = chr(10).join(parts)
+        if not additions:
+            return True
+        text = " ".join(additions)
         return await self._deliver(target_type, target_id, text, [], [], [], delivery=delivery)
 
     async def _dispatch_reaction(self, event, session_id, baseline=False):

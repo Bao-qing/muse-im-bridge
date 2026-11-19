@@ -463,16 +463,36 @@ class TelegramAdapterTests(unittest.IsolatedAsyncioTestCase):
             ("setMessageReaction", {"chat_id": USER_ID, "message_id": 42, "reaction": []}),
         ])
 
-    async def test_unsupported_emoji_falls_back_to_quoted_message(self):
+    async def test_unsupported_emoji_falls_back_according_to_reaction_quote(self):
+        # Default (reaction_quote=False): send plain emoji without quoting original message.
         adapter = self.adapter()
-        env = ReactionEnvelope("fallback", "private", str(USER_ID), ("id", "123:42"),
+        env = ReactionEnvelope("fallback-unquoted", "private", str(USER_ID), ("id", "123:42"),
                                ("😮",), added=("😮",))
         self.assertTrue((await adapter.deliver_reaction(env)).confirmed)
+        self.assertEqual(self.requests[-1], ("sendMessage", {
+            "chat_id": USER_ID, "text": "😮",
+        }))
+        self.assertNotIn("setMessageReaction", [method for method, _ in self.requests])
+
+        # Opt-in (reaction_quote=True): quote original message when falling back.
+        quoted_adapter = self.adapter(reaction_quote=True)
+        env_q = ReactionEnvelope("fallback-quoted", "private", str(USER_ID), ("id", "123:42"),
+                                 ("😮",), added=("😮",))
+        self.assertTrue((await quoted_adapter.deliver_reaction(env_q)).confirmed)
         self.assertEqual(self.requests[-1], ("sendMessage", {
             "chat_id": USER_ID, "text": "😮",
             "reply_parameters": {"message_id": 42, "allow_sending_without_reply": True},
         }))
         self.assertNotIn("setMessageReaction", [method for method, _ in self.requests])
+
+        # Native reactions remain unaffected regardless of reaction_quote.
+        self.responses["setMessageReaction"] = [ok(True)]
+        native_env = ReactionEnvelope("native-quoted", "private", str(USER_ID), ("id", "123:42"), ("👍",))
+        self.assertTrue((await quoted_adapter.deliver_reaction(native_env)).confirmed)
+        self.assertEqual(self.requests[-1], ("setMessageReaction", {
+            "chat_id": USER_ID, "message_id": 42,
+            "reaction": [{"type": "emoji", "emoji": "👍"}],
+        }))
 
     async def test_supported_emoji_forms_use_native_reaction(self):
         adapter = self.adapter()
@@ -487,12 +507,48 @@ class TelegramAdapterTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_clearing_reaction_stays_native_even_for_empty_state(self):
         adapter = self.adapter()
-        self.responses["setMessageReaction"] = [ok(True)]
+        self.responses["setMessageReaction"] = [ok(True), ok(True)]
         env = ReactionEnvelope("clear", "private", str(USER_ID), ("id", "123:42"), ())
         self.assertTrue((await adapter.deliver_reaction(env)).confirmed)
         self.assertEqual(self.requests[-1], ("setMessageReaction", {
             "chat_id": USER_ID, "message_id": 42, "reaction": [],
         }))
+
+        # Pure removal of a natively supported emoji clears natively.
+        env_native_rm = ReactionEnvelope("rm-native", "private", str(USER_ID), ("id", "123:42"),
+                                         (), removed=("👍",), is_removal=True)
+        self.assertTrue((await adapter.deliver_reaction(env_native_rm)).confirmed)
+        self.assertEqual(self.requests[-1], ("setMessageReaction", {
+            "chat_id": USER_ID, "message_id": 42, "reaction": [],
+        }))
+
+        # Pure removal of an unsupported emoji is ignored without API calls or text messages.
+        before = len(self.requests)
+        env_unsupported_rm = ReactionEnvelope("rm-unsupported", "private", str(USER_ID), ("id", "123:42"),
+                                              (), removed=("😮",), is_removal=True)
+        result = await adapter.deliver_reaction(env_unsupported_rm)
+        self.assertTrue(result.confirmed)
+        self.assertEqual(result.receipts, [])
+        self.assertEqual(len(self.requests), before)
+
+    async def test_replacing_reaction_with_unsupported_emoji_omits_removed_and_clears_native(self):
+        adapter = self.adapter()
+        # Unsupported -> unsupported: sends only the newly added emoji, no setMessageReaction.
+        env_u2u = ReactionEnvelope("u2u", "private", str(USER_ID), ("id", "123:42"),
+                                   ("🫶",), added=("🫶",), removed=("😮",))
+        self.assertTrue((await adapter.deliver_reaction(env_u2u)).confirmed)
+        self.assertEqual(self.requests, [("sendMessage", {"chat_id": USER_ID, "text": "🫶"})])
+
+        # Native -> unsupported: clears the old native reaction first, then sends only the new emoji.
+        self.requests.clear()
+        self.responses["setMessageReaction"] = [ok(True)]
+        env_n2u = ReactionEnvelope("n2u", "private", str(USER_ID), ("id", "123:42"),
+                                   ("😮",), added=("😮",), removed=("👍",))
+        self.assertTrue((await adapter.deliver_reaction(env_n2u)).confirmed)
+        self.assertEqual(self.requests, [
+            ("setMessageReaction", {"chat_id": USER_ID, "message_id": 42, "reaction": []}),
+            ("sendMessage", {"chat_id": USER_ID, "text": "😮"}),
+        ])
 
     async def test_native_reaction_rejects_invalid_targets_or_states(self):
         adapter = self.adapter()
@@ -671,6 +727,30 @@ class TelegramAdapterTests(unittest.IsolatedAsyncioTestCase):
             {"chat_id": USER_ID, "message_id": 77, "reaction": []},
         ])
         self.assertFalse(any(m == "sendMessage" for m, _ in self.requests))
+
+        # Muse adds an unsupported emoji (fallback text), removes it (ignored, state advances), then re-adds it.
+        await ctx.outbound_pusher._scan_and_dispatch(
+            [{"event": "reactions.updated", "seq": 13,
+              "payload": {"message_id": "assistant-msg-9", "reactions": ["😮"]}}],
+            sid,
+        )
+        before_clear = len(self.requests)
+        await ctx.outbound_pusher._scan_and_dispatch(
+            [{"event": "reactions.updated", "seq": 14,
+              "payload": {"message_id": "assistant-msg-9", "reactions": []}}],
+            sid,
+        )
+        self.assertEqual(len(self.requests), before_clear)
+        self.assertEqual(ctx.outbound_pusher.reference_store.reaction_state(sid, "assistant-msg-9"), (14, []))
+        await ctx.outbound_pusher._scan_and_dispatch(
+            [{"event": "reactions.updated", "seq": 15,
+              "payload": {"message_id": "assistant-msg-9", "reactions": ["😮"]}}],
+            sid,
+        )
+        self.assertEqual([p for m, p in self.requests if m == "sendMessage"], [
+            {"chat_id": USER_ID, "text": "😮"},
+            {"chat_id": USER_ID, "text": "😮"},
+        ])
 
     async def test_gateway_ignores_unauthorized_or_cross_session_reaction_and_handles_failure(self):
         adapter, ctx, svc = await self.mounted()

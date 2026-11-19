@@ -166,6 +166,42 @@ class TestWeChatConfig(unittest.TestCase):
             with self.assertRaises(ValueError):
                 original.for_account(bad)
 
+    def test_reaction_quote_defaults_per_adapter_and_strict_validation(self):
+        path = Path(self.tmp.name) / "per-adapter.json"
+        path.write_text(json.dumps({"adapters": {
+            "qq": {"reaction_quote": True},
+            "onebot": {"reaction_quote": False},
+            "telegram": {"reaction_quote": True},
+            "wechat": {"reaction_quote": True},
+        }}), encoding="utf-8")
+        cfg = ConfigLoader.load(str(path))
+        self.assertTrue(cfg.qq.reaction_quote)
+        self.assertFalse(cfg.onebot.reaction_quote)
+        self.assertTrue(cfg.telegram.reaction_quote)
+        self.assertTrue(cfg.wechat.reaction_quote)
+
+        default_cfg = AppConfig()
+        for name in ("qq", "onebot", "telegram", "wechat"):
+            self.assertFalse(getattr(default_cfg, name).reaction_quote)
+
+        override_path = Path(self.tmp.name) / "override.json"
+        override_path.write_text(json.dumps({
+            "adapters": {"wechat": {"reaction_quote": False}},
+            "overrides": {"reaction_quote": True},
+        }), encoding="utf-8")
+        override_cfg = ConfigLoader.load(str(override_path))
+        for name in ("qq", "onebot", "telegram", "wechat"):
+            self.assertTrue(getattr(override_cfg, name).reaction_quote)
+
+        for adapter_name in ("qq", "onebot", "telegram", "wechat"):
+            for bad in ("true", 1):
+                with self.subTest(adapter=adapter_name, bad=bad):
+                    bad_path = Path(self.tmp.name) / f"bad-{adapter_name}.json"
+                    bad_path.write_text(json.dumps({"adapters": {adapter_name: {"reaction_quote": bad}}}),
+                                        encoding="utf-8")
+                    with self.assertRaises(ValueError):
+                        ConfigLoader.load(str(bad_path))
+
 
 if __name__ == "__main__":
     unittest.main()

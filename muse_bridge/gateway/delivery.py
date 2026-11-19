@@ -254,6 +254,7 @@ class GatewayOutbound(OutboundDispatcher):
             reactions=tuple(emojis),
             added=tuple(additions),
             removed=tuple(removals),
+            is_removal=not additions and bool(removals),
             quote=quote,
             quote_fallback=quote_fallback,
             fallback_target=fallback,

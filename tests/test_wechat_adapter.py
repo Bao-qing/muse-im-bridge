@@ -226,7 +226,7 @@ class TestWeChatParsing(unittest.TestCase):
         self.assertEqual(message.text, "[引用: 摘要内容]\n回复")
 
 
-def make_adapter(root, state=None, *, muse=None):
+def make_adapter(root, state=None, *, muse=None, **cfg_kwargs):
     from gateway_helpers import WeChatAdapter
     from muse_bridge.config.models import MuseConfig, WeChatConfig
     from muse_bridge.core.interactions import InteractionManager
@@ -242,7 +242,7 @@ def make_adapter(root, state=None, *, muse=None):
         muse.token_manager.has_credentials.return_value = True
         muse.post_message.side_effect = lambda sid, text, *a, **kw: "mid-" + text
     client = mock.Mock(send_message=mock.AsyncMock(return_value={"ret": 0}), aclose=mock.AsyncMock())
-    adapter = WeChatAdapter(WeChatConfig(enabled=True, state_dir=root), muse, state=state, client=client)
+    adapter = WeChatAdapter(WeChatConfig(enabled=True, state_dir=root, **cfg_kwargs), muse, state=state, client=client)
     adapter.outbound_pusher.ensure_baseline = mock.AsyncMock()
     return adapter, muse, client
 
@@ -566,8 +566,34 @@ class TestWeChatIntake(unittest.IsolatedAsyncioTestCase):
                             "payload": {"message_id": "answer", "reactions": emojis}}
                 await pusher._dispatch_reaction(reaction, sid)
                 await pusher._dispatch_reaction(reaction, sid)
-            self.assertEqual(client.send_message.await_count, 5)
+            sent_texts = [c.args[0]["item_list"][0]["text_item"]["text"] for c in client.send_message.await_args_list]
+            self.assertEqual(sent_texts, ["async answer", "like", "heart", "like"])
             self.assertEqual(pusher.reference_store.reaction_state(sid, "answer"), (13, ["like"]))
+
+    async def test_reaction_quote_controls_wechat_text_quote_prefix(self):
+        for reaction_quote in (False, True):
+            with self.subTest(reaction_quote=reaction_quote), tempfile.TemporaryDirectory() as root:
+                adapter, muse, client = make_adapter(root, reaction_quote=reaction_quote)
+                await adapter.handle_batch([event("A", text="hello", token="TA")])
+                sid = muse.post_message.call_args.args[0]
+                pusher = adapter.outbound_pusher
+                pusher.reference_store.remember(sid, "private", "owner", "known-text", [("id", "100")], "original line")
+                pusher.reference_store.remember(sid, "private", "owner", "known-media", [("id", "101")], "")
+                for seq, mid in ((1, "known-text"), (2, "known-media"), (3, "missing-mid")):
+                    await pusher._dispatch_reaction(
+                        {"event_name": "reactions.updated", "seq": seq,
+                         "payload": {"message_id": mid, "reactions": ["👍"]}},
+                        sid,
+                    )
+                sent = [c.args[0]["item_list"][0]["text_item"]["text"] for c in client.send_message.await_args_list]
+                if reaction_quote:
+                    self.assertEqual(sent, [
+                        "【引用】original line\n👍",
+                        "【引用】[非文本消息]\n👍",
+                        "【引用】原消息在此聊天不可用\n👍",
+                    ])
+                else:
+                    self.assertEqual(sent, ["👍", "👍", "👍"])
 
     async def test_unknown_intake_and_restart_do_not_repeat_business(self):
         with tempfile.TemporaryDirectory() as root:

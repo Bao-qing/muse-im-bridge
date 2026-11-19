@@ -62,6 +62,8 @@ DEFAULT_ALLOW_ALL_PRIVATE = False
 DEFAULT_ALLOW_ALL_GROUP = False
 # Let admins fill credential cards in the group that shows them (input visible to members).
 DEFAULT_CREDENTIALS_IN_PLACE = True
+# Quote the original message when a reaction falls back to a plain-text chat message.
+DEFAULT_REACTION_QUOTE = False
 
 # OneBot group messages reaching Muse: "all", "at" (@bot or / command), "prefix".
 DEFAULT_ONEBOT_GROUP_TRIGGER = "all"

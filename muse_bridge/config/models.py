@@ -161,6 +161,7 @@ class ConversationConfig:
     enabled: bool = True
     credentials_in_place: bool = constants.DEFAULT_CREDENTIALS_IN_PLACE
     approvals_in_place: bool = constants.DEFAULT_APPROVALS_IN_PLACE
+    reaction_quote: bool = constants.DEFAULT_REACTION_QUOTE
     delivered_file: str = "data/qq_delivered.jsonl"
     debug: bool = False
 
@@ -201,7 +202,7 @@ class ConversationConfig:
     download_timeout_s: int = constants.DEFAULT_DOWNLOAD_TIMEOUT_S
 
     def __post_init__(self):
-        for name in ("credentials_in_place", "approvals_in_place"):
+        for name in ("credentials_in_place", "approvals_in_place", "reaction_quote"):
             if type(getattr(self, name)) is not bool:
                 raise ValueError(f"{self.section}.{name} must be a boolean")
         if type(self.reconnect_max_retries) is not int or self.reconnect_max_retries < 0:
@@ -707,6 +708,7 @@ class ConfigLoader:
                 credentials_in_place=_get_val(raw, "credentials_in_place", defaults["credentials_in_place"]),
                 approvals_in_place=_get_val(raw, "approvals_in_place",
                                             constants.DEFAULT_APPROVALS_IN_PLACE),
+                reaction_quote=_get_val(raw, "reaction_quote", defaults["reaction_quote"]),
                 allow_all_private=_get_val(raw, "allow_all_private",
                                            constants.DEFAULT_ALLOW_ALL_PRIVATE),
                 allow_all_group=val_grp,

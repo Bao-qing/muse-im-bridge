@@ -11,7 +11,7 @@ import re
 from typing import List, Optional
 
 from ...config.models import QQConfig
-from ...core.delivery import ReactionEnvelope, reaction_as_delivery
+from ...core.delivery import DeliveryResult, DeliveryStatus, ReactionEnvelope, reaction_as_delivery
 from ...core.identity import valid_id
 from ...core.message import Attachment, InboundMessage, MessageSource
 from ..base import BaseAdapter
@@ -52,7 +52,12 @@ class QQAdapter(BaseAdapter):
         return await self.sender.deliver(envelope)
 
     async def deliver_reaction(self, envelope: ReactionEnvelope):
-        return await self.deliver(reaction_as_delivery(envelope))
+        if envelope.is_removal:
+            return DeliveryResult(DeliveryStatus.CONFIRMED)
+        delivery = reaction_as_delivery(envelope, quote=self.config.reaction_quote)
+        if delivery is None:
+            return DeliveryResult(DeliveryStatus.CONFIRMED)
+        return await self.deliver(delivery)
 
     @property
     def name(self) -> str:
