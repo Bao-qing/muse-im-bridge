@@ -4,13 +4,42 @@ from __future__ import annotations
 import asyncio
 import re
 
-from ...core.delivery import DeliveryEnvelope, DeliveryReceipt, DeliveryResult, DeliveryStatus, ReactionEnvelope
+from ...core.delivery import (
+    DeliveryEnvelope,
+    DeliveryReceipt,
+    DeliveryResult,
+    DeliveryStatus,
+    ReactionEnvelope,
+    reaction_as_delivery,
+)
 from .client import PHOTO_CAP, UPLOAD_CAP, TelegramAPIError
 from .markdown import chunk_formatted, parse_markdown, utf16_len
 
 
 _ID = re.compile(r"-?[1-9][0-9]{0,15}")
 _MESSAGE_ID = re.compile(r"[1-9][0-9]{0,15}")
+
+# Bot API only accepts this fixed set of native reactions. Both the bare and
+# emoji-presentation forms (U+2764 / U+2764 U+FE0F) are accepted by Telegram,
+# so variation selectors are ignored when comparing.
+SUPPORTED_REACTIONS = frozenset(
+    "❤ 👍 👎 🔥 🥰 👏 😁 🤔 🤯 😱 🤬 😢 🎉 🤩 🤮 💩 🙏 👌 🕊 🤡 🥱 🥴 😍 🐳 ❤️‍🔥 "
+    "🌚 🌭 💯 🤣 ⚡ 🍌 🏆 💔 🤨 😐 🍓 🍾 💋 🖕 😈 😴 😭 🤓 👻 👨‍💻 👀 🎃 🙈 😇 😨 "
+    "🤝 ✍ 🤗 🫡 🎅 🎄 ☃ 💅 🤪 🗿 🆒 💘 🙉 🦄 😘 💊 🙊 😎 👾 🤷‍♂ 🤷 🤷‍♀ 😡".split()
+)
+
+
+def _reaction_key(emoji: str) -> str:
+    return emoji.replace("\ufe0f", "")
+
+
+_SUPPORTED_KEYS = frozenset(_reaction_key(emoji) for emoji in SUPPORTED_REACTIONS)
+
+
+def supports_native_reaction(reactions) -> bool:
+    """True when every emoji can be applied through setMessageReaction."""
+    return all(isinstance(emoji, str) and _reaction_key(emoji) in _SUPPORTED_KEYS
+               for emoji in reactions)
 
 
 def message_key(chat_id: int | str, message_id: int) -> str:
@@ -64,6 +93,10 @@ class TelegramSender:
                 or not message_id or not isinstance(reactions, tuple) or len(reactions) > 1
                 or any(not isinstance(emoji, str) or not emoji.strip() for emoji in reactions)):
             return DeliveryResult(DeliveryStatus.REJECTED, reason="Invalid Telegram reaction target or state")
+        if not supports_native_reaction(reactions):
+            # Bot API rejects emoji outside its fixed set, so quote the original
+            # message instead of losing the reaction.
+            return await self.deliver(reaction_as_delivery(envelope))
 
         async def send():
             try:
