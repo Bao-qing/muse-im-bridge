@@ -2,6 +2,8 @@
 
 所有外发 HTTP 与 WebSocket 传输统一由 `muse_bridge/network.py` 收拢管理，所有客户端均强制关闭隐式系统环境变量代理（`trust_env=False` / 显式空 `ProxyHandler({})` / `proxy=None`），仅按配置路由。
 
+> 需要从零搭建自有 Worker 时，请先阅读 [Cloudflare Worker 转发部署指南](worker-deployment.md)。
+
 ## 顶层 `network` 配置
 
 ```json
