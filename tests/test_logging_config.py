@@ -24,11 +24,6 @@ class TestLoggingConfig(unittest.TestCase):
         self.env = mock.patch.dict(os.environ, {}, clear=True)
         self.env.start()
         self.addCleanup(self.env.stop)
-        detect_patch = mock.patch(
-            "muse_bridge.config.models._detect_egress_ip", return_value="203.0.113.7",
-        )
-        self.detect = detect_patch.start()
-        self.addCleanup(detect_patch.stop)
 
     def load(self, data):
         path = Path(self.tmp.name) / "config.json"
@@ -46,10 +41,8 @@ class TestLoggingConfig(unittest.TestCase):
         self.assertFalse(cfg.debug)
         self.assertFalse(cfg.qq.debug)
         self.assertFalse(Path("logs").exists())
-        self.detect.assert_not_called()
         cfg_direct = self.load({"muse": {"proxy": "none"}})
-        self.assertEqual(cfg_direct.muse.client_ip, "203.0.113.7")
-        self.detect.assert_called_once_with(None, True)
+        self.assertEqual(cfg_direct.muse.client_ip, "")
 
     def test_legacy_positional_app_config_construction(self):
         muse, qq, onebot, gateway = MuseConfig(), QQConfig(), OneBotConfig(), GatewayConfig()
@@ -208,7 +201,6 @@ class TestLoggingConfig(unittest.TestCase):
         self.assertEqual(json.loads(Path("config.json").read_text(encoding="utf-8")), data)
         self.assertEqual(cfg.qq.chunk_chars, 777)
         self.assertEqual(cfg.muse.timezone, "UTC")
-        self.detect.assert_not_called()
 
 
 if __name__ == "__main__":

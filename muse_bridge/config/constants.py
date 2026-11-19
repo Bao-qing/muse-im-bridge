@@ -8,14 +8,6 @@ can be overridden via user configuration (`config.json`) if desired.
 DEFAULT_MUSE_HOST = "hatch.metaaivm.com"
 DEFAULT_MUSE_TIMEZONE = "Asia/Shanghai"
 
-# Egress IP Detection Services
-EGRESS_IP_SERVICES = (
-    "https://api.ipify.org",
-    "https://ifconfig.me/ip",
-    "https://checkip.amazonaws.com",
-    "https://icanhazip.com",
-)
-
 # QQ Bot Media & Payload Limits (Bytes)
 DEFAULT_MAX_IMAGE_BYTES = 8 * 1024 * 1024         # 8 MiB (QQ API image cap)
 DEFAULT_MAX_FILE_BYTES = 25 * 1024 * 1024        # 25 MiB (Muse file cap)

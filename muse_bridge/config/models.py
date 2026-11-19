@@ -11,11 +11,9 @@ import dataclasses
 import hashlib
 import math
 from pathlib import Path
-import ipaddress
 import json
 import os
 import re
-import urllib.request
 from typing import Any, ClassVar, Dict, List, Optional, Union
 from urllib.parse import urlsplit
 
@@ -28,29 +26,6 @@ def _env_bool(name: str, default: bool = False) -> bool:
     if v is None or v == "":
         return default
     return v.strip().lower() in ("1", "true", "yes", "on")
-
-
-def _detect_egress_ip(proxy_url: Optional[str] = None, direct: bool = True) -> str:
-    """Best-effort public egress IP auto-detection."""
-    if direct:
-        handler = urllib.request.ProxyHandler({})
-    elif proxy_url:
-        handler = urllib.request.ProxyHandler({"http": proxy_url, "https": proxy_url})
-    else:
-        handler = urllib.request.ProxyHandler()
-
-    opener = urllib.request.build_opener(handler)
-    for url in constants.EGRESS_IP_SERVICES:
-        try:
-            with opener.open(url, timeout=5) as resp:
-                text = resp.read().decode("utf-8", "ignore").strip()
-                try:
-                    return str(ipaddress.ip_address(text))
-                except ValueError:
-                    continue
-        except Exception:
-            continue
-    return ""
 
 
 @dataclasses.dataclass
@@ -675,19 +650,6 @@ class ConfigLoader:
             timezone=_get_val(m_raw, "timezone", os.environ.get("MUSE_TIMEZONE") or constants.DEFAULT_MUSE_TIMEZONE),
             proxy=m_raw.get("proxy", "worker"),
         )
-
-        # Worker egress is not the bridge's egress. Never probe third parties in
-        # Worker mode; set muse.client_ip explicitly if needed.
-        if not muse_cfg.client_ip and muse_cfg.proxy != "worker":
-            if muse_cfg.proxy == "http":
-                if network_cfg.proxy_url:
-                    detected = _detect_egress_ip(network_cfg.proxy_url, False)
-                    if detected:
-                        muse_cfg.client_ip = detected
-            else:
-                detected = _detect_egress_ip(None, True)
-                if detected:
-                    muse_cfg.client_ip = detected
 
         # 2. Group-capable adapters share one field set.
         adapters_raw = raw_data.get("adapters", {})

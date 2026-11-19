@@ -197,13 +197,13 @@ class PushSubscription:
 
 
 class MuseClient:
-    def __init__(self, token, notary_token, vm_id, client_ip,
+    def __init__(self, token, notary_token, vm_id, client_ip="",
                  host="hatch.metaaivm.com",
-                 timezone="Asia/Shanghai", *, route: NetworkRoute | None = None):
-        # vm_id and client_ip are required, with no defaults: they are
-        # deployment values (your VM, your egress IP), not library
-        # constants. host is the shared service endpoint and timezone a
-        # generic default; both are overridable.
+                 timezone="Asia/Shanghai", *, route: NetworkRoute | None = None,
+                 client_ip_provider=None):
+        # vm_id is required with no default (it is a deployment value).
+        # client_ip is optional: if omitted, chat.stream omits the field
+        # unless client_ip_provider supplies a cached IP (matching muse.ai).
         self.token = token
         self.notary_token = notary_token
         self.vm_id = vm_id
@@ -211,6 +211,7 @@ class MuseClient:
         self.client_ip = client_ip
         self.timezone = timezone
         self.route = route or DIRECT_ROUTE
+        self._client_ip_provider = client_ip_provider
         self._ws = None
         self._send_cs = None
         self._recv_cs = None
@@ -435,14 +436,20 @@ class MuseClient:
         then shows it as "[image:<mime> <media_library path>]" with
         metadata.message_kind "message_parts". With no attachments the
         body is exactly the old text-only shape."""
+        client_ip = self.client_ip
+        if not client_ip:
+            provider = getattr(self, "_client_ip_provider", None)
+            if provider is not None:
+                client_ip = provider() or ""
         payload = {
             "node_id": str(uuid.uuid4()),
             "capabilities": DEFAULT_CAPABILITIES,
             "session_id": session_id,
-            "client_ip": self.client_ip,
             "timezone": self.timezone,
             "metadata": {"thread_is_dictation_used": False},
         }
+        if client_ip:
+            payload["client_ip"] = client_ip
         # Verified against the web client's chat.stream request builder.
         if in_reply_to:
             payload["in_reply_to"] = in_reply_to

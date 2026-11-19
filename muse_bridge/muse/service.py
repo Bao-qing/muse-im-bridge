@@ -21,6 +21,7 @@ from ..network import DIRECT_ROUTE, NetworkRoute
 from ..observability import get_logger, trace_event
 from .token_manager import MuseTokenManager
 from .interactions import ApprovalBlocked, MuseInteractions
+from .routing import ClientIPResolver
 
 
 logger = get_logger(__name__)
@@ -33,6 +34,14 @@ class MuseService:
         token_route = getattr(token_manager, "route", None)
         self.route = route if isinstance(route, NetworkRoute) else (
             token_route if isinstance(token_route, NetworkRoute) else DIRECT_ROUTE
+        )
+        raw_base = getattr(token_manager, "real_base_url", None)
+        base_url = raw_base if isinstance(raw_base, str) and raw_base.strip() else "https://muse.ai"
+        self._client_ip_resolver = ClientIPResolver(
+            cookie_provider=lambda: self.token_manager.load_cookie_string(),
+            route=self.route,
+            configured_ip=config.client_ip,
+            base_url=base_url,
         )
         self.interactions = InteractionManager()
         self.interaction_protocol = MuseInteractions(self)
@@ -65,6 +74,7 @@ class MuseService:
             client_ip=self.config.client_ip,
             timezone=self.config.timezone,
             route=self.route,
+            client_ip_provider=self._client_ip_resolver.get,
         )
 
         orig_connect = client.connect

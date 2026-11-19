@@ -12,11 +12,11 @@ python main.py --config config.json --wechat-login
 python main.py --config config.json --wechat-status
 ```
 
-两个命令在完整 `ConfigLoader.load()` 之前分流，使用 `ConfigLoader.load_wechat()`：只读取配置和 `const.json`，不初始化 Muse、不读取 Muse Cookie、不探测出口 IP。配置仍采用工作目录中的 `config.json` / `credentials.json` 默认候选及 `const.json` 底层合并规则；显式配置覆盖 const，顶层 overrides 优先。不会自动启动登录。`--login` 保持 Muse 登录用途，三个登录/状态开关互斥。
+两个命令在完整 `ConfigLoader.load()` 之前分流，使用 `ConfigLoader.load_wechat()`：只读取配置和 `const.json`，不初始化 Muse、不读取 Muse Cookie。配置仍采用工作目录中的 `config.json` / `credentials.json` 默认候选及 `const.json` 底层合并规则；显式配置覆盖 const，顶层 overrides 优先。不会自动启动登录。`--login` 保持 Muse 登录用途，三个登录/状态开关互斥。
 
 扫码展示将 auth 提供的字符串直接编码为终端 ASCII 二维码，不下载二维码图片或访问展示 URL；依赖 `qrcode>=8.0`，不需要 Pillow。验证输入使用 `getpass` 隐藏回显；auth 状态回调只显示固定提示，不输出票据、验证地址或原始服务端 payload。成功后调用 `WeChatState.save_account(credentials)` 保存并激活账号。失败和取消不会打印认证详情。
 
-`--wechat-status` 只消费 `WeChatState.status()` 的脱敏摘要，不输出 credentials 或 token。它不连接微信，不证明 token 远端有效。`--check` 同时显示此本地摘要；完整配置校验保留已有 Muse 出口 IP 探测语义。没有本地凭据时，运行适配器会提示显式执行 `--wechat-login`，不在后台自动重扫码。
+`--wechat-status` 只消费 `WeChatState.status()` 的脱敏摘要，不输出 credentials 或 token。它不连接微信，不证明 token 远端有效。`--check` 同时显示此本地摘要，离线校验全部配置而不发起网络探测。没有本地凭据时，运行适配器会提示显式执行 `--wechat-login`，不在后台自动重扫码。
 
 ## 配置与账号隔离
 

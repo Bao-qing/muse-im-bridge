@@ -3,6 +3,7 @@ import asyncio
 import json
 from pathlib import Path
 import tempfile
+import threading
 import unittest
 from unittest.mock import MagicMock, patch
 
@@ -29,7 +30,15 @@ from muse_bridge.muse.client.client import MuseClient
 from muse_bridge.muse.client.errors import CredentialRefreshError, HandshakeError
 from muse_bridge.muse.client.transport import WS
 from muse_bridge.muse.login import MuseProtocolLogin
-from muse_bridge.muse.routing import auth_url, cookie_domain, http_base, muse_http_client, muse_http_hooks
+from muse_bridge.muse.routing import (
+    ClientIPResolver,
+    auth_url,
+    cookie_domain,
+    fetch_client_ip,
+    http_base,
+    muse_http_client,
+    muse_http_hooks,
+)
 from muse_bridge.muse.service import MuseService
 from muse_bridge.muse.token_manager import MuseTokenManager
 from muse_bridge.network import DIRECT_ROUTE, NetworkRoute, resolve_route, validate_app_network, worker_url
@@ -115,32 +124,18 @@ class NetworkConfigTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "adapters.telegram"):
             validate_app_network(cfg_enabled_tg)
 
-    def test_egress_detection_respects_muse_proxy_mode(self):
+    def test_config_loader_does_not_probe_egress_ip(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "config.json"
-            path.write_text(json.dumps({
-                "network": {"worker": {"base": BASE}},
-                "muse": {"proxy": "worker"},
-            }), encoding="utf-8")
-            with patch("muse_bridge.config.models._detect_egress_ip") as detect:
-                cfg = ConfigLoader.load(str(path))
-            detect.assert_not_called()
-            self.assertEqual(cfg.muse.client_ip, "")
-
-            path.write_text(json.dumps({
-                "network": {"proxy_url": "http://127.0.0.1:7890"},
-                "muse": {"proxy": "http"},
-            }), encoding="utf-8")
-            with patch("muse_bridge.config.models._detect_egress_ip", return_value="203.0.113.4") as detect:
-                cfg = ConfigLoader.load(str(path))
-            detect.assert_called_once_with("http://127.0.0.1:7890", False)
-            self.assertEqual(cfg.muse.client_ip, "203.0.113.4")
-
-            path.write_text(json.dumps({"muse": {"proxy": "none"}}), encoding="utf-8")
-            with patch("muse_bridge.config.models._detect_egress_ip", return_value="203.0.113.5") as detect:
-                cfg = ConfigLoader.load(str(path))
-            detect.assert_called_once_with(None, True)
-            self.assertEqual(cfg.muse.client_ip, "203.0.113.5")
+            for raw in (
+                {"network": {"worker": {"base": BASE}}, "muse": {"proxy": "worker"}},
+                {"network": {"proxy_url": "http://127.0.0.1:7890"}, "muse": {"proxy": "http"}},
+                {"muse": {"proxy": "none"}},
+            ):
+                with self.subTest(raw=raw):
+                    path.write_text(json.dumps(raw), encoding="utf-8")
+                    cfg = ConfigLoader.load(str(path))
+                    self.assertEqual(cfg.muse.client_ip, "")
 
     def test_manage_registered_fields_match_dataclasses(self):
         import dataclasses
@@ -265,6 +260,98 @@ class MuseRoutingTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "escaped"):
             guard(httpx.Request("GET", "https://muse.ai/"))
         guard(httpx.Request("GET", MUSE_PREFIX + "/"))
+
+    def test_fetch_client_ip_routes_and_validation(self):
+        seen = []
+
+        def handler(request):
+            seen.append((str(request.url), request.headers.get("cookie")))
+            return httpx.Response(200, json={"ip": "203.0.113.9"})
+
+        worker_route = NetworkRoute(mode="worker", worker_base=BASE, worker_http=True, worker_ws=True)
+        self.assertEqual(
+            fetch_client_ip("hatch_sess=abc", DIRECT_ROUTE, transport=httpx.MockTransport(handler)),
+            "203.0.113.9",
+        )
+        self.assertEqual(
+            fetch_client_ip("hatch_sess=abc", worker_route, transport=httpx.MockTransport(handler)),
+            "203.0.113.9",
+        )
+        self.assertEqual(seen, [
+            ("https://muse.ai/api/client-ip", "hatch_sess=abc"),
+            (MUSE_PREFIX + "/api/client-ip", "hatch_sess=abc"),
+        ])
+
+        # Empty cookie skips network entirely.
+        called = False
+
+        def fail_handler(request):
+            nonlocal called
+            called = True
+            return httpx.Response(200, json={"ip": "203.0.113.9"})
+
+        self.assertEqual(fetch_client_ip("", DIRECT_ROUTE, transport=httpx.MockTransport(fail_handler)), "")
+        self.assertFalse(called)
+
+        # Non-200, invalid JSON, or invalid IP return "" silently.
+        for resp in (
+            httpx.Response(401, json={"error": "Authentication required"}),
+            httpx.Response(200, text="not-json"),
+            httpx.Response(200, json={"ip": "not-an-ip"}),
+            httpx.Response(200, json={}),
+        ):
+            with self.subTest(status=resp.status_code, body=resp.text):
+                self.assertEqual(
+                    fetch_client_ip("hatch_sess=abc", DIRECT_ROUTE, transport=httpx.MockTransport(lambda _: resp)),
+                    "",
+                )
+
+    def test_client_ip_resolver_lazy_single_flight_and_send_message_omission(self):
+        # Explicit configured IP never triggers network fetch.
+        explicit_fetcher = MagicMock(return_value="203.0.113.99")
+        explicit = ClientIPResolver(lambda: "hatch_sess=abc", configured_ip="198.51.100.7", fetcher=explicit_fetcher)
+        self.assertEqual(explicit.get(), "198.51.100.7")
+        explicit_fetcher.assert_not_called()
+
+        # Lazy single-flight warm-up + cache reuse.
+        started = threading.Event()
+        release = threading.Event()
+        calls = 0
+
+        def slow_fetcher(cookie, route, *, base_url, timeout):
+            nonlocal calls
+            calls += 1
+            started.set()
+            release.wait(timeout=2.0)
+            return "203.0.113.42"
+
+        resolver = ClientIPResolver(lambda: "hatch_sess=abc", fetcher=slow_fetcher)
+        client = MuseClient("t", "n", "vm", "", client_ip_provider=resolver.get)
+        client.request = MagicMock(return_value=b'{"message_id":"m1"}')
+
+        # First send is non-blocking and omits client_ip while warming cache.
+        client.send_message("sid", "hello")
+        first_payload = json.loads(client.request.call_args.args[2])
+        self.assertNotIn("client_ip", first_payload)
+        self.assertTrue(started.wait(timeout=2.0))
+
+        # Concurrent call while in flight deduplicates without starting a second fetch.
+        self.assertEqual(resolver.get(), "")
+        release.set()
+
+        # Wait briefly for background thread to store cached IP.
+        for _ in range(50):
+            if resolver.peek():
+                break
+            threading.Event().wait(0.01)
+        self.assertEqual(resolver.peek(), "203.0.113.42")
+        self.assertEqual(calls, 1)
+
+        # Next send includes cached client_ip synchronously.
+        client.send_message("sid", "world")
+        second_payload = json.loads(client.request.call_args.args[2])
+        self.assertEqual(second_payload["client_ip"], "203.0.113.42")
+        self.assertEqual(calls, 1)
 
     def test_token_http_calls_route_through_worker_and_never_retry_direct(self):
         route = NetworkRoute(mode="worker", worker_base=BASE, worker_http=True)

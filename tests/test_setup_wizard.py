@@ -429,8 +429,7 @@ class TestManageConsoleAndWizardV2(unittest.TestCase):
 
             # Generated config must load cleanly via ConfigLoader without errors
             from muse_bridge.config.models import ConfigLoader
-            with mock.patch("muse_bridge.config.models._detect_egress_ip", return_value="127.0.0.1"):
-                loaded = ConfigLoader.load(out_file)
+            loaded = ConfigLoader.load(out_file)
             self.assertFalse(loaded.qq.enabled)
             self.assertTrue(loaded.telegram.enabled)
 

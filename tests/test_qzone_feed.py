@@ -364,9 +364,7 @@ class TestQzoneAndGatewayFeedConfig(unittest.TestCase):
             self.assertEqual(QzoneFeedConfig(ugc_right=permission).ugc_right, permission)
 
     def test_loader_accepts_fields_and_rejects_unknown_or_coerced_values(self):
-        with tempfile.TemporaryDirectory() as directory, \
-                mock.patch("muse_bridge.config.models._detect_egress_ip",
-                           side_effect=AssertionError("must not detect egress")) as detect:
+        with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "config.json"
             original_exists = __import__("os").path.exists
             with mock.patch("muse_bridge.config.models.os.path.exists",
@@ -389,7 +387,6 @@ class TestQzoneAndGatewayFeedConfig(unittest.TestCase):
                 }), encoding="utf-8")
                 gw_loaded = ConfigLoader.load(str(path)).gateway.feed
                 self.assertEqual(gw_loaded.targets, {"qq": "chat", "onebot": "native"})
-            detect.assert_not_called()
 
 
 if __name__ == "__main__":

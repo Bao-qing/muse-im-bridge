@@ -46,7 +46,7 @@
 - `adapters.qq.proxy` / `adapters.onebot.proxy` / `adapters.wechat.proxy`：`"none"`
 
 说明：
-- `muse.proxy == "worker"` 时，空 `client_ip` 不会触发 `api.ipify.org` 等第三方出口 IP 探测。
+- `muse.client_ip` 留空时，不再在启动加载配置阶段连接第三方公网探测服务，而是在首次向 Muse 发消息时按当前 `muse.proxy` 路由异步请求同源 `GET https://muse.ai/api/client-ip`（3 秒超时并内存缓存，未就绪或失败时省略 `client_ip` 字段）。
 - QQ 适配器特有的 `download_proxy`（腾讯附件 CDN URL 前缀改写）属于适配器自身逻辑，不进入 `network` 层。
 - Worker 转发不会在失败时静默回退到直连。
 

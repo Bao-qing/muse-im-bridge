@@ -24,9 +24,6 @@ class TestWeChatConfig(unittest.TestCase):
         cwd = os.getcwd()
         os.chdir(self.tmp.name)
         self.addCleanup(os.chdir, cwd)
-        patch = mock.patch("muse_bridge.config.models._detect_egress_ip", return_value="")
-        self.detect = patch.start()
-        self.addCleanup(patch.stop)
 
     def load(self, settings=None, **top):
         path = Path(self.tmp.name) / "config.json"
@@ -66,7 +63,6 @@ class TestWeChatConfig(unittest.TestCase):
     def test_offline_loader_ignores_unrelated_muse_and_logging(self):
         cfg = self.load({"enabled": True}, muse={"approval": "bad"}, logging="bad")
         self.assertTrue(cfg.enabled)
-        self.detect.assert_not_called()
 
     def test_full_loader_wires_wechat_without_policy(self):
         self.load({"enabled": True, "admin_id": ["obsolete"]})
@@ -82,7 +78,6 @@ class TestWeChatConfig(unittest.TestCase):
         self.assertEqual(cfg.channel_version, "user")
         self.assertEqual(cfg.chunk_chars, 3000)
         self.assertFalse(hasattr(cfg, "admin_only"))
-        self.detect.assert_not_called()
         self.assertEqual(ConfigLoader.load(str(Path(self.tmp.name) / "config.json")).wechat, cfg)
 
     def test_old_serialized_policy_is_explicitly_discarded(self):
