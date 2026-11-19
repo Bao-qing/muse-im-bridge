@@ -409,7 +409,7 @@ QQ 与 OneBot 适配器中每个群、每个私聊用户各自绑定一个 Muse 
 - **Muse → 渠道**：官方 QQ 使用 `message_reference.message_id`，优先选择不透明的 `REFIDX`；OneBot 使用 Array `reply` 段。原生引用与 QQ 被动回复授权 `msg_id` / `msg_seq` 分开处理。每个成功发送的文本分段、图片和视频都记录消息 ID。
 - **仅原消息查不到时降级**：当前聊天没有对应原消息时，用文字标明「原消息在此聊天不可用」，不会拿另一个群或会话的文本代替。原生引用 API 报错不会改发文字引用；引用导致 Muse 返回查无消息时，也不会自动重建会话或重发。
 - **文件**：OneBot 的 `upload_*_file` 不返回可引用的聊天消息 ID，因此附发一条可原生引用的「【文件】文件名」说明。回复该说明可关联到原来的 Muse 展示卡；不把文件 ID 冒充消息 ID。
-- **点赞及其他反应**：同时处理 Muse 历史的 `reaction_emoji` 和实时 `reactions.updated`，将新增/取消反应转换为引用原消息的「【Muse 反应】」/「【Muse 取消反应】」消息。反应独立于原消息投递去重；启动基线不重放旧反应，重复和乱序的实时更新不重复推送。
+- **点赞及其他反应**：同时处理 Muse 历史的 `reaction_emoji` 和实时 `reactions.updated`；不支持原生反应的渠道（以及 Telegram 73 个固定表情之外的回落）会将反应转换为纯文本通知发送。各适配器均可在自身配置下独立设置 `reaction_quote`（默认 `false`），用于控制回落为普通消息发送的 reaction 是否引用原消息（默认不引用，使消息列表更干净；不影响 Telegram 原生 `setMessageReaction`）。反应独立于原消息投递去重；启动基线不重放旧反应，重复和乱序的实时更新不重复推送。
 - **持久化**：引用索引和反应状态保存在 `<routes_file>.references.local.json`，最多保留各 4096 条记录及每条 240 字符的普通消息摘要。官方 QQ 按应用隔离，OneBot 按接口地址及登录账号隔离；文件不保存凭证输入或完整原始事件，应与其他本地状态一样妥善保管，不提交仓库。
 
 ## OneBot (NapCat) 适配器
@@ -478,7 +478,7 @@ Telegram 默认关闭，仅支持官方 Bot API **长轮询**，不需要公网�
 - 测普通群时，在 `whitelist` 加入 Telegram **带负号的群 ID**（值为允许的数字用户 ID 列表，或明确写 `"*"` 放行全群）。`at` 处理可见的 `@bot`、针对本 bot 的命令或已关联的引用；Telegram Privacy Mode 可能不提交普通群消息，由平台决定，桥接配置不会扩大可见范围。暂不处理频道、论坛话题或消息编辑。
 - 支持纯文本、图片、文件、视频和原生回复引用。媒体受 Bot API 与本项目配置中较低的限制；图片、文件或视频附件需有可用文件内容。轮询状态保存在 `routes_file` 旁并按 bot ID 隔离；确定未提交的消息可重试，崩溃时结果不明的消息不会重放。
 - 机器人通过 `muse_bridge/adapters/telegram/markdown.py` 将常见 Markdown（`**粗体**`、`*斜体*`、`~~删除线~~`、`||剧透||`、行内代码、代码块、链接、标题、引用、列表和表格）解析为 Telegram `text + entities`（UTF-16 偏移）发送，不需要额外依赖或字符转义。网关要求纯文本时不解析；纯文本引用兜底保持字面内容。若某段仍被 Telegram 拒绝实体格式，仅该段改用纯文本重发。
-- 适配器与网关已打通双向 reaction：用户在 Telegram 给当前会话的消息点 emoji 反应，会经 `POST /reactions/toggle` 同步给 Muse（不回弹重复通知）；Muse 下发的反应会通过 `setMessageReaction` 原生贴在对应的 Telegram 消息上；Bot API 只接受固定的 73 种反应，列表外的 emoji 改用引用原消息的纯文本通知发送（其余渠道始终走这种引用通知）。
+- 适配器与网关已打通双向 reaction：用户在 Telegram 给当前会话的消息点 emoji 反应，会经 `POST /reactions/toggle` 同步给 Muse（不回弹重复通知）；Muse 下发的反应会通过 `setMessageReaction` 原生贴在对应的 Telegram 消息上；Bot API 只接受固定的 73 种反应，列表外的 emoji 改用纯文本通知发送（其余渠道始终走这种回落通知），默认不引用原消息，可在各适配器配置中设 `reaction_quote: true` 开启引用。
 
 ## 微信 iLink 适配器
 

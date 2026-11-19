@@ -94,9 +94,9 @@ class TelegramSender:
                 or any(not isinstance(emoji, str) or not emoji.strip() for emoji in reactions)):
             return DeliveryResult(DeliveryStatus.REJECTED, reason="Invalid Telegram reaction target or state")
         if not supports_native_reaction(reactions):
-            # Bot API rejects emoji outside its fixed set, so quote the original
-            # message instead of losing the reaction.
-            return await self.deliver(reaction_as_delivery(envelope))
+            # Bot API rejects emoji outside its fixed set, so fall back to a
+            # plain-text message instead of losing the reaction.
+            return await self.deliver(reaction_as_delivery(envelope, quote=self.config.reaction_quote))
 
         async def send():
             try:

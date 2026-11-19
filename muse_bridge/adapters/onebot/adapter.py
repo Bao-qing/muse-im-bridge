@@ -118,7 +118,7 @@ class OneBotAdapter(BaseAdapter):
         return await self.sender.deliver(envelope)
 
     async def deliver_reaction(self, envelope: ReactionEnvelope) -> DeliveryResult:
-        return await self.deliver(reaction_as_delivery(envelope))
+        return await self.deliver(reaction_as_delivery(envelope, quote=self.config.reaction_quote))
 
     def activity_started(self, target: str, token: str, *, kind: str = "private") -> None:
         if kind != "private" or not self.config.typing_enabled or not target:

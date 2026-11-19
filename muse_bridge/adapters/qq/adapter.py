@@ -52,7 +52,7 @@ class QQAdapter(BaseAdapter):
         return await self.sender.deliver(envelope)
 
     async def deliver_reaction(self, envelope: ReactionEnvelope):
-        return await self.deliver(reaction_as_delivery(envelope))
+        return await self.deliver(reaction_as_delivery(envelope, quote=self.config.reaction_quote))
 
     @property
     def name(self) -> str:

@@ -463,16 +463,36 @@ class TelegramAdapterTests(unittest.IsolatedAsyncioTestCase):
             ("setMessageReaction", {"chat_id": USER_ID, "message_id": 42, "reaction": []}),
         ])
 
-    async def test_unsupported_emoji_falls_back_to_quoted_message(self):
+    async def test_unsupported_emoji_falls_back_according_to_reaction_quote(self):
+        # Default (reaction_quote=False): send plain emoji without quoting original message.
         adapter = self.adapter()
-        env = ReactionEnvelope("fallback", "private", str(USER_ID), ("id", "123:42"),
+        env = ReactionEnvelope("fallback-unquoted", "private", str(USER_ID), ("id", "123:42"),
                                ("😮",), added=("😮",))
         self.assertTrue((await adapter.deliver_reaction(env)).confirmed)
+        self.assertEqual(self.requests[-1], ("sendMessage", {
+            "chat_id": USER_ID, "text": "😮",
+        }))
+        self.assertNotIn("setMessageReaction", [method for method, _ in self.requests])
+
+        # Opt-in (reaction_quote=True): quote original message when falling back.
+        quoted_adapter = self.adapter(reaction_quote=True)
+        env_q = ReactionEnvelope("fallback-quoted", "private", str(USER_ID), ("id", "123:42"),
+                                 ("😮",), added=("😮",))
+        self.assertTrue((await quoted_adapter.deliver_reaction(env_q)).confirmed)
         self.assertEqual(self.requests[-1], ("sendMessage", {
             "chat_id": USER_ID, "text": "😮",
             "reply_parameters": {"message_id": 42, "allow_sending_without_reply": True},
         }))
         self.assertNotIn("setMessageReaction", [method for method, _ in self.requests])
+
+        # Native reactions remain unaffected regardless of reaction_quote.
+        self.responses["setMessageReaction"] = [ok(True)]
+        native_env = ReactionEnvelope("native-quoted", "private", str(USER_ID), ("id", "123:42"), ("👍",))
+        self.assertTrue((await quoted_adapter.deliver_reaction(native_env)).confirmed)
+        self.assertEqual(self.requests[-1], ("setMessageReaction", {
+            "chat_id": USER_ID, "message_id": 42,
+            "reaction": [{"type": "emoji", "emoji": "👍"}],
+        }))
 
     async def test_supported_emoji_forms_use_native_reaction(self):
         adapter = self.adapter()

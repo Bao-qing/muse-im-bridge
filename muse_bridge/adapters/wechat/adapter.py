@@ -198,7 +198,11 @@ class WeChatAdapter(BaseAdapter):
         return await self.transport.deliver(envelope)
 
     async def deliver_reaction(self, envelope: ReactionEnvelope):
-        return await self.deliver(reaction_as_delivery(envelope))
+        delivery = reaction_as_delivery(envelope, quote=self.config.reaction_quote)
+        if self.config.reaction_quote and delivery.quote and not delivery.quote_fallback:
+            excerpt = delivery.quote.excerpt or "[非文本消息]"
+            delivery.quote_fallback = "【引用】" + excerpt.replace("\n", "\n> ") + "\n"
+        return await self.deliver(delivery)
 
     def activity_started(self, target, token, *, kind="private"):
         if kind != "private" or not self.config.typing_enabled:

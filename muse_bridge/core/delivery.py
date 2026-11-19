@@ -52,8 +52,13 @@ class ReactionEnvelope:
     fallback_target: str | None = None
 
 
-def reaction_as_delivery(envelope: ReactionEnvelope) -> DeliveryEnvelope:
-    """Render a ReactionEnvelope as a quoted plain-text message for chat platforms."""
+def reaction_as_delivery(envelope: ReactionEnvelope, *, quote: bool = False) -> DeliveryEnvelope:
+    """Render a ReactionEnvelope as a plain-text message for chat platforms.
+
+    When ``quote`` is True, keep the original message quote (or its text
+    fallback). When ``quote`` is False (default), omit quoting so fallback
+    reactions keep the chat list clean.
+    """
     parts = []
     if envelope.added:
         parts.append(" ".join(envelope.added))
@@ -61,9 +66,13 @@ def reaction_as_delivery(envelope: ReactionEnvelope) -> DeliveryEnvelope:
         parts.append(" ".join(envelope.removed))
     if not parts and envelope.reactions:
         parts.append(" ".join(envelope.reactions))
-    quote = envelope.quote
-    if quote is None and envelope.message_ref and envelope.message_ref[0] and envelope.message_ref[1]:
-        quote = NativeQuote((envelope.message_ref,))
+    native_quote = None
+    quote_fallback = ""
+    if quote:
+        native_quote = envelope.quote
+        if native_quote is None and envelope.message_ref and envelope.message_ref[0] and envelope.message_ref[1]:
+            native_quote = NativeQuote((envelope.message_ref,))
+        quote_fallback = envelope.quote_fallback
     return DeliveryEnvelope(
         delivery_id=envelope.delivery_id,
         target_type=envelope.target_type,
@@ -71,10 +80,10 @@ def reaction_as_delivery(envelope: ReactionEnvelope) -> DeliveryEnvelope:
         text="\n".join(parts),
         purpose="notification",
         passive_id=envelope.passive_id,
-        quote=quote,
-        quote_fallback=envelope.quote_fallback,
+        quote=native_quote,
+        quote_fallback=quote_fallback,
         plain_text=True,
-        fallback_target=envelope.fallback_target,
+        fallback_target=envelope.fallback_target if quote else None,
     )
 
 
