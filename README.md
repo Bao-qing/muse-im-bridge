@@ -1,93 +1,141 @@
-# Muse im Bridge
+<p align="center">
+  <img src="assets/logo.svg" width="90" height="90" alt="Muse IM Bridge" />
+</p>
 
-Muse im Bridge 是一 Muse 助理消息桥接系统。支持将 Muse 虚拟助理接入到 **QQ 官方机器人**、**OneBot (推荐 NapCat)** 和 **微信 iLink（OpenClaw 渠道，仅私聊）**。微信直接使用 HTTP 长轮询，无需第三方网关。
+<h1 align="center">Muse IM Bridge</h1>
 
-> **非官方项目**：本项目与 Muse、腾讯 QQ 无隶属关系，接入方式依赖对网页端协议的逆向分析，可能违反目标平台的服务条款，也可能随服务端更新而失效，使用风险自负。
+<p align="center">
+  <strong>多平台 Muse 消息桥接网关</strong><br/>
+  统一接入 QQ 官方机器人、OneBot v11、Telegram Bot 与微信 iLink
+</p>
 
----
+<p align="center">
+  <img src="https://img.shields.io/badge/Python-3.11%2B-3776AB?logo=python&logoColor=white" alt="Python 3.11+" />
+  <img src="https://img.shields.io/badge/License-MIT-green.svg" alt="MIT License" />
+  <img src="https://img.shields.io/badge/Platforms-QQ%20%7C%20OneBot%20%7C%20Telegram%20%7C%20WeChat-blue" alt="Supported Platforms" />
+</p>
 
-## 目录结构
-
-```
-muse_bridge/
-├── main.py                   # 主程序入口（加载配置、初始化引擎、优雅启停）
-├── config.example.json       # 用户配置文件模板（无敏感信息，复制为 config.json）
-├── muse_bridge/              # 核心框架包
-│   ├── config/               # 配置系统（分清用户凭据与程序默认值，支持覆盖）
-│   │   ├── constants.py      # 程序默认常量（超时、限制、时区、域名）
-│   │   └── models.py         # 配置模型与深层合并加载器
-│   ├── core/                 # 领域核心
-│   │   ├── message.py        # 统一消息定义（Inbound/Outbound/Attachment/Markdown分块）
-│   │   ├── deduplicator.py   # 3状态消息去重
-│   │   └── commands.py       # 通用斜杠指令层（/会话, /切换, /新建 等）
-│   ├── muse/                 # Muse 独立业务服务层
-│   │   ├── client/           # 底层 Noise_XX 加密协议与 WebSocket 传输客户端
-│   │   ├── token_manager.py  # 自动凭证推导与静默续期（cookies -> vm_id -> mint）
-│   │   └── service.py        # 会话交互、附件处理、工作区文件读写、主动事件流订阅
-│   ├── gateway/              # 与平台无关的 Gateway 层（对接 Muse）
-│   │   ├── runtime.py        # UnifiedGateway：挂载适配器、账号隔离、串行入站与生命周期
-│   │   ├── inbound.py        # 所有平台共用的命令、交互与 Muse 提交流水线
-│   │   ├── chat.py           # 网关拥有的账号上下文与业务仓库，不是适配器基类
-│   │   ├── muse_events.py    # 单一 Muse 订阅协调器、会话并集、独立投递队列
-│   │   ├── feed.py           # Muse 个人动态统一轮询、限流、预留账本与跨平台分发
-│   │   ├── delivery.py       # 因果路由、投递账本、真实平台回执关联
-│   │   ├── outbound.py       # Muse 历史处理、呈现渲染与订阅协议实现
-│   │   ├── interactions.py   # 登录、凭证、审批数字回复的输入路由
-│   │   ├── access.py         # 白名单申请与本地审批
-│   │   └── routes.py         # Muse 消息 ID -> 聊天目的地
-│   ├── adapters/             # 平台适配器（只负责解析事件与调用平台 API）
-│   │   ├── base.py           # BaseAdapter 抽象基类
-│   │   ├── qq/               # QQ 官方机器人适配器
-│   │   │   ├── adapter.py    # QQAdapter：解析 QQ 事件、被动/主动回复
-│   │   │   ├── client.py     # QQ OpenAPI 客户端（鉴权、发消息、上传富媒体）
-│   │   │   ├── gateway.py    # QQ WebSocket 事件源（心跳与事件分发）
-│   │   │   ├── outbound.py   # QQSender：被动序号、主动配额、富媒体上传与明确投递结果
-│   │   │   └── ws_transport.py # 兼容 QQ 101 Connection:close 的底层 WS 客户端
-│   │   └── onebot/           # OneBot v11 (NapCat) 适配器
-│   │       ├── adapter.py    # OneBotAdapter：消息段解析、可信账号身份、自身消息过滤
-│   │       ├── client.py     # NapCat HTTP API 客户端（Array 消息段、retcode 校验）
-│   │       ├── gateway.py    # NapCat 正向 WebSocket 事件源（退避重连）
-│   │       └── outbound.py   # OneBotSender：文本分段、原生引用、base64 媒体与文件上传
-│   └── engine.py             # BridgeEngine 协调调度引擎
-├── tools/
-│   └── export_cookies.js     # 网页端 Cookie 一键导出辅助工具
-└── tests/
-    └── test_bridge.py       
-```
+> [!CAUTION]
+> **非官方项目声明**：本项目与 Muse、腾讯 QQ / 微信、Telegram 等平台官方无任何隶属或合作关系。Muse 接入依赖对网页端协议的分析实现，可能随上游服务端变更而失效，也可能触及目标平台的服务条款。请仅用于本人自有账号与机器人测试，使用风险由使用者自行承担。
 
 ---
 
-## 核心设计与特性
+## 目录
 
-- **单一业务网关**：`BridgeEngine` 组装一个 `UnifiedGateway`，QQ、OneBot、微信适配器挂载其上，不再各自继承业务网关或运行 Muse 订阅。Muse 的 token、RPC 和交互协议仍由独立服务负责。
-- **严格入站顺序**：同一平台账号/聊天从附件下载前开始排队；已共享 Muse 会话的聊天还串行提交，避免后发文字和命令超车图片、视频。不使用全局大锁阻塞其他聊天。
-- **显式输入归属**：只有前台审批会阻塞所属会话；凭证卡、连接器密钥卡与后台审批均不阻塞聊天，必须引用对应卡片或使用显式命令才会进入处理流程，未引用时普通消息直接发给 Muse。
-- **保守投递语义**：区分确认、明确拒绝、部分完成和结果未知；未知/部分结果保留账本，不整包重放。平台原生引用、业务因果路由和被动回复权限分别处理。
+- [设计理念](#设计理念)
+- [核心特性](#核心特性)
+- [支持平台与能力矩阵](#支持平台与能力矩阵)
+  - [平台与系统限制说明](#平台与系统限制说明)
+- [快速开始](#快速开始)
+- [斜杠指令参考](#斜杠指令参考)
+- [平台接入指南](#平台接入指南)
+  - [QQ 官方机器人](#qq-官方机器人)
+  - [OneBot v11](#onebot-v11)
+  - [Telegram Bot API](#telegram-bot-api)
+  - [微信 iLink（仅私聊）](#微信-ilink仅私聊)
+- [核心机制说明](#核心机制说明)
+  - [会话隔离与投递路由](#会话隔离与投递路由)
+  - [白名单与动态访问申请](#白名单与动态访问申请)
+  - [登录、凭证、连接器密钥与审批交互](#登录凭证连接器密钥与审批交互)
+  - [双向消息引用与 Emoji 反应](#双向消息引用与-emoji-反应)
+  - [Muse 动态同步（Feed）](#muse-动态同步feed)
+- [配置与运维参考](#配置与运维参考)
+  - [全量配置参考](#全量配置参考)
+  - [环境变量](#环境变量)
+  - [日志与 JSONL 追踪](#日志与-jsonl-追踪)
+  - [运行状态文件](#运行状态文件)
+- [系统架构与项目结构](#系统架构与项目结构)
+- [开发与测试](#开发与测试)
+- [安全、隐私与免责声明](#安全隐私与免责声明)
+- [贡献与许可证](#贡献与许可证)
 
-架构边界、状态文件与升级/回退注意事项见 [统一网关说明](docs/unified-gateway.md)。
+---
+
+## 设计理念
+
+**在日常聊天软件中，完整覆盖 Muse 的日常使用体验。**
+
+Muse IM Bridge 致力于将 Muse 的完整交互闭环自然融入你常用的即时通讯工具中。除极少数特殊操作外，从日常对话、多会话切换、富媒体收发，到审批确认、凭证与连接器密钥填写、账号登录以及个人动态转发，全部流程均可直接在聊天软件内完成——无需频繁切回 Muse 网页端，真正实现零割裂、无缝衔接的日常使用体验。
+
+---
+
+## 核心特性
+
+- **单一统一网关架构**：`BridgeEngine` 装配单个 `UnifiedGateway`，所有平台适配器仅负责事件解析与平台 API 投递，共享统一的入站流水线、事件泵（`MuseEventPump`）、投递账本与动态协调器。
+- **严格入站顺序与账号隔离**：按 `(platform, account, chat)` 粒度加锁，附件下载前即开始排队；共享同一 Muse 会话的聊天进一步串行提交，防止文字/命令超车图片与视频，同时不阻塞其他会话。
+- **显式输入归属**：仅前台审批会阻塞所属会话；凭证卡、连接器密钥卡与后台审批均不阻塞聊天，必须通过引用对应卡片或显式斜杠指令进入填写，未引用时普通消息正常发往 Muse。
+- **保守投递语义与幂等账本**：明确区分 `confirmed`、`rejected`、`partial`、`unknown` 四种投递状态；对结果不明或部分完成的发送保留账本且不盲目整包重放，原生引用关联基于真实平台回执。
+- **完整交互协议支持**：支持在 IM 内完成 Muse 邮箱验证码登录、单/多字段凭证提交、连接器单行密钥注册，以及事件驱动的前台/后台审批队列与自动审批策略。
+- **一体化交互控制台**：内置 `manage.py`，覆盖首次引导向导、多渠道凭据即时校验、发消息认领管理员、Muse/微信登录、一键连通性体检与日常运维。
+- **统一网络代理与结构化可观测性**：通过顶层 `network` 收拢全部外发 HTTP/WS 路由，各模块独立选择直连（`none`）、HTTP 代理（`http`）或 Cloudflare Worker（`worker`），并提供脱敏运行日志与可选 JSONL 诊断追踪。
+
+---
+
+## 支持平台与能力矩阵
+
+| 能力                  |        QQ 官方机器人         | OneBot v11 |     Telegram Bot API      |            微信 iLink            |
+| :------------------ | :---------------------: | :-----------------: | :-----------------------: | :----------------------------: |
+| **接入方式**            |     官方 OpenAPI + WS     |  HTTP API + 正向 WS   |        Bot API 长轮询        |         iLink HTTP 长轮询         |
+| **私聊 / 群聊**         |         私聊 + 群聊         |       私聊 + 群聊       |          私聊 + 群聊          |              仅私聊               |
+| **图片 / 视频 / 文件**    |           支持            |         支持          |            支持             |               支持               |
+| **原生引用回复**          |    双向原生（含 `REFIDX`）     | 双向原生（Array `reply`） |           双向原生            | 入站原生（`ref_msg.msg_id`）/ 出站文本前缀 |
+| **双向 Emoji 反应**     |         回落文本通知          |       回落文本通知        |      双向原生（73 种）+ 回落       |             回落文本通知             |
+| **输入状态（正在输入）**      |            —            |        私聊支持         |             —             |              私聊支持              |
+| **Markdown 富文本渲染**  | **原生支持**（`msg_type: 2`） |         不支持         | **原生支持**（UTF-16 Entities） |            **原生支持**            |
+| **Muse 动态同步（Feed）** |         私聊图文推送          |   原生 QQ 空间 / 私聊推送   |             —             |             私聊图文推送             |
+
+### 平台与系统限制说明
+
+以下为各渠道及桥接层在协议或配置上的硬性限制与默认上限（未标注单位均为默认配置上限，可在对应适配器下微调，但无法突破平台侧硬上限）：
+
+| 维度 | QQ 官方机器人 | OneBot v11 | Telegram Bot API | 微信 iLink |
+| :--- | :--- | :--- | :--- | :--- |
+| **单条文本上限** | 默认 1200 字/段，单轮最多 8 段 | 默认 1200 字/段，单轮最多 8 段 | 平台硬上限 **4096 字符**/段（`min(4096, chunk_chars)`），默认 8 段 | 配置限制 **1–4000 字符**/段（默认 4000），默认 8 段 |
+| **图片大小上限** | 入站 / 出站 **8 MiB** | 入站 / 出站默认 **8 MiB** | 平台上传硬上限 **10 MiB**（配置默认 8 MiB）；下载硬上限 **20 MiB** | 配置默认 **8 MiB**（平台 CDN 上传硬上限 100 MiB） |
+| **文件大小上限** | 入站 / 出站 **25 MiB**（发送至 Muse 时 >2 MiB 自动走 `file_ref` 上传） | 入站 / 出站默认 **25 MiB**（不支持仅本机路径） | 平台上传硬上限 **50 MiB**（配置默认 25 MiB）；下载硬上限 **20 MiB** | 配置默认 **25 MiB**（平台 CDN 上传硬上限 100 MiB） |
+| **视频大小上限** | 入站下载 100 MiB / **出站上传硬限制 10 MiB** | 入站 100 MiB / 出站默认 **10 MiB**（`base64://` 受负载制约） | 平台上传硬上限 **50 MiB**（配置默认 10 MiB）；下载硬上限 **20 MiB** | 入站 100 MiB / 出站默认 **10 MiB**（平台 CDN 上传硬上限 100 MiB） |
+| **回复 / 推送配额** | 单条消息被动回复 **私聊 4 次 / 群聊 5 次**；耗尽后每轮最多消耗 **2 条**主动配额（受官方月/频次配额限制） | 无被动窗口，直接发送；群发被拒时带前缀转告首位管理员 | 仅支持 `getUpdates` 长轮询（`poll_timeout_s` 1–50s）；同一 Token 仅限单实例，不可与 Webhook 共存 | 收到 `-14` 状态码自动冷却 **1 小时**；发送结果不明时不自动重发以免重复 |
+| **群聊 / 媒体 / 协议边界** | 仅支持 C2C 私聊与群 `@机器人`；受阻 CDN 域名（如 `multimedia.nt.qq.com.cn`）需配置 `download_proxy` | QQ 空间同步需后端支持 SnowLuma `send_qzone_msg` 扩展；单条最多 9 图、视频仅取封面 | 不支持频道、论坛话题与消息编辑；群消息受 BotFather Privacy Mode 约束；仅 73 种表情支持原生 Reaction | **仅支持个人私聊**（无群聊、按钮、出站语音发送与消息编辑）；入站支持原生引用 ID，出站回退文本前缀；每次登录最多获取 3 次二维码 |
+
+**通用系统限制**：
+- **默认媒体上限来源**：除各平台硬限制外，通用默认值为图片 `8 MiB`、文件 `25 MiB`、入站视频 `100 MiB`、出站视频 `10 MiB`（可在适配器配置中分别通过 `max_image_bytes`、`max_file_bytes`、`max_video_bytes`、`max_video_upload_bytes` 调整，最终生效值为「本地配置与平台硬上限中的较小值」）。
+- **单实例与状态文件**：`data/` 下的映射、账本、水位与动态白名单文件均按单进程独占设计，**不支持多个网桥进程共用同一套状态文件或同一微信账号游标**。
+- **引用与缓存容量**：原生引用索引（`<routes_file>.references.local.json`）最多保留 **4096 条**记录及每条 **240 字符**消息摘要；服务重启后旧消息的交互卡片引用关联不保留，需通过 `/凭证`、`/密钥`、`/审批` 按编号查看处理。
+- **交互与申请时效**：登录与凭证临时输入态约 **5 分钟**自动过期（过期后 5 分钟内首条消息会被拦截一次防误发）；动态白名单申请间隔 ≥ 1 分钟、被拒后 10 分钟可重提、待办 7 天过期。
+- **安全与隐私边界**：通过 IM 传递的密码、私钥、验证码、API Key 均会经过对应聊天平台链路，高敏操作仍建议管理员私聊或直接在 Muse 网页端完成。
 
 ---
 
 ## 快速开始
 
-环境要求：Python 3.11 或更高版本。
+> [!TIP]
+> **部署环境建议**：由于需要连接 Muse 及可选的 Telegram，最推荐部署在海外服务器或 Docker 环境中；若部署在国内网络，可通过顶层 `network` 配置 HTTP(S) 代理，或参考 [Cloudflare Worker 部署指南](docs/worker-deployment.md) 使用 [`tools/cfproxy.js`](tools/cfproxy.js) 部署自有 Worker 转发（路由细节见 [统一网络代理与 Worker 传输说明](docs/worker-transport.md)）。
+>
+> 不建议直接部署在 Muse 虚拟机本机——Muse 虚拟机环境对 `muse.ai` 的访问存在限制，容易导致连接不稳定。
 
-可选网络传输：默认保留原路由，也可按 WS、普通 HTTPS、登录三个通道独立启用用户自有 Cloudflare Worker。配置示例、分阶段启用与退回步骤见 [Worker 传输说明](docs/worker-transport.md)。
+### 1. 环境要求
 
-### 1. 安装依赖
+- **Python 3.11** 或更高版本
+- 推荐使用虚拟环境（`venv` 或 [`uv`](https://docs.astral.sh/uv/)）
+
+### 2. 安装依赖
 
 ```bash
+git clone https://github.com/Bao-qing/muse-im-bridge.git
+cd muse-im-bridge
+
+# 方式 A：使用 pip
 pip install -e .
+
+# 方式 B：使用 uv
+uv sync
 ```
 
-### 2. 初始化与修改配置
+### 3. 初始化配置
 
-**方式一：日常控制台与首次引导向导（推荐）**
+#### 方式一：交互式控制台与首次引导（推荐）
 
-统一支持首次初始化引导与日常配置、登录、体检及启动：
-- **首次引导**：无配置时自动进入渠道配置列表，自由选择并即时校验 QQ / OneBot / Telegram / 微信 iLink，按渠道发消息认领管理员（支持跳过或手填），配置完可直接衔接 Muse 邮箱登录与网桥启动；
-- **微信精简引导**：进入微信后可直接扫码登录、查看本地状态或只调常用 2 项基础开关；私信不设管理员、白名单或访问申请。
-- **日常控制台**：有配置时展示当前状态面板，支持单渠道开关与重配、发消息随时新增管理员/群白名单、Muse/微信登录、一键连通性测试、全量高级设置、保存并启动网桥以及带自动备份的重新初始化。
+运行统一管理控制台，无配置时自动进入首次引导，有配置时展示日常运维状态面板：
 
 ```bash
 python manage.py
@@ -95,38 +143,161 @@ python manage.py
 python main.py --manage
 ```
 
-**方式二：手动从模板复制**
+控制台支持：
+- 自由启用并即时校验 **QQ 官方机器人 / OneBot / Telegram / 微信 iLink** 凭据；
+- 通过发消息实时认领管理员与群白名单（也支持跳过或手填）；
+- 微信精简扫码引导与状态查看；
+- 直接衔接 Muse 邮箱登录、一键连通性体检与启动网桥；
+- 带自动备份的重新初始化与全量高级参数调整。
 
-从模板复制并手动填写凭据：
+> [!TIP]
+> 直接运行 `python main.py` 时，若根目录不存在 `config.json` 或 `credentials.json`，也会自动提示进入首次引导向导。
+
+#### 方式二：手动从模板创建
 
 ```bash
 cp config.example.json config.json
 ```
 
+最小示例（按需启用对应适配器，其余项自动采用内置默认值）：
+
 ```json
 {
   "muse": {
-    "cookies_file": "cookies.json",
-    "session_id": "YOUR_MUSE_SESSION_ID"
+    "cookies_file": "cookies.json"
   },
   "adapters": {
     "qq": {
       "enabled": true,
       "app_id": "YOUR_QQ_APP_ID",
       "app_secret": "YOUR_QQ_APP_SECRET",
+      "admin_id": ["YOUR_ADMIN_OPENID"],
       "whitelist": {
-        "private": [
-          "YOUR_PRIVATE_OPENID"
-        ],
+        "private": ["YOUR_C2C_OPENID"],
         "YOUR_GROUP_OPENID": "*"
       }
-    },
+    }
+  }
+}
+```
+
+### 4. 登录 Muse 账号
+
+任选其一即可生成 `cookies.json`（网桥启动后会自动推导 `vm_id` 并静默续期 `.mint.json`）：
+
+1. **交互控制台登录（推荐）**：在 `python manage.py` 中直接选择 Muse 登录。
+2. **纯协议命令行登录（无需浏览器）**：
+   ```bash
+   python main.py --login
+   # 或使用独立工具指定邮箱与输出路径
+   python tools/login.py --config config.json --email "you@example.com" --output cookies.json
+   ```
+3. **浏览器导出**：在已登录的 `https://muse.ai` 页面打开开发者工具 Console，粘贴运行 [`tools/export_cookies.js`](tools/export_cookies.js) 导出 `cookies.json` 放置到项目根目录。
+
+### 5. 校验配置并启动
+
+```bash
+# 本地配置与凭据检查（不连接真实网关）
+python main.py --check
+
+# 启动网桥服务
+python main.py
+```
+
+Windows 用户也可直接双击根目录下的 [`start.bat`](start.bat) 启动服务（自动优先使用 `.venv\Scripts\python.exe`）。
+
+### 常用 CLI 参数
+
+| 命令 | 说明 |
+| :--- | :--- |
+| `python manage.py [config.json]` | 打开日常运维控制台 / 首次引导向导 |
+| `python main.py [--config PATH]` | 启动网桥服务（默认读取 `config.json` 或 `credentials.json`） |
+| `python main.py --manage` / `--setup` | 等价于运行 `manage.py` |
+| `python main.py --check` | 校验配置与本地状态，不发起真实网关连接 |
+| `python main.py --login` | 纯协议邮箱验证码登录 Muse 并写入 `cookies.json` |
+| `python main.py --wechat-login` | 显式执行微信 iLink 终端二维码扫码登录 |
+| `python main.py --wechat-status` | 查看脱敏后的微信本地账号状态（不联网） |
+
+---
+
+## 斜杠指令参考
+
+所有指令均以 `/` 开头，同时支持中文与英文别名（发 `/帮助` 或 `/help` 可在聊天内随时查看）。
+
+### 会话管理
+
+| 中文指令 | 英文别名 | 说明 |
+| :--- | :--- | :--- |
+| `/会话 [页]` | `/sessions` | 列出未归档的 Muse 会话（分页显示） |
+| `/切换 <序号\|id>` | `/switch` | 将当前聊天切换到指定会话（旧消息自动标为已读） |
+| `/新建` | `/new` | 为当前聊天创建全新的 Muse 会话 |
+| `/当前` | `/current` | 查看当前聊天绑定的会话 ID |
+| `/重命名 <序号\|id> <标题>` | `/rename` | 重命名指定会话 |
+| `/置顶` / `/取消置顶 <序号\|id>` | `/pin` / `/unpin` | 置顶或取消置顶会话 |
+| `/归档` / `/取消归档 <序号\|id>` | `/archive` / `/unarchive` | 归档或恢复会话 |
+| `/删除 <序号\|id>` | `/delete` | 删除指定会话（主会话不可删除） |
+
+### 登录、审批与安全交互
+
+| 中文指令 | 英文别名 | 说明 |
+| :--- | :--- | :--- |
+| `/登录 [邮箱]` | `/login` | 触发 Muse 登录流程（仅管理员私聊可用） |
+| `/审批 [编号] [选项数字]` | `/approval` | 查看或处理当前/指定 Muse 审批 |
+| `/审批 全部 <选项数字>` | — | 对当前已显示审批队列批量应用同义选项（也可直接回复 `数字 全部`） |
+| `/凭证 [编号] [保存\|一次]` | `/credential` | 查看或填写凭证卡（也可直接引用凭证卡回复） |
+| `/密钥 [编号]` | `/key` | 查看或填写连接器单行密钥（也可直接引用密钥卡回复） |
+| `/取消` | `/cancel` | 退出当前登录/凭证/密钥填写并清除内存临时秘密 |
+| `/聊天` | `/chat` | 结束残留填写流程，返回正常对话 |
+
+### 访问控制（QQ / OneBot / Telegram）
+
+| 指令 | 说明 |
+| :--- | :--- |
+| `/申请` | 申请私聊访问，或在群内仅申请本人使用 |
+| `/申请 全员` | 申请将当前群对全体群成员开放 |
+| `/申请审批 [编号 同意\|拒绝]` | 管理员私聊查看待办申请或审批通过/拒绝 |
+
+### Muse 运行时指令（透传至 Muse）
+
+| 中文指令 | 英文别名 | 说明 |
+| :--- | :--- | :--- |
+| `/状态` | `/status` | 查看当前会话状态与用量 |
+| `/用量 开启\|关闭` | `/usage on\|off` | 开关回复中的用量显示 |
+| `/压缩` | `/compact` | 压缩当前会话上下文 |
+| `/清空` | `/clear` | 从下一句话起使用全新上下文 |
+| `/子代理` | `/subagents` | 列出当前子代理 |
+| `/停止` | `/stop` | 中止当前正在执行的任务 |
+| `/帮助` | `/help` | 显示帮助列表 |
+
+---
+
+## 平台接入指南
+
+### QQ 官方机器人
+
+使用 QQ 开放平台官方 OpenAPI 与 WebSocket 事件网关，支持私聊（C2C）与群聊 `@机器人` 互动。
+
+- **必填凭据**：`app_id`、`app_secret`（亦支持环境变量 `QQ_APP_ID`、`QQ_APP_SECRET`）。
+- **权限配置**：在 `whitelist` 中配置允许私聊的 `private` OpenID 列表，以及按 `群 OpenID: "*"` 或指定成员列表开放的群聊；或通过 `allow_all_private` / `allow_all_group` 全局放开。
+- **回复配额**：`QQSender` 独立维护被动回复序号（`msg_seq`，单条消息上限私聊 4 次 / 群聊 5 次）与主动推送配额（`max_active_chunks`，默认 `2`）；当群主动消息被平台拒绝时，可按策略改发管理员私聊。
+- **富媒体与 Markdown**：出站默认使用 QQ 原生 Markdown 消息（`msg_type: 2`，纯文本通知时降级文本）；图片默认上限 8 MiB、文件 25 MiB、视频下载 100 MiB / **QQ 接口上传限制 10 MiB**（`file_ref_threshold_bytes` 默认 2 MiB，控制入站附件转发至 Muse 时转为分块 `file_ref` 上传）。
+
+### OneBot v11
+
+与 QQ 共用统一网关，通过 HTTP API 发消息、正向 WebSocket 接收事件（断开后 1s → 30s 指数退避重连，支持自签证书并携带自定义 UA 以避免 Cloudflare 1010 拦截）。
+
+```json
+{
+  "adapters": {
     "onebot": {
-      "enabled": false,
+      "enabled": true,
+      "proxy": "none",
       "base_url": "https://onebot.example.com",
       "access_token": "YOUR_ONEBOT_TOKEN",
       "ws_url": "wss://onebot.example.com",
       "admin_id": ["YOUR_ADMIN_QQ"],
+      "group_trigger": "at",
+      "typing_enabled": false,
       "whitelist": {
         "private": ["YOUR_ADMIN_QQ"],
         "YOUR_GROUP_ID": "*"
@@ -136,436 +307,475 @@ cp config.example.json config.json
 }
 ```
 
-### 3. 配置检查
+- **环境变量**：`base_url`、`access_token`、`ws_url` 可通过 `ONEBOT_BASE_URL`、`ONEBOT_ACCESS_TOKEN`、`ONEBOT_WS_URL` 提供；`ws_url` 留空时自动由 `base_url` 推导。
+- **群消息触发（`group_trigger`）**：`all`（默认，处理全部群消息）、`at`（需 `@机器人` 或 `/` 指令）、`prefix`（仅处理 `/` 指令）。私聊不受此项限制。
+- **私聊输入状态（`typing_enabled`）**：设为 `true` 时在 Muse 处理期间通过 `set_input_status` 保活「正在输入...」（需机器人 QQ 开启对应隐私设置）。
+- **消息与媒体**：优先解析 Array 消息段；丢弃自身 `self_id` 与 `message_sent` 事件。文件上传因 `upload_*_file` 不返回可引用消息 ID，会附发一条可原生引用的 `【文件】文件名` 说明。若群发送被明确拒绝（`retcode != 0`），自动带 `【群消息提醒】` 前缀转告首位管理员（网络超时不改发以免重复）。
+- **白名单格式**：QQ 号与群号均可写为字符串或数字；白名单为空时默认拒绝所有聊天。
 
-运行校验模式（仅检查凭证与配置可用性，不连接真实网关）：
+### Telegram Bot API
 
-```bash
-python main.py --check
+仅使用官方 Bot API **长轮询（`getUpdates`）**，无需公网域名或反向代理端口。
+
+```json
+{
+  "adapters": {
+    "telegram": {
+      "enabled": true,
+      "proxy": "worker",
+      "bot_token": "",
+      "poll_timeout_s": 30,
+      "admin_id": ["123456789"],
+      "whitelist": {
+        "private": ["123456789"],
+        "-1001234567890": "*"
+      },
+      "group_trigger": "at",
+      "seed_main_session": false
+    }
+  }
+}
 ```
 
-### 4. 启动服务
+- **Token 与网络代理**：通过 `@BotFather` 创建 Bot，将 Token 写入环境变量 `TELEGRAM_BOT_TOKEN` 或 `bot_token`。网络模式由 `proxy` 显式控制（默认 `"worker"`，可设为 `"none"` 直连或 `"http"` 走 `network.proxy_url`），不会读取系统环境变量代理。
+- **唯一消费者约束**：同一 Bot Token 同时只能由一个 `getUpdates` 实例消费，且不能与 Webhook 共存；程序不会自动删除已有 Webhook。
+- **用户与群 ID**：`admin_id` 与 `whitelist` 须填写 **数字 ID**（群组为带负号的 ID），不能使用 `@username`。普通群聊可见范围受 BotFather 的 Privacy Mode 约束；暂不支持频道、论坛话题与消息编辑。
+- **Markdown 实体渲染**：内置 [`muse_bridge/adapters/telegram/markdown.py`](muse_bridge/adapters/telegram/markdown.py)，将常见 Markdown（粗体、斜体、删除线、剧透、代码块、链接、标题、引用、列表、表格）零依赖转换为 UTF-16 `text + entities`；若单段被拒绝则自动回退纯文本重发。
+- **双向原生 Reaction**：支持接收用户在 Telegram 贴上的表情并经 `/reactions/toggle` 同步给 Muse；Muse 发出的表情在 Bot API 固定的 73 种表情内调用 `setMessageReaction` 原生贴上或摘除，超出范围时回落为纯文本通知。
 
-```bash
-python main.py
+### 微信 iLink（仅私聊）
+
+基于 iLink HTTP 长轮询直连，无需额外网关。默认关闭，**启动网桥不会自动扫码**，需先显式完成本地扫码登录。
+
+```json
+{
+  "adapters": {
+    "wechat": {
+      "enabled": true,
+      "proxy": "none",
+      "state_dir": "data/wechat",
+      "channel_version": "2.4.6",
+      "route_tag": "",
+      "http_timeout_s": 35,
+      "polling_timeout_ms": 35000,
+      "typing_enabled": false,
+      "chunk_chars": 4000,
+      "max_chunks": 8,
+      "session_bindings": {}
+    }
+  }
+}
 ```
 
-### 5. 运行测试集
+1. **扫码登录与状态查看**：
+   ```bash
+   python main.py --config config.json --wechat-login
+   python main.py --config config.json --wechat-status
+   ```
+   `--wechat-login` 直接在终端输出 ASCII 二维码（基于 `qrcode>=8.0`，无需 Pillow）；`--wechat-status` 仅读取并脱敏展示本地状态，不访问网络。
+2. **私聊直通模型**：微信通道仅支持个人私聊，不设管理员、白名单、访问申请或群聊配置；`session_bindings` 仅允许 `private:<user_id>` 键。会话管理、Muse 登录、凭证和审批均通过文本指令完成。
+3. **按账号物理隔离**：状态文件自动派生至 `<state_dir>/accounts/<sha256(bot_id)[:24]>/`（包含会话映射、路由、推送水位、已投递账本），切换扫码账号时互不污染。切勿让多个进程共用同一账号状态。
+4. **发送语义与安全边界**：
+   - 收到 `-14` 状态码后自动冷却 1 小时并保留 Token，不自动重新扫码；发送结果不明时不盲目重试以避免重复。
+   - 账号 `baseurl` 强制校验为 HTTPS `*.weixin.qq.com` 域名，CDN 传输不自动跟随 HTTP 重定向。
+   - `data/wechat/` 下保存明文 JSON 凭据与上下文，请严格控制目录权限并切勿公开分享。
+5. **独立微信协议调试台**：无需启动 Muse 即可单独验证微信收发（**使用前请先停止同账号网桥**，两者共享游标）：
+   ```bash
+   python tests/wechat_cli.py --config config.json
+   # 需要重新扫码时：
+   python tests/wechat_cli.py --config config.json --login
+   ```
+   支持 `/image <路径>`、`/file <路径>`、`/video <路径>`、`/to <用户ID>`、`/peers`、`/status`、`/help`、`/quit`，接收媒体默认保存至 `data/wechat_cli/downloads/`。
+
+> 协议边界与实现细节详见 [微信 iLink 协议说明](docs/wechat-ilink-protocol.md)。
+
+---
+
+## 核心机制说明
+
+### 会话隔离与投递路由
+
+- **默认隔离**：每个群聊、每个私聊用户首次发消息时自动创建独立的 Muse 会话 UUID，各平台映射文件物理分开。如需多聊天共用同一会话，可在各聊天中 `/切换` 至同一 ID，或在配置中预置 `session_bindings`（如 `{"group:<id>": "<session_id>"}`）。
+- **投递优先级**：
+  1. 有因果来源的回复：仅投递回发起提问的来源聊天（通过账本 `origins` 持久化追踪，即使共享会话也不会跨聊天广播）；
+  2. 无提问来源的主动推送（如定时提醒）：投递到该会话绑定的聊天；群主动发送被 QQ 拒绝时可按策略转告管理员私聊；
+  3. 未绑定任何聊天的会话不监听、不投递，切走旧会话的聊天也不会再收到该会话的后续消息。
+- **高效事件驱动**：依托持久 Noise WebSocket 上的实时事件流与增量水位检测，不盲目轮询全部历史；运行中切换到已有会话时自动将旧消息标为已读，避免刷屏回放。
+
+### 白名单与动态访问申请
+
+适用于 QQ、OneBot、Telegram 三个支持多用户的渠道：
+
+- **全局放开开关**：`allow_all_private` / `allow_all_group`（默认 `false`），开启后跳过对应维度的白名单检查。
+- **静态白名单**：`whitelist` 中通过 `"private": [...]` 和 `"<群ID>": "*" | [...]` 精细授权。
+- **动态申请流程**：未授权用户/群可直接发送 `/申请` 或 `/申请 全员`，管理员在私聊收到通知后发送 `/申请审批 编号 同意|拒绝` 即可即时生效（不改写含密钥的 `config.json`，原子持久化至 `access_requests.state_file`）。
+- **防滥用与自动审批**：内置去重合并、1 分钟冷却、10 分钟重提间隔及 7 天过期策略。将 `access_requests.auto_approve` 设为 `true` 时新申请自动放行（含 `/申请 全员`），请按需谨慎启用。
+
+### 登录、凭证、连接器密钥与审批交互
+
+- **登录与失效通知**：当 Muse 凭据失效需要重新登录时，网关会自动向所有已启用渠道广播提醒，管理员（或微信扫码账号）可直接在私聊中发送 `/登录 [邮箱]` 完成验证码重登。
+- **显式归属、不误拦截**：
+  - 仅**前台审批**会阻塞所属会话的普通发言（未处理前的新消息直接丢弃，不排队补发）；
+  - **凭证卡**、**连接器密钥卡**与**后台审批**均不阻塞聊天，必须**引用对应卡片**或发送显式指令（`/凭证`、`/密钥`、`/审批`）才会进入交互流程。
+- **凭证与连接器密钥**：
+  - **账号密码卡**：引用凭证卡分两行发送账号与密码（支持多行密钥）；信息不全时仅追问缺失项，保存后自动恢复聊天。
+  - **单字段秘密卡**（API Key、创建密码、SSH 私钥、OTP 种子等）与**验证码卡**：直接引用卡片发送完整内容，无需虚构账号。
+  - **连接器单行密钥**（v2 自定义 API-key connector / 内置回调）：引用密钥卡发送一行密钥，或使用 `/密钥 编号 [密钥]`；经 `authd` 注册/回调接口确认后在 `cookies_file + .captures.local.json` 记录 SHA-256 脱敏回执防重。
+  - **原处填写**：`credentials_in_place` 默认 `true`，允许管理员在所在群内直接引用填写（群成员可见输入）；设为 `false` 则强制转由管理员私聊填写。
+- **前台与后台审批**：
+  - 同一会话产生多张审批时自动排队，依次推送并显示 `【审批 编号】序号/总数`，支持 `数字 全部` / `/审批 全部 数字` 批量应用同义选项。
+  - `approvals_in_place` 默认 `true`，审批卡仅推到会话所在聊天；设为 `false` 时同步抄送管理员私聊。
+  - 定时任务与后台任务审批进入独立后台队列，仅推给单一管理员私聊收件箱：可通过 `gateway.background_approval_push` 固定为 `qq:<管理员OpenID>` 或 `onebot:<管理员QQ>`，留空则自动选择最近活跃的管理员私聊。
+  - 审批由独立的账号级 `daemon/chat.subscribe` 事件流实时驱动，日常发消息只读本地门禁；按 `muse.approval.sync_interval_s`（默认 180 秒）做全量补偿同步。详见 [事件驱动审批说明](docs/approval-event-driven.md)。
+  - `muse.approval.mode` 支持 `manual`（默认人工）、`allow_all`（逐条单次允许，不创建长期规则）、`deny_all`（逐条拒绝）；`notify` 控制自动决定后的结果通知。
+
+> [!WARNING]
+> 通过 IM 发送密码、私钥、验证码和 API Key 仍需经过对应 IM 平台链路，群内原处填写对群成员可见，安全性不等同于 Muse 网页原生输入。敏感凭据建议仅由管理员在私聊中填写，或直接在网页端完成。
+
+### 双向消息引用与 Emoji 反应
+
+- **双向引用**：IM 端引用已关联消息自动映射为 Muse 的 `in_reply_to` / `reply_to_target`（QQ、OneBot、Telegram 与微信均支持入站原生引用 ID 提取）；Muse 端引用在 QQ、OneBot、Telegram 按渠道编码为原生引用，微信 iLink 出站协议无引用气泡时自动回退 `【引用】` 文本前缀。若原消息不在当前聊天中，仅降级显示「原消息在此聊天不可用」，绝不跨群泄露原文。引用索引保存在 `<routes_file>.references.local.json`。
+- **Emoji 反应**：同时同步历史 `reaction_emoji` 与实时 `reactions.updated`（含取消事件 `is_removal`）。Telegram 73 种原生表情走 `setMessageReaction` 原生贴上/摘除；其余渠道及超范围表情采用纯文本通知回落，可通过各适配器的 `reaction_quote`（默认 `false`）控制回落消息是否引用原消息。
+
+### Muse 动态同步（Feed）
+
+由 `UnifiedGateway` 下的 `GatewayFeedCoordinator` 统一轮询 `GET /api/feed`，支持跨平台独立账本与滚动频控：
+
+- **统一配置**：在 `gateway.feed` 中启用，按平台在 `targets` 中配置投递模式（支持 `qq`、`onebot`、`wechat`）：
+  - `"native"`：发布到平台原生动态广场（如 OneBot QQ 空间）；
+  - `"chat"`：渲染为图文消息推送给该平台的管理员/扫码用户私聊；
+  - `"auto"`：支持原生广场时走原生，否则走私聊。
+- **OneBot QQ 空间原生发表**：依赖 OneBot 后端的 SnowLuma 扩展接口 [`send_qzone_msg`](https://snowluma.github.io/zh/docs/api/qzone/send_qzone_msg)（非 OneBot v11 标准接口），单条最多 9 张图（视频仅取封面），可见范围支持 `1`（所有人）、`4`（好友，默认）、`64`（仅自己）。
+- **防刷屏与幂等**：默认每 5 分钟扫描最近 1 小时动态、每轮最多 3 条、每小时最多 5 条、相邻发表至少间隔 60 秒；发表前原子落盘预留，发送失败或结果不明时不自动重试，避免重复公开发布。
+
+> 协议细节详见 [Muse 动态只读协议](docs/muse-feed-protocol.md)。
+
+---
+
+## 配置与运维参考
+
+配置系统采用 **用户凭据** 与 **内置默认值** 分层深合并设计：只需填写启用渠道所需的凭据，未显式声明的参数自动沿用内置默认值；顶层 `overrides` 优先级最高，可跨适配器统一覆盖通用参数。
+
+> [!NOTE]
+> `config.example.json` 的顶层 `overrides` 示例中包含 `chunk_chars: 1200`，它会覆盖微信默认的分段长度 `4000`。若希望各渠道保留各自默认分段值，请从 `overrides` 中移除 `chunk_chars`。
+
+### 全量配置参考
+
+<details>
+<summary>点击展开完整 <code>config.json</code> 字段说明（JSONC 注释版）</summary>
+
+```jsonc
+{
+  "network": {                              // 统一外发网络代理与 Worker 配置（详见 docs/worker-transport.md）
+    "proxy_url": "",                        // 全局 HTTP(S) 代理地址，如 "http://127.0.0.1:7890"（供 proxy="http" 模块使用）
+    "worker": {                             // 自有 Cloudflare Worker 转发配置（可用 tools/cfproxy.js 部署）
+      "base": "https://your-worker.example.com",
+      "ws": true,
+      "http": true
+    }
+  },
+  "muse": {
+    "cookies_file": "cookies.json",         // 网页登录 Cookie 文件路径（用于自动推导 vm_id 与静默续期）
+    "mint_file": ".mint.json",              // 缓存的 mint token 路径
+    "session_id": "",                       // 可选主会话 UUID（各聊天默认按聊天独立建会话）
+    "vm_id": "",                            // 可选 VM ID，留空则自动解析
+    "host": "hatch.metaaivm.com",           // Muse 网关域名
+    "client_ip": "",                        // 可选出口公网 IP；留空则在首次发消息时通过 muse.ai /api/client-ip 异步缓存
+    "timezone": "Asia/Shanghai",            // 时区
+    "proxy": "worker",                      // "none" | "http" | "worker"（默认 "worker"）
+    "approval": {
+      "mode": "manual",                     // "manual" | "allow_all" | "deny_all"
+      "notify": true,                       // 自动审批后是否发送通知
+      "sync_interval_s": 180                // 审批补偿全量同步间隔（正整数秒）
+    }
+  },
+  "adapters": {
+    "qq": {
+      "enabled": true,
+      "proxy": "none",                      // "none" | "http" | "worker"（默认 "none"）
+      "app_id": "YOUR_QQ_APP_ID",
+      "app_secret": "YOUR_QQ_APP_SECRET",
+      "admin_id": ["YOUR_ADMIN_OPENID"],
+      "admin_only": true,                   // 会话管理指令是否仅管理员可用
+      "credentials_in_place": true,         // 允许管理员在凭证所在群直接填写
+      "approvals_in_place": true,           // 审批卡仅推会话所在聊天，不另发管理员私聊
+      "reaction_quote": false,              // 回落文本通知的 reaction 是否引用原消息
+      "allow_all_private": false,           // 放开所有私聊访问
+      "allow_all_group": false,             // 放开所有群聊互动
+      "group_sender_info": true,            // 群消息是否附带发送者标识
+      "whitelist": {
+        "private": ["YOUR_C2C_OPENID"],
+        "YOUR_GROUP_OPENID": "*"
+      },
+      "access_requests": {
+        "enabled": true,
+        "auto_approve": false,
+        "state_file": "data/qq_access.local.json"
+      },
+      "session_map_file": "data/qq_session_map.json",
+      "session_bindings": {},
+      "delivered_file": "data/qq_delivered.jsonl",
+      "push_state_file": "data/qq_push_state.json",
+      "routes_file": "data/qq_routes.json",
+      "catch_up_enabled": false,            // 启动时是否补推离线期间产生的消息
+      "catch_up_window_s": 21600,           // 补推时间窗口（秒）
+      "catch_up_max_messages": 5,           // 单次补推最大条数
+      "chunk_chars": 1200,
+      "max_chunks": 8,
+      "max_active_chunks": 2,               // 被动额度耗尽后最多消耗的主动消息条数
+      "max_image_bytes": 8388608,           // 8 MiB
+      "max_file_bytes": 26214400,           // 25 MiB
+      "max_video_bytes": 104857600,         // 100 MiB
+      "max_video_upload_bytes": 10485760,   // 10 MiB
+      "file_ref_threshold_bytes": 2097152,  // 2 MiB
+      "download_timeout_s": 60,
+      "download_proxy": ""                  // 可选腾讯附件 CDN 下载代理前缀
+    },
+    "onebot": {
+      "enabled": false,
+      "proxy": "none",                      // "none" | "http" | "worker"（默认 "none"）
+      "base_url": "https://onebot.example.com",
+      "access_token": "YOUR_ONEBOT_TOKEN",
+      "ws_url": "wss://onebot.example.com",
+      "admin_id": ["YOUR_ADMIN_QQ"],
+      "admin_only": true,
+      "credentials_in_place": true,
+      "approvals_in_place": true,
+      "group_trigger": "all",               // "all" | "at" | "prefix"
+      "typing_enabled": false,              // 私聊「正在输入...」
+      "reaction_quote": false,
+      "allow_all_private": false,
+      "allow_all_group": false,
+      "whitelist": {
+        "private": ["YOUR_ADMIN_QQ"],
+        "YOUR_GROUP_ID": "*"
+      },
+      "access_requests": {
+        "enabled": true,
+        "auto_approve": false,
+        "state_file": "data/onebot_access.local.json"
+      }
+    },
+    "telegram": {
+      "enabled": false,
+      "proxy": "worker",                    // "none" | "http" | "worker"（默认 "worker"）
+      "bot_token": "",                      // 或使用环境变量 TELEGRAM_BOT_TOKEN
+      "poll_timeout_s": 30,                 // 1..50 秒
+      "admin_id": [],
+      "seed_main_session": false,
+      "group_trigger": "at",                // "all" | "at" | "prefix"
+      "credentials_in_place": true,
+      "approvals_in_place": true,
+      "reaction_quote": false,
+      "allow_all_private": false,
+      "allow_all_group": false,
+      "whitelist": {
+        "private": []
+      }
+    },
+    "wechat": {
+      "enabled": false,
+      "proxy": "none",                      // "none" | "http" | "worker"（默认 "none"）
+      "state_dir": "data/wechat",
+      "channel_version": "2.4.6",
+      "route_tag": "",
+      "http_timeout_s": 35,
+      "polling_timeout_ms": 35000,
+      "reconnect_max_retries": 30,
+      "typing_enabled": false,
+      "reaction_quote": false,
+      "chunk_chars": 4000,                  // 1..4000
+      "max_chunks": 8,
+      "session_bindings": {}                // 仅支持 "private:<user_id>"
+    }
+  },
+  "gateway": {
+    "background_approval_push": "",         // "qq:<admin_openid>" | "onebot:<admin_qq>" | ""(自动)
+    "feed": {
+      "enabled": false,
+      "targets": {
+        "onebot": "native"                  // 键: qq|onebot|wechat，值: auto|native|chat
+      },
+      "poll_interval_s": 300,
+      "max_age_s": 3600,
+      "scan_limit": 50,
+      "max_per_scan": 3,
+      "min_publish_interval_s": 60,
+      "publish_window_s": 3600,
+      "max_per_window": 5
+    }
+  },
+  "logging": {
+    "level": "INFO",                        // TRACE|DEBUG|INFO|WARNING|ERROR|CRITICAL|OFF
+    "console": true,
+    "file": "logs/bridge.log",
+    "trace": false,                         // 独立 JSONL 诊断追踪开关（仅排障时临时开启，用完请及时关闭并清理）
+    "trace_file": "logs/trace.jsonl",
+    "payload_limit": 65536,                 // 单事件脱敏 payload 上限（字节，0=不限）
+    "max_bytes": 10485760,                  // 单文件轮转阈值（默认 10 MiB）
+    "backup_count": 5
+  },
+  "overrides": {}                           // 顶层覆盖项（优先级最高）
+}
+```
+
+</details>
+
+### 环境变量
+
+敏感凭据支持通过环境变量注入（避免写入配置文件）：
+
+| 环境变量 | 对应配置项 |
+| :--- | :--- |
+| `MUSE_COOKIES_FILE` / `MUSE_MINT_FILE` | `muse.cookies_file` / `muse.mint_file` |
+| `MUSE_SESSION_ID` / `MUSE_VM_ID` | `muse.session_id` / `muse.vm_id` |
+| `MUSE_HOST` / `MUSE_CLIENT_IP` / `MUSE_TIMEZONE` | `muse.*` 对应项 |
+| `QQ_APP_ID` / `QQ_APP_SECRET` / `QQ_DEBUG` | `adapters.qq.*` |
+| `ONEBOT_BASE_URL` / `ONEBOT_ACCESS_TOKEN` / `ONEBOT_WS_URL` | `adapters.onebot.*` |
+| `TELEGRAM_BOT_TOKEN` | `adapters.telegram.bot_token` |
+
+### 日志与 JSONL 追踪
+
+- **等级与输出**：支持 `TRACE` / `DEBUG` / `INFO` / `WARNING` / `ERROR` / `CRITICAL` / `OFF`。`console` 控制 stderr 输出，`file` 控制文本日志（设为 `""` 或 `null` 禁用文件写入），按 `max_bytes` × `backup_count` 大小轮转。
+- **JSONL 追踪**：`trace: true` 独立开启结构化追踪文件（`trace_file` 不可与 `file` 同路径，`level: "OFF"` 同时关闭运行日志与追踪），用于串联诊断事件与 HTTP 耗时，不改变任何业务与重试行为。
+- **磁盘与隐私提示**：框架已对认证头、Token、Cookie、密码、验证码与凭证交互进行脱敏，但 `trace` 会产生较大磁盘写入且可能包含普通聊天上下文摘要；**请仅在排障时临时开启，排查完成后及时关闭并清理**，提交 Issue 前务必人工复核。
+
+### 运行状态文件
+
+所有运行态持久化文件默认存放在项目根目录 `data/` 下（首次写入自动创建，已加入 `.gitignore`）：
+
+| 路径 | 用途 |
+| :--- | :--- |
+| `data/<platform>_session_map.json` | 聊天目标 → Muse 会话 UUID 映射 |
+| `data/<platform>_delivered.jsonl` | 已投递消息去重日志（追加写入） |
+| `data/<platform>_push_state.json` | 主动推送水位与已见消息集合 |
+| `data/<platform>_routes.json` | Muse 消息 ID → 聊天路由（含 `.identity` / `.deliveries` / `.references` / `.admins` 附属 sidecar） |
+| `data/<platform>_access.local.json` | 动态白名单授权与申请记录（QQ / OneBot / Telegram） |
+| `data/wechat/accounts/<hash>/` | 微信 iLink 按账号隔离的完整运行态与凭据目录 |
+| `cookies.json.captures.local.json` | 凭证与连接器密钥提交的 SHA-256 脱敏回执（不含任何明文秘密） |
+
+> [!IMPORTANT]
+> 请以单实例方式运行同一套状态文件；升级或迁移版本前请先停止旧进程并整体备份 `config.json`、`cookies.json` 与 `data/` 目录。详见 [统一网关说明](docs/unified-gateway.md)。
+
+---
+
+## 系统架构与项目结构
+
+### 架构总览
+
+系统由 `BridgeEngine` 统一装配：**平台适配器**只负责协议收发与媒体加解密，**`UnifiedGateway`** 持有全部会话、权限、交互与投递账本状态，**`MuseService`** 封装加密传输与业务接口，底层经由 **`network.py`** 按模块路由直连、HTTP(S) 代理或 Cloudflare Worker。
+
+```mermaid
+flowchart TB
+    subgraph Channels["IM 平台与适配器层（muse_bridge/adapters/ · BaseAdapter）"]
+        direction LR
+        QQ["QQ 官方机器人<br/>OpenAPI + WS / 原生 Markdown"]
+        OB["OneBot v11<br/>HTTP + 正向 WS / QQ 空间"]
+        TG["Telegram Bot API<br/>长轮询 / UTF-16 Entities / 原生反应"]
+        WC["微信 iLink（仅私聊）<br/>HTTP 长轮询 / AES 媒体"]
+    end
+
+    subgraph Gateway["统一业务网关层（muse_bridge/gateway/ · UnifiedGateway）"]
+        direction TB
+        IN["InboundPipeline<br/>聊天/会话双层串行锁 · 指令 · 白名单与申请 · 凭证/审批输入路由"]
+        CTX["ChannelContext（按平台账号物理分片）<br/>SessionMapper · 投递账本 · 引用索引 · 被动路由 · 独立出站队列"]
+        PUMP["MuseEventPump & GatewayFeedCoordinator<br/>跨平台会话并集事件泵 · 动态统一轮询与幂等分发"]
+    end
+
+    subgraph Muse["Muse 服务与传输层（muse_bridge/muse/ & network.py）"]
+        direction LR
+        SVC["MuseService & ApprovalStream<br/>会话 RPC · file_ref 分块上传 · 账号级审批门禁"]
+        AUTH["MuseTokenManager<br/>Cookie → vm_id → .mint 自动续期"]
+        NET["network.py 统一出站路由<br/>直连 (none) / HTTP 代理 (http) / Worker (worker)"]
+    end
+
+    CLOUD(["Muse 服务端<br/>Noise_XX WebSocket / HTTPS API"])
+
+    QQ -->|"InboundMessage / Reaction"| IN
+    OB -->|"InboundMessage / Reaction"| IN
+    TG -->|"InboundMessage / Reaction"| IN
+    WC -->|"InboundMessage"| IN
+
+    IN -->|"会话/附件提交 · 交互处理"| SVC
+    IN <-->|"状态读写 / 即时回复"| CTX
+
+    SVC -->|"实时事件流 / 动态 / 审批快照"| PUMP
+    PUMP -->|"路由解析 · 因果归属"| CTX
+    CTX -->|"DeliveryEnvelope / FeedEnvelope"| QQ
+    CTX -->|"DeliveryEnvelope / FeedEnvelope"| OB
+    CTX -->|"DeliveryEnvelope / Reaction"| TG
+    CTX -->|"DeliveryEnvelope / FeedEnvelope"| WC
+
+    SVC --- AUTH
+    SVC --> NET --> CLOUD
+```
+
+### 目录结构
+
+```text
+muse-im-bridge/
+├── main.py                      # 主入口（参数解析、配置校验、登录/微信 CLI、引擎生命周期）
+├── manage.py                    # 统一日常运维控制台与首次引导向导
+├── start.bat                    # Windows 一键启动脚本
+├── config.example.json          # 无敏感信息的配置模板
+├── pyproject.toml               # 包元数据与依赖声明
+├── muse_bridge/
+│   ├── engine.py                # BridgeEngine：组装统一网关与各平台适配器
+│   ├── network.py               # 统一出站网络路由（直连 / HTTP 代理 / Cloudflare Worker）
+│   ├── observability.py         # 脱敏日志、JSONL 追踪与错误净化
+│   ├── config/                  # 配置常量、强校验模型与分层加载器
+│   ├── core/                    # 统一消息模型、斜杠指令、去重、引用存储、会话映射、原子状态文件
+│   ├── muse/                    # Muse 服务层（Noise_XX 加密传输、Token 续期、审批流、动态、登录、连接器密钥）
+│   ├── gateway/                 # 平台无关统一网关（运行时、入站流水线、事件泵、出站渲染、投递账本、动态协调、访问审批）
+│   └── adapters/                # 平台适配器（只负责事件转换与平台 API 投递）
+│       ├── base.py              # BaseAdapter 端口接口定义
+│       ├── qq/                  # QQ 官方机器人适配器
+│       ├── onebot/              # OneBot v11 适配器
+│       ├── telegram/            # Telegram Bot API 适配器（含 Markdown Entities 解析）
+│       └── wechat/              # 微信 iLink 适配器（扫码认证、媒体加解密）
+├── assets/                      # 项目图标等静态资源
+├── docs/                        # 架构设计与协议技术文档
+├── tools/                       # 辅助脚本（cfproxy.js Worker 代理、login.py 登录、export_cookies.js 导出、onebot_live.py 联调）
+└── tests/                       # 单元测试套件与独立微信协议 CLI（tests/wechat_cli.py）
+```
+
+### 技术文档索引
+
+| 文档 | 内容说明 |
+| :--- | :--- |
+| [统一网关说明](docs/unified-gateway.md) | 架构边界、平台端口契约、投递账本、状态文件与升级/回退规范 |
+| [统一网关适配器开发指南](docs/adapter-development-guide.md) | 面向贡献者的新平台适配器接入步骤、契约要求与测试清单 |
+| [事件驱动审批与本地发送门禁](docs/approval-event-driven.md) | 账号级审批订阅流、事件快照结构、跨来源指纹与补偿同步机制 |
+| [Cloudflare Worker 转发部署指南](docs/worker-deployment.md) | 基于 `tools/cfproxy.js` 部署自有 Cloudflare Worker、绑定域名、验证与安全加固步骤 |
+| [统一网络代理与 Worker 传输说明](docs/worker-transport.md) | 顶层 `network` 配置与各模块 `proxy`（`none` / `http` / `worker`）路由说明 |
+| [微信 iLink 接线与协议边界](docs/wechat-ilink-protocol.md) | 微信 iLink 长轮询认证、媒体加解密与安全边界 |
+| [Muse 动态只读协议](docs/muse-feed-protocol.md) | `GET /api/feed` 响应信封、分页与受保护媒体获取协议 |
+
+---
+
+## 开发与测试
+
+运行完整离线单元测试套件：
 
 ```bash
 python -m unittest discover tests
 ```
 
+如需接入新的 IM 平台（例如飞书、钉钉、Discord 等），请先阅读 [统一网关适配器开发指南](docs/adapter-development-guide.md)，遵循统一的 `BaseAdapter` 端口契约，无需重复实现会话管理、审批流或投递账本。
+
 ---
 
-## 全量配置参考 (`config.json`)
+## 安全、隐私与免责声明
 
-系统采用“**必须填写的用户凭据**”与“**有合理默认值的内部参数**”分层设计。以下是所有可用配置项的全量参考（可根据需求选择性配置，未填写的项将自动采用内置默认值）：
+1. **零凭据入库**：本仓库不包含任何真实密钥或运行状态。`config.json`、`credentials.json`、`cookies*.json`、`.mint.json`、`.env*`、`*.local.json`、`data/`、`logs/` 等均已列入 [`.gitignore`](.gitignore)。提交代码前请务必再次核查，切勿将 Cookie、Token、OpenID、QQ 号或私有接口地址带入版本库。
+2. **本地数据保护**：`data/` 下的状态文件与 `logs/` 下的日志文件可能包含聊天摘要、消息 ID 与本地凭据，请妥善控制文件访问权限，切勿公开上传或在 Issue 中直接粘贴。
+3. **安全漏洞上报**：如发现安全隐患，请通过 GitHub Security Advisories 私下联系维护者，勿在公开 Issue 中附带有效凭据或可复现的真实账号信息。
+4. **合规使用**：请遵守各 IM 平台与 Muse 服务条款，严禁用于垃圾消息群发、未授权抓取或任何违法违规用途。
 
-```json
-{
-  "muse": {
-    "cookies_file": "cookies.json",                 // [可选] 网页 cookies 路径，用于自动提取 vm_id 和静默续期 token (默认: "cookies.json")
-    "mint_file": ".mint.json",                     // [可选] 缓存的 mint token 路径 (默认: ".mint.json")
-    "session_id": "YOUR_MUSE_SESSION_ID",          // [可选] 主会话 UUID，仅用于其审批卡推送给管理员；QQ 与 OneBot 都按聊天自动建会话，不使用此项
-    "vm_id": "",                                   // [可选] 虚拟机 ID，留空则自动从 cookies 或 mint token 解析
-    "host": "hatch.metaaivm.com",                  // [可选] Muse 网关域名 (默认: "hatch.metaaivm.com")
-    "client_ip": "",                               // [可选] 出口公网 IP，留空则启动时自动探测
-    "timezone": "Asia/Shanghai",                   // [可选] 时区 (默认: "Asia/Shanghai")
-    "proxy_url": null,                             // [可选] 网络代理 URL，例如 "http://127.0.0.1:7890" (默认: null)
-    "direct": true,                                // [可选] 是否直连 (默认: true)
-    "approval": {                                // [可选] 原生审批策略，不改变长期权限规则
-      "mode": "manual",                         // manual / allow_all / deny_all
-      "notify": true,                             // 自动决定后通知，默认开启
-      "sync_interval_s": 180                       // 审批补偿全量同步间隔，正整数秒，默认 180
-    }
-  },
-  "adapters": {
-    "qq": {
-      "enabled": true,                             // [必填] 是否启用 QQ 官方机器人适配器
-      "app_id": "YOUR_QQ_APP_ID",                  // [必填] QQ 机器人 AppID
-      "app_secret": "YOUR_QQ_APP_SECRET",          // [必填] QQ 机器人 AppSecret
-      "admin_id": [                                // [可选] 管理员 OpenID 列表
-        "YOUR_ADMIN_OPENID"
-      ],
-      "admin_only": true,                          // [可选] 会话管理指令的管理员限制 (默认: true)
-      "credentials_in_place": true,                // [可选] 允许管理员在凭证所在群填写；群成员可见输入，设 false 则只能私聊填写 (默认: true)
-      "approvals_in_place": true,                  // [可选] 审批卡只推送到会话所在聊天，不另发管理员 (默认: true)
-      "allow_all_private": false,                  // [可选] 是否放开所有私聊访问（默认: false）
-      "allow_all_group": false,                    // [可选] 是否放开所有群聊互动（默认: false）
-      "whitelist": {                               // [必填] 权限白名单
-        "private": [
-          "YOUR_C2C_OPENID"                        // 允许私聊机器人的用户 OpenID 列表
-        ],
-        "YOUR_GROUP_OPENID": "*"                   // 允许互动的群 OpenID: "*" 表示群员全员开放，或配置指定成员 OpenID 列表
-      },
-      "session_map_file": "data/qq_session_map.json", // [可选] 群/私聊 -> Muse 会话映射文件 (默认: "data/qq_session_map.json")
-      "session_bindings": {},                      // [可选] 预置绑定，如 {"group:<group_openid>": "<session_id>"}
-      "delivered_file": "data/qq_delivered.jsonl", // [可选] 已投递消息去重记录文件路径 (默认: "data/qq_delivered.jsonl")
-      "push_state_file": "data/qq_push_state.json", // [可选] 推送水位持久化文件路径 (默认: "data/qq_push_state.json")
-      "catch_up_enabled": false,                   // [可选] 启动时是否补推离线期间产生的未推送消息 (默认: false，全量标为已读)
-      "catch_up_window_s": 21600,                  // [可选] 补推允许的最大离线时间窗口 (秒，默认: 21600 = 6小时)
-      "catch_up_max_messages": 5,                  // [可选] 单次补推的最大消息条数 (默认: 5，防止刷屏)
-      "recheck_sleep_s": 5,                        // [可选] 会话空闲时的出站复查间隔 (秒，默认: 5)
-      "in_flight_ttl_s": 300,                      // [可选] 发送中消息的去重锁有效期 (秒，默认: 300)
-      "processing_ttl_s": 300,                     // [可选] 处理中消息的去重锁有效期 (秒，默认: 300)
-      "ws_guid": "258EAFA5-E914-47DA-95CA-C5AB0DC85B11", // [可选] QQ Gateway 握手 GUID
-      "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/155.0.0.0 Safari/537.36", // [可选] 全局统一 HTTP/WS User-Agent
-      "chunk_chars": 1200,                         // [可选] 单条消息文本最大切片字符数 (默认: 1200)
-      "max_chunks": 8,                             // [可选] 单轮回复最大允许发送的切片数量 (默认: 8)
-      "max_active_chunks": 2,                      // [可选] 被动回复额度耗尽后，允许消耗的主动消息配额条数 (默认: 2)
-      "max_image_bytes": 8388608,                  // [可选] 图片下载/上传字节上限 (默认: 8MB)
-      "max_file_bytes": 26214400,                  // [可选] 文件下载/上传字节上限 (默认: 25MB)
-      "max_video_bytes": 104857600,                // [可选] 视频下载字节上限 (默认: 100MB)
-      "max_video_upload_bytes": 10485760,          // [可选] QQ 视频接口单文件上传上限 (默认: 10MB)
-      "file_ref_threshold_bytes": 2097152,         // [可选] 大文件切片上传阈值 (默认: 2MB，超量自动转为 file_ref 上传)
-      "gateway_dedup_s": 120,                      // [可选] QQ 网关事件去重窗口秒数 (默认: 120)
-      "download_timeout_s": 60,                    // [可选] 附件下载超时时间 (秒，默认: 60)
-      "download_proxy": "",                        // [可选] 针对受阻域名的专用代理前缀，例如 "https://proxy.example.com/https/"
-      "debug": false                               // [可选] 旧兼容开关，仅在 logging.level 未指定时选用 DEBUG (默认: false)
-    },
-    "onebot": {
-      "enabled": false,                            // [可选] 是否启用 OneBot (NapCat v11) 适配器 (默认: false)
-      "base_url": "https://onebot.example.com",    // [必填-若启用] OneBot HTTP API 地址
-      "access_token": "YOUR_ONEBOT_TOKEN",         // [必填-若启用] OneBot API Bearer Token
-      "ws_url": "wss://onebot.example.com",        // [必填-若启用] OneBot 正向 WebSocket 事件流地址
-                                                   // access_token / base_url / ws_url 也可用环境变量
-                                                   // ONEBOT_ACCESS_TOKEN / ONEBOT_BASE_URL / ONEBOT_WS_URL 提供；ws_url 留空时由 base_url 推出
-      "admin_id": ["YOUR_ADMIN_QQ"],               // [可选] 管理员 QQ 号（审批、凭证、/登录、管理指令）
-      "group_trigger": "all",                      // [可选] 群消息触发：all 全部 / at 需 @机器人或 / 指令 / prefix 仅 / 指令 (默认: all)
-      "typing_enabled": false,                     // [可选] 私聊回复期间是否展示「正在输入...」(NapCat set_input_status，默认: false)
-      "whitelist": {                               // [必填-若启用] 与 QQ 同格式；为空时拒绝所有聊天
-        "private": ["YOUR_ADMIN_QQ"],              // 允许私聊的 QQ 号
-        "YOUR_GROUP_ID": "*"                       // 群号: "*" 全员开放，或成员 QQ 号列表；旧写法 "groups": [群号] 仍兼容
-      }
-      // 其余字段与 adapters.qq 相同：admin_only、approvals_in_place、credentials_in_place、
-      // unbound_push_to_admin、access_requests、session_bindings、catch_up_*、chunk_chars、max_*_bytes 等；
-      // 状态文件默认 data/onebot_*.json，与 QQ 分开
-    }
-  },
-  "gateway": {                                     // [可选] 跨通道与网关协同配置
-    "login_through_adapter": "qq",                 // 允许通过指定适配器进行登录认证
-    "background_approval_push": ""                  // 后台审批只推管理员私聊：qq:<管理员OpenID> / onebot:<管理员QQ号>；空值自动选最近活跃管理员私聊
-  },
-  "overrides": {                                   // [可选] 全局顶层参数覆盖字典 (优先级最高)
-    "chunk_chars": 1200,
-    "timezone": "Asia/Shanghai"
-  }
-}
-```
+---
 
-## 日志与 JSONL 追踪
+## 贡献与许可证
 
-在配置文件顶层增加 `logging`（完整示例见 `config.example.json`）：
-警告！：开启追踪会生成大量日志，可能影响性能和磁盘空间，日志已脱敏，但仍包含QQ消息等隐私信息，请妥善管理，谨慎使用！
-```json
-{
-  "logging": {
-    "level": "INFO",
-    "console": true,
-    "file": "logs/bridge.log",
-    "trace": false,                 // [可选] 是否开启 JSONL 追踪 (默认: false)
-    "trace_file": "logs/trace.jsonl",
-    "payload_limit": 65536,
-    "max_bytes": 10485760,
-    "backup_count": 5
-  }
-}
-```
-
-- **等级优先级**：显式 `logging.level` 优先，支持 `TRACE` / `DEBUG` / `INFO` / `WARNING` / `ERROR` / `CRITICAL` / `OFF`（大小写不敏感）。未指定等级时，旧顶层 `debug`、QQ `debug` 或环境变量 `QQ_DEBUG` 开启则使用 `DEBUG`，否则 `INFO`；旧字段保留。显式 `INFO` 或 `OFF` 不会被旧 debug 标志覆盖。
-- **目的地**：`console` 控制 stderr 运行日志，`file` 控制文本运行日志；`file: ""` 或 `null` 禁用文件输出。`trace: true` 单独开启 JSONL 追踪，不会因 `DEBUG` / `TRACE` 等级自动打开；`OFF` 同时关闭运行日志与追踪。开启追踪时 `trace_file` 必须非空且不能与 `file` 指向同一路径；未开启时可设为空或 `null`。相对路径基于进程工作目录。
-- **JSONL 模式**：每行一个 JSON 对象，包含 schema 版本、UTC 时间、单调时钟、运行 ID、顺序号、组件/事件，以及可用的关联 ID、耗时、状态与脱敏 payload。用于串联诊断事件与 HTTP 请求/响应，不改变请求、重试或业务行为，也不主动消费尚未读完的流。运行日志与 JSONL 不混写。
-- **大小与保留**：`payload_limit` 为单事件脱敏后 payload 的 UTF-8 字节限制，默认 65536；超出时记录截断预览、长度与摘要。`0` 表示不限，**不是关闭脱敏**；大消息会增加隐私暴露面、磁盘占用和写入压力，通常不建议长期使用。`max_bytes` 必须为正整数（默认 10 MiB），`backup_count` 为至少 1 的整数（默认 5）；两个文件分别按大小轮转，保留当前文件与最多 5 个备份（`.1` 至 `.5`），不是按天保留，单条大记录可能超过阈值。开关必须为 JSON 布尔值，数字字段不接受字符串、浮点数或布尔值。
-- **隐私与重放限制**：认证请求、Token、Cookie、Authorization、密码、验证码和凭证授权等会被遮蔽，低层交互敏感输入/消息正文也受保护；二进制或无法安全解释的内容仅保留省略标记、长度或摘要。日志不是完整抓包，不能依靠它原样重放认证、凭证、敏感输入或二进制请求。脱敏不能保证识别任意业务字段中的个人信息；即使截断/脱敏后也应限制访问、及时清理，分享前人工检查。不要记录完整配置或真实凭据，也不要提交日志；默认目录及轮转文件已加入 `.gitignore`。
-
-`main.py` 在加载配置前先启用不创建文件的安全默认日志，加载完成后再应用完整配置；加载中的出口 IP 探测行为保持不变。`--check` 的业务输出、CLI 用户提示和交互 `input()` 不受日志开关影响。独立登录工具同样读取日志配置，原有 `--email` / `--output` 行为不变：
-
-```bash
-python tools/login.py --config config.json --output cookies.json
-```
-
-临时诊断可将 `trace` 改为 `true`，排查后关闭并按需删除本地日志；日志目录不可写等日志故障不应阻止认证或消息投递。不要为排查而把真实 Cookie、Token、验证码或密码写进示例配置、日志消息或测试。
-
-## 白名单与权限管理
-
-系统支持细粒度白名单、动态申请审批，以及全局放开模式（QQ 与 OneBot 通用）：
-
-### 全局放开选项
-
-在对应适配器（`adapters.qq` 或 `adapters.onebot`）中配置：
-
-- `allow_all_private: true`：允许任意用户通过私聊与机器人互动，跳过私聊白名单检查。
-- `allow_all_group: true`：允许任意群聊及其全体成员与机器人互动，跳过群白名单检查。
-- 两项默认均为 `false`，此时严格执行静态 `whitelist` 及动态申请授权。
-
-### 白名单申请
-
-新私聊或新群无需先加入白名单即可向机器人发送申请；普通消息仍不会转发。
-
-- `/申请`：申请当前用户的私聊访问，或在当前群内仅允许申请人使用。
-- `/申请 全员`：申请将当前群对所有成员开放，不影响其他群或私聊。已能使用的成员也可申请全员升级。
-- 管理员收到私聊通知后，发送 `/申请审批 编号 同意` 或 `/申请审批 编号 拒绝`；单独发送 `/申请审批` 查看待处理申请。只允许配置中的管理员在私聊审批。
-- 批准后立即生效并通知原聊天；拒绝不改变已有权限。不会授予管理员权限，也不会补发此前被拦截的消息。
-
-在 `adapters.qq` 中配置：
-
-```json
-"access_requests": {
-  "enabled": true,
-  "auto_approve": false,
-  "state_file": "data/qq_access.local.json"
-}
-```
-
-默认人工审批。显式设置 `auto_approve: true` 后，新申请会直接通过并加入有效白名单，包括 `/申请 全员` 的整群开放；这意味着任何能向机器人发送申请的新群都可自行开通。开启前请确认这是期望的访问策略。切换自动模式不会自动批准已有待办。`enabled: false` 停止接收新申请，已有授权和管理员处理待办仍可用。
-
-动态授权与申请记录原子保存到 `state_file`，与配置中的静态白名单合并生效，不改写含密钥的配置文件。删除状态文件会丢失动态授权；修改静态白名单不会撤销已批准的动态授权。文件损坏或不属于当前 QQ 应用时拒绝启动，避免静默重置权限。单实例使用该文件，不支持多个进程同时写入。运行状态文件无需提交。
-
-### 运行状态文件（`data/`）
-
-以下运行状态文件默认写入项目根目录的 `data/`（可各自在配置中改写路径），目录在首次写入时自动创建：
-
-| 文件 | 内容 | 配置项 |
-| :--- | :--- | :--- |
-| `data/qq_access.local.json` | 动态白名单授权与申请记录 | `adapters.qq.access_requests.state_file` |
-| `data/qq_delivered.jsonl` | 已投递消息去重记录（追加写入） | `adapters.qq.delivered_file` |
-| `data/qq_push_state.json` | 主动推送水位与已见消息 | `adapters.qq.push_state_file` |
-| `data/qq_routes.json` | 消息 ID -> QQ 目标路由（重启后仍可被动回复） | `adapters.qq.routes_file` |
-| `data/qq_session_map.json` | 群/私聊到 Muse 会话的映射 | `adapters.qq.session_map_file` |
-| `data/onebot_*.json(l)` | OneBot 的同类文件（access、delivered、push_state、routes、session_map） | `adapters.onebot.*_file` |
-
-`data/` 已在 `.gitignore` 中忽略。从旧版升级时，将根目录下的同名文件移入 `data/` 即可保留原有状态（不移动则按空状态重新开始）。
-
-重复待办合并；每人新申请间隔至少一分钟，已处理申请重提需等待十分钟，待办七天过期。管理员通知失败时保留待办，可稍后重发申请或由管理员查询；通知和授权结果不等同 QQ 一定送达。
-
-申请只开通聊天访问；获批的群/私聊同样拥有独立的 Muse 会话。登录、凭证、Muse 原生审批仍沿用各自管理员权限。
-
-## 登录、密钥、凭证与审批交互
-
-- **连接器密钥**：显示 `【Matlab Mcp提示】连接器（需要输入单行秘钥/授权凭据）` 一类提示时，管理员引用密钥卡发送**一行密钥**即可；也可发送 `/密钥 编号`（别名 `/key`）后发送一行，或 `/密钥 编号 密钥`。无需账号，两行输入会被拒绝，不会转发给模型。`/密钥` 与 `/凭证` 分别列出对应卡片；成功提示为 `【密钥已保存】`。支持网页的 v2 自定义 API-key connector spec 和内置 API-key 回调；其他授权类型仍在网页完成。连接器提交走 `authd` 的注册/回调接口，而非账号密码的 vault capture；只有接口确认成功才保存本地完成回执，不猜测远端卡片完成接口。结果不确定时仅允许同一密钥重试。IM 输入仍会经过 QQ/微信等通道，不等同网页安全输入。
-
-三类交互共用临时状态与身份校验，但不混用协议：
-
-- **登录**：管理员私聊发送 `/登录` 或 `/登录 邮箱`，再输入验证码。直接发送邮箱不再触发登录。`admin_only: false` 不会放开登录、凭证或审批的管理员权限。
-- **凭证**：回复凭证卡即可填写；账号和密码可一次分两行发送，信息不足时只询问缺少的一项。也支持 `/凭证 编号 [保存|一次]` 后连续输入。仅引用凭证卡或显式发送 `/凭证 编号`（及兼容凭证命令）才进入凭证输入模式，不根据消息行数或待填卡数量自动选择。验证码卡只需回复验证码。凭证库的单字段秘密卡（创建密码、API key、SSH 私钥、OTP 种子等）只需引用卡片发送完整内容，无需虚构账号，支持整段多行私钥；也可先 `/凭证 编号 [保存|一次]` 再发送。账号/密码卡可在第一行发送账号、后续各行发送多行密钥。保存成功后自动返回聊天，无需 `/聊天`。第三方登录仍在 Muse 网页完成。
-- **原处填写**：`credentials_in_place`（QQ、OneBot 与 Telegram 均默认 `true`）允许管理员在凭证所在群内填写，回复凭证卡分两行发账号和密码即可；设为 `false` 则群内提示「请私聊填写此凭证」，需管理员私聊填写。群内输入对群成员可见。不会放开普通成员权限，也不能填写其他群的凭证。
-- **引用识别**：仅关联机器人实际发送成功的消息；不凭引用文字猜测卡片。服务重启后旧消息的引用关联不保留，可发送 `/凭证` 查看当前可填写的卡片，再按编号填写。
-- **审批**：按当前卡实际提供的原生选项逐项展示，保留长期允许范围及顺序；当前聊天绑定会话正在等待审批时可直接回复数字；其他聊天只能引用审批卡回复数字，或使用 `/审批 编号 选项数字`。管理员私聊可查看管理中的所有会话；群聊只能操作本群绑定会话。
-- **审批排队**：Muse 同时发起多个审批时，每个会话按请求时间排队，一次只推送一张卡，卡头显示 `【审批 编号】序号/总数`；处理完当前卡后，结果与下一张卡合并为一条消息发出，全部完成后提示可继续聊天。回复 `数字 all`（或 `/审批 all 数字`）对当前已显示队列全部使用该选项：按决定类型与长期范围匹配各卡的同义选项，没有相同选项的卡保留待审批；之后新到的审批不受影响。管理员私聊操作其他会话或后台队列时，需引用对应审批卡，或用 `/审批 编号 数字` 指定；批量可用 `/审批 编号 数字 全部`，不会因收到或查看卡片接管普通消息。
-- **原位推送审批**：默认 `adapters.qq.approvals_in_place: true`，审批卡只推送到会话所在的聊天，不再另发管理员私聊；找不到所在聊天或发送失败时才退回发给管理员。设为 `false` 则会话聊天与管理员私聊都会收到。
-- **后台审批**：定时任务（`scope_type: schedule` / `scheduler.cron`）或服务端明确标记为 `background` 的审批进入独立后台队列，不绑定任何聊天、不因缺少 `thread_id` 阻塞其他会话。统一只推管理员私聊，不受 `approvals_in_place` 控制，不发原聊天或群。`gateway.background_approval_push` 可指定 `qq:<管理员OpenID>` 或 `onebot:<管理员QQ号>`，目标必须属于已启用适配器的 `admin_id`；QQ 官方机器人不能填普通 QQ 号。留空/省略时，从启用的 QQ / OneBot 中选择最近收到管理员私聊消息的单一会话（含本地命令、审批回复），出站通知不刷新活跃时间。活跃记录按平台/账号隔离，保存在各适配器 `routes_file + .admins.local.json`，重启保留；配置管理员列表变更后会重新检查权限。选中的收件箱在重试与卡片修订时保持不变，不跨网关重复广播。
-- **无可用后台收件箱**：保持待办，管理员私聊后由约三秒一次的协调循环补推；发送失败也保留待办，不擅自放行或拒绝。管理员私聊 `/审批` 可查看后台队列，但查看或收到推送不会进入网关输入流程；后台审批只能引用对应卡片回复选项数字，或发送 `/审批 编号 数字`（批量为 `/审批 编号 数字 全部`）。未引用卡片的数字、多行文本及其他普通消息仍正常转发，不按内容推断为审批；群聊无权处理后台审批。网页端结束审批后自动同步，不再推送待办。
-- **门禁**：对应 Muse 会话未结束的审批会拦截 QQ、OneBot 的普通发送；消息直接丢弃，不排队、不在审批后补发。QQ 再次返回审批卡。审批内容/版本变化后必须重新选择。后台队列只等待后台任务本身；未明确作用域的未知审批、网络/状态查询错误仍保守阻塞，不把它们当成没有审批。
-- **退出**：`/取消`（流程进行中也可直接发“取消”/“退出”）结束本地登录或凭证输入并清除临时秘密，不会取消远端审批；登录完成、凭证保存成功会自动退出。临时输入约五分钟过期，过期后五分钟内的第一条消息会被拦截一次（防止迟到的密码或验证码被转发），之后恢复正常转发。
-- **转发规则**：凭证填写只由引用已关联的凭证卡或显式凭证命令触发。进入凭证输入模式后，未引用消息的后续输入用于填写；引用其他消息仍按普通消息转发，无论单行、多行或待填卡数量，且不退出已有凭证输入模式。未进入输入模式时，未引用卡片的多行消息也正常转发，不自动选卡。斜杠命令、登录流程、审批交互及群聊触发规则保持原有行为。
-
-IM 私聊不等同网页安全输入：密码、验证码和私钥等秘密仍经过 IM 链路，群内发送对群成员可见；敏感密钥建议管理员私聊填写。交互正文在日志前消费；不持久化临时密码、验证码、私钥或卡片授权。凭证提交使用固定幂等键；结果不确定时仅接受相同输入重试。审批提交结果不确定时先查询远端，不自动重复决定；管理员再次回复选项数字或发送审批命令时可重新提交，也可改选拒绝，重复决定由服务端处理。重试仍核对远端状态及卡片版本，已结束或内容已变化的审批不会按旧选择提交。
-
-在 `muse` 中配置：
-
-```json
-"approval": {
-  "mode": "manual",
-  "notify": true,
-  "sync_interval_s": 180
-}
-```
-
-- `manual`：用户选择；`allow_all`：对每个待审批请求选择单次允许；`deny_all`：逐个拒绝。自动模式不创建长期允许/拒绝规则。
-- `notify` 只控制自动决定后的结果通知，默认开启；人工审批仍展示卡片。后台审批同样遵循 `manual` / `allow_all` / `deny_all`：自动决定先于推送，无管理员私聊或推送失败也照常单次放行/拒绝，不授予永久权限。开启结果通知但暂时没有收件箱时，结果在当前进程中保留待补推（重启不重发自动结果，待审批本身从远端恢复）。实际生产配置不会随示例或测试自动切换模式。
-- 原生 `decision_options` 存在时（即使为空）为权威列表，不从标签、域名或排他标记猜测范围。仅在该字段缺失且请求类型受支持时，采用网页源码已验证的旧版回退规则；无法验证选项时保留门禁并引导网页处理。若只提供长期权限选项，自动策略不擅自创建长期规则，而是交回人工选择。
-- 单字段卡按明确的 capture 类型提交受保护字段，不根据标题猜测字段类型；未知类型、字段与卡片 URL 冲突时仍回退网页。旧版 `create_password` 卡允许不带 `capture_authorization`（与已验证的 Authd 行为一致），其他卡仍要求授权；所有提交都带所属会话 ID。
-- 凭证 capture 返回有效 ID 才记录完成；网页成功回调也只更新本地展示，不额外猜测远端卡片完成接口。桥接在 `cookies_file + .captures.local.json` 中原子保存目标/会话/卡片/授权上下文的 SHA-256 回执，以防重启重开已成功提交的同一卡片。文件不含账号、密码、验证码、授权原文或 capture ID；删除该回执文件会丢失本地完成去重，损坏或不可读时拒绝启动。远端 `credential_capture_completed` 状态仍以服务器事件为准。
-- 审批由独立的账号级 `daemon/chat.subscribe` 订阅接收 `approvals.snapshot`，同时覆盖前台与后台审批；不依赖聊天是否已有出站订阅。**普通发送只读本地审批门禁，不再逐条查询 `/approvals`**。启动时先检查远端审批，之后按 `sync_interval_s`（默认 **180 秒**，必须为正整数）全量补偿同步；事件通知不等待慢速补偿查询完成。断线、凭据轮换、无效快照及状态查询失败时保守门禁并重新同步；旧连接或过时查询结果不能覆盖较新事件。快照中消失但没有明确终态的审批保留门禁，再查详情确认。约三秒的本地通知补推／故障重试不是正常全量查询周期。用户显式处理审批时仍查询远端状态与版本，不自动重试不确定的决定。详见 [事件驱动审批说明](docs/approval-event-driven.md) 与 [网页运行时证据](docs/approval-events-runtime.md)。
-
-## 会话隔离
-
-QQ 与 OneBot 适配器中每个群、每个私聊用户各自绑定一个 Muse 会话，互不可见（两个平台的映射文件分开，互不串号）。需要多个聊天共用同一会话时，在各聊天中 `/切换` 到同一个会话 ID，或用 `session_bindings` 预置。
-
-相关选项：
-
-- `session_map_file`（默认 `data/qq_session_map.json`）：`群/私聊 -> Muse session_id` 映射，重启后保持。
-- `session_bindings`：预置绑定，键为 `group:<group_openid>` 或 `private:<user_openid>`，值为已有的 Muse `session_id`。
-- `session_hot_window_s` / `session_sweep_s`：出站检测参数（见下）。
-- `unbound_push_to_admin`：兼容旧配置保留，不再允许未绑定会话兜底推送管理员。没有任何聊天绑定的会话不监听、不推送其聊天审批卡和凭证卡；明确属于后台任务的审批不属于聊天会话，单独遵循 `gateway.background_approval_push`。
-
-出站消息的投递顺序：
-
-1. 有对应提问的回复，被动回复到提问所在的群/私聊。
-2. 提醒等无对应提问的主动消息，推到该会话绑定的群/私聊（多个聊天共用时取映射中的第一个）。群主动消息被 QQ 拒绝时改发管理员私聊。
-3. 会话没有绑定任何聊天时停止订阅并丢弃迟到消息，不再转发管理员。
-4. 切换后的旧路由不能向已经离开该会话的群/私聊继续投递；若仍有其他聊天绑定，则只向现有绑定投递。
-
-行为说明：
-
-- 首次收到某个群/私聊的消息时自动新建会话（新 UUID）；`/新建`、`/切换` 只改变发指令的这个群/私聊。
-- 出站不会轮询所有会话历史：每轮只调用一次 `/api/session/list`，按 `updated_at_ms` 变化判断哪个会话有新活动（等价于网页端的 `sessions.updated` 事件），只拉取有变化或刚发过消息的会话历史。
-- 运行中切换到已有会话时，会先把该会话旧消息标记为已读，不会回放历史。
-
-## 双向消息引用与 Muse 反应
-
-- **渠道 → Muse**：引用已关联的消息时，桥接发送 Muse 原生 `in_reply_to`；引用展示卡时发送 `reply_to_target`。账号、群/私聊及当前 Muse 会话分别隔离，切换会话后不会误引用旧会话。登录和凭证输入先由本地交互处理，不进入普通消息引用索引。
-- **Muse → 渠道**：官方 QQ 使用 `message_reference.message_id`，优先选择不透明的 `REFIDX`；OneBot 使用 Array `reply` 段。原生引用与 QQ 被动回复授权 `msg_id` / `msg_seq` 分开处理。每个成功发送的文本分段、图片和视频都记录消息 ID。
-- **仅原消息查不到时降级**：当前聊天没有对应原消息时，用文字标明「原消息在此聊天不可用」，不会拿另一个群或会话的文本代替。原生引用 API 报错不会改发文字引用；引用导致 Muse 返回查无消息时，也不会自动重建会话或重发。
-- **文件**：OneBot 的 `upload_*_file` 不返回可引用的聊天消息 ID，因此附发一条可原生引用的「【文件】文件名」说明。回复该说明可关联到原来的 Muse 展示卡；不把文件 ID 冒充消息 ID。
-- **点赞及其他反应**：同时处理 Muse 历史的 `reaction_emoji` 和实时 `reactions.updated`，网关会将取消事件标记为 `is_removal` 一并下发给适配器处理：支持原生反应的渠道（如 Telegram 在 73 个固定表情内）直接调用原生接口贴上或摘除；不支持原生反应的渠道（以及 Telegram 列表外表情的回落）忽略纯取消并仅在新增/替换时发送新增的 emoji。各适配器均可在自身配置下独立设置 `reaction_quote`（默认 `false`），用于控制回落为普通消息发送的 reaction 是否引用原消息（默认不引用，使消息列表更干净；不影响 Telegram 原生 `setMessageReaction`）。反应独立于原消息投递去重；启动基线不重放旧反应，重复和乱序的实时更新不重复推送。
-- **持久化**：引用索引和反应状态保存在 `<routes_file>.references.local.json`，最多保留各 4096 条记录及每条 240 字符的普通消息摘要。官方 QQ 按应用隔离，OneBot 按接口地址及登录账号隔离；文件不保存凭证输入或完整原始事件，应与其他本地状态一样妥善保管，不提交仓库。
-
-## OneBot (NapCat) 适配器
-
-OneBot 与 QQ 走同一个 Gateway 层（`muse_bridge/gateway/`），会话隔离、斜杠命令、`admin_only`、白名单申请、登录/凭证/审批、主动推送的行为与 QQ 一致；适配器只负责把 NapCat 事件转成统一消息、调用 NapCat API 发出。
-
-- **连接**：HTTP API（`base_url`）发消息，正向 WebSocket（`ws_url`，留空则由 `base_url` 推出）收事件。WS 断开后按 1s、2s、4s…最长 30s 退避重连。证书不校验（兼容自签证书）。请求带自定义 User-Agent，Cloudflare 会拒绝 Python 默认 UA（错误 1010）。
-- **消息格式**：按 Array 消息段解析 `text`、`at`、`reply`、`image`、`video`、`file`、`record`；`message_format: string`（CQ 码）只取文本、@ 与引用。
-- **过滤**：丢弃机器人自己发的消息（`self_id`）与 `message_sent` 事件；按 `message_id` 去重。
-- **群触发**：`group_trigger` 为 `all`（默认，群内所有消息）、`at`（需 @机器人，或以 `/` 开头的指令）、`prefix`（只处理 `/` 指令）。私聊不受影响。
-- **私聊输入状态**：`typing_enabled: true`（默认 `false`）时，私聊消息进入转发流程至 Muse 本轮结束（回复投递完成、弹出审批/凭证/密钥卡、`/停止`、会话切换或停机）期间，通过 NapCat 扩展接口 `set_input_status` 展示并保活「正在输入...」；群聊、未授权私聊及斜杠指令不触发。需机器人 QQ 开启「展示我的输入状态」。
-- **回复与推送**：OneBot 没有被动回复窗口，回复和主动推送都直接发送，投递顺序同上（提问所在聊天 → 会话绑定的聊天 → 管理员 → 丢弃）。长文本按 `chunk_chars` / `max_chunks` 分段；图片、视频以 `base64://` 消息段发送，文件走 `upload_group_file` / `upload_private_file`。群发送被 NapCat 拒绝（`retcode != 0`，如被禁言、被移出群）时，加「【群消息提醒】」前缀改发第一个管理员私聊；网络超时不会改发，避免重复。
-- **收图与文件**：图片段自带可下载的 QQ CDN 地址（含 rkey），直接下载。文件段只有 `file_id`，依次尝试 `get_file`（base64 或 http 地址）与 `get_group_file_url`；NapCat 只给出它本机路径时无法读取，Muse 收到的消息会附「[file下载失败：NapCat 未提供可下载地址]」。
-- **凭证引用**：回复（引用）凭证提示消息即可选中该凭证，等同 QQ 的引用回复。
-- **白名单**：与 QQ 同格式，QQ 号、群号写成字符串或数字均可；为空时拒绝所有聊天（旧版 OneBot 原型为空即放行，已改）。旧写法 `"groups": [群号]` 等价于这些群 `"*"`。
-- **审批卡与登录**：聊天审批卡只推送到拥有该会话的适配器，未绑定会话不广播管理员；后台审批统一按 `gateway.background_approval_push` 选择一个管理员私聊收件箱。`gateway.login_through_adapter` 设为 `"onebot"` 时，凭据失效的登录提醒发给 OneBot 管理员。
-
-### Muse 动态同步（统一网关协调，支持 QQ 空间或私聊推送）
-
-动态轮询、时间窗口、滚动配额与先落盘预留后发送的幂等账本统一由 `UnifiedGateway` 的 `GatewayFeedCoordinator` 管理：
-- **统一配置（推荐）**：可在 `gateway.feed` 中按平台配置投递模式（`"native"` 发往平台原生动态广场如 OneBot QQ 空间；`"chat"` 渲染为图文消息发往该平台管理员/扫码用户私聊；`"auto"` 有原生广场走原生，否则走私聊），多平台同时启用时上游 `GET /api/feed` 每轮只拉取一次，各渠道账本相互独立。
-- **OneBot 原有配置兼容**：`adapters.onebot.qzone_feed` 继续保留并完全兼容原有 `data/onebot_qzone_feed.local.json` 状态文件。原生 QQ 空间发表需要 OneBot 后端支持 SnowLuma 扩展动作 [`send_qzone_msg`](https://snowluma.github.io/zh/docs/api/qzone/send_qzone_msg)；**这不是 OneBot v11 标准接口，不保证普通 NapCat 版本支持**。只实现发表，不读取、点赞、评论或删除空间内容。客户端方法 `OneBotClient.send_qzone_msg(content, images=[...])` 支持纯文本及图文，图片源支持 HTTP(S)、`file://`、`base64://`，返回经校验的 `tid` / `time`。
-
-在 `adapters.onebot` 下增加以下配置，或在配置编辑器的 OneBot 分类选择 **15**。自动同步默认关闭；启用后会把当前登录 Muse 账号的个人动态正文、标题和图片发布到当前 OneBot 登录账号的空间，内容可能包含私人信息，请先检查可见范围。
-
-```json
-"qzone_feed": {
-  "enabled": false,
-  "poll_interval_s": 300,
-  "max_age_s": 3600,
-  "scan_limit": 50,
-  "max_per_scan": 3,
-  "min_publish_interval_s": 60,
-  "publish_window_s": 3600,
-  "max_per_window": 5,
-  "ugc_right": 4,
-  "state_file": "data/onebot_qzone_feed.local.json"
-}
-```
-
-- **扫描**：开启时启动立即扫描一次，之后每轮完成后等待 `poll_interval_s` 秒。通过现有 Muse 认证/加密连接读取 `GET /api/feed`，按 `next_cursor` 翻页，最多十页、取最新 `scan_limit` 条（1–100）；不会调用动态生成接口，也不监听聊天会话。
-- **时间和数量窗口**：只考虑最近 `max_age_s` 秒内的动态，未知时间及未来时间跳过；每轮最多取最新 `max_per_scan` 条未处理动态，按时间从旧到新发布。每个滚动 `publish_window_s` 秒内最多尝试 `max_per_window` 条。
-- **发送节奏**：每次发表尝试至少间隔 `min_publish_interval_s` 秒，间隔及滚动计数跨重启保留。默认每 5 分钟扫描、最近 1 小时、每轮最多 3 条、每小时最多 5 条、发送间隔至少 60 秒。这些是防刷屏的保守节奏，不保证平台不会限制账号；遇到拒绝不会绕过平台限制。
-- **图片**：公开 HTTP(S) 图片由后端上传；Muse 受保护的动态图片通过 `GET /api/feed/units/{unit_id}/media/{handle}` 获取后转成 base64，单张大小沿用 OneBot 的 `max_image_bytes`。最多 9 张；视频只取已有封面，不发布视频；不会执行动态内的 widget HTML。
-- **可见范围**：自动同步支持 `ugc_right` 为 `1`（所有人）、`4`（好友，默认）、`64`（仅自己）。底层发送方法另支持文档定义的部分好友权限参数。
-- **持久化与失败**：状态文件按 Muse 来源和 OneBot 账号隔离，发表前原子落盘记录尝试；同一动态跨轮次、跨重启不重复发表。发送失败或结果不明时，该条不会自动重试，可能漏发，但优先避免重复公开发布。图片准备失败不发表残缺内容。状态损坏、账号不匹配或写盘失败时停止该轮发送，不自动清空记录；更换账号请配置新的状态文件。不要随意删除状态文件，否则仍在时间窗口内的动态可能重新发表。
-- **独立生命周期**：不影响 QQ 官方适配器和群聊触发规则；关闭开关不扫描、不发布，退出时中断等待并等待正在进行的操作结束。建议单实例运行，不要让多个进程共用同一发表账号与状态文件。
-
-## Telegram Bot API 适配器
-
-Telegram 默认关闭，仅支持官方 Bot API **长轮询**，不需要公网入站端口、OneBot 或个人号登录。先用 `@BotFather` 创建独立测试 bot，把 Token 私下配置到环境变量 `TELEGRAM_BOT_TOKEN`（或本地配置 `bot_token`），再在 `adapters` 中加入：
-
-```json
-"telegram": {
-  "enabled": true,
-  "admin_id": ["123456789"],
-  "whitelist": {"private": ["123456789"]},
-  "group_trigger": "at",
-  "seed_main_session": false
-}
-```
-
-- `123456789` 换成你的 **Telegram 数字用户 ID**，不是用户名。管理员与白名单是两项独立设置；建议先只放行自己的私聊。只测 Telegram 时，关闭配置内其他适配器。`seed_main_session` 默认关闭，未经显式绑定的 Telegram 聊天会创建独立 Muse 会话。
-- 用 `python main.py --check --config config.json` 检查配置；该检查不会验证 Telegram Token 或连接。用 `python -u main.py --config config.json` 启动，打开 bot 私聊，先发 `/help` 验证收发，再发 `/new` 和一句普通消息。可以用 Telegram 的「回复」功能引用 bot 回复或卡片；不要在 bot 聊天中发送生产密钥。
-- 同一个 Bot Token 只能由一个 `getUpdates` 实例持有，且不能同时配置 webhook。本程序不会自动移除 webhook 或清空积压更新。`proxy_url` 留空表示直连 `api.telegram.org`，不会读取系统代理环境变量；需要代理时填 HTTP(S) 代理地址，例如 `http://127.0.0.1:7890`。`poll_timeout_s` 默认 30 秒。
-- 测普通群时，在 `whitelist` 加入 Telegram **带负号的群 ID**（值为允许的数字用户 ID 列表，或明确写 `"*"` 放行全群）。`at` 处理可见的 `@bot`、针对本 bot 的命令或已关联的引用；Telegram Privacy Mode 可能不提交普通群消息，由平台决定，桥接配置不会扩大可见范围。暂不处理频道、论坛话题或消息编辑。
-- 支持纯文本、图片、文件、视频和原生回复引用。媒体受 Bot API 与本项目配置中较低的限制；图片、文件或视频附件需有可用文件内容。轮询状态保存在 `routes_file` 旁并按 bot ID 隔离；确定未提交的消息可重试，崩溃时结果不明的消息不会重放。
-- 机器人通过 `muse_bridge/adapters/telegram/markdown.py` 将常见 Markdown（`**粗体**`、`*斜体*`、`~~删除线~~`、`||剧透||`、行内代码、代码块、链接、标题、引用、列表和表格）解析为 Telegram `text + entities`（UTF-16 偏移）发送，不需要额外依赖或字符转义。网关要求纯文本时不解析；纯文本引用兜底保持字面内容。若某段仍被 Telegram 拒绝实体格式，仅该段改用纯文本重发。
-- 适配器与网关已打通双向 reaction：用户在 Telegram 给当前会话的消息点 emoji 反应，会经 `POST /reactions/toggle` 同步给 Muse（不回弹重复通知）；Muse 下发的反应会通过 `setMessageReaction` 原生贴在对应的 Telegram 消息上；Bot API 只接受固定的 73 种反应，列表外的 emoji 改用纯文本通知发送（其余渠道始终走这种回落通知），默认不引用原消息，可在各适配器配置中设 `reaction_quote: true` 开启引用。
-
-## 微信 iLink 适配器
-
-微信通道默认关闭。先在 `adapters.wechat` 配置启用开关，再**显式**执行本地扫码登录；启动网桥不会自动发起扫码。仅使用微信时还需设置 `adapters.qq.enabled=false`（旧 QQ 默认开启）；微信首次向导会代为设置。
-
-```json
-"wechat": {
-  "enabled": true,
-  "state_dir": "data/wechat",
-  "channel_version": "2.4.6",
-  "route_tag": "",
-  "http_timeout_s": 35,
-  "polling_timeout_ms": 35000,
-  "typing_enabled": false,
-  "chunk_chars": 4000,
-  "max_chunks": 8,
-  "session_bindings": {}
-}
-```
-
-```bash
-python main.py --config config.json --wechat-login
-```
-
-```bash
-python main.py --config config.json --wechat-status
-```
-
-```bash
-python main.py --config config.json --check
-```
-
-```bash
-python main.py --config config.json
-```
-
-- `--wechat-login` 在终端使用 `qrcode>=8.0` 的 ASCII 二维码（不依赖 Pillow），验证信息隐藏输入。`--wechat-status` **仅显示脱敏本地状态**，不连接微信，也不代表远端登录有效；这两个命令不加载 Muse 配置或探测公网 IP。`--login` 仍是 Muse 登录，与两个微信开关互斥。`--check` 包含微信本地状态，但完整配置加载仍保留原有 IP 探测行为。
-- 微信只做个人私信，协议收到的个人消息直接进入对话，不另设管理员、白名单、访问申请或群聊配置。会话管理、Muse 登录、审批和凭证用文本命令操作。协议要求的扫码登录及 bot token 保留。会话预绑定仅支持 `private:<user_id>`。
-- 文本按 `chunk_chars`（严格整数 1–4000，默认 4000）和 `max_chunks`（正整数）分段。开关必须是 JSON 布尔值；限额和超时拒绝布尔值、数字字符串和非有限数；整数参数也拒绝小数。顶层 `overrides` 仍优先于通道参数（示例的全局 `chunk_chars:1200` 会覆盖微信默认值）。
-- 账号切换后，网关运行文件全部派生到 `state_dir/accounts/<sha256(bot_id)[:24]>/`，包括会话映射、路由及其引用附属文件、推送水位、已投递记录；不创建访问申请文件。全局配置不被修改；`session_bindings` 预设仍按本地配置应用。不要让多个进程共用同一账号状态。
-- 即时命令回复使用当前消息的 **reply 上下文快照**；Muse 异步回复和 proactive 消息使用 **bot + user 的 latest 上下文**。这些上下文不是精确的原生引用保证，不要把 QQ/OneBot 的引用行为直接套用到微信。无群聊、按钮、消息编辑或语音发送；凭证和审批请使用文本命令。
-- 收到 `-14` 后冷却一小时，保留 token，不自动重新扫码。cursor 是 best-effort 持久化；发送结果未知时不盲目重试，优先避免重复消息，因此崩溃或超时可能漏发。
-- 凭据为 **JSON 明文运行文件**，含 bot token；上下文与状态也属于敏感数据。限制 `data/wechat/` 的文件权限、备份访问和分享范围，不提交或公开这些文件，不把二维码、验证信息或完整状态贴到 Issue。
-- 当前仅允许已核实的 iLink API/CDN 主机；未知区域跳转或新域名会安全拒绝，不自动放宽白名单。已有离线协议和桥接测试，但真实账号扫码、区域节点和 CDN 传输尚未验证。
-
-### 独立微信协议测试 CLI
-
-不启动 Muse，直接验证微信收发。**先停掉使用同一账号的网桥**，避免两个长轮询抢消息。脚本仅读取微信配置，不要求 Muse Cookie；微信适配器未启用也可以单独测试。
-
-```bash
-python tests/wechat_cli.py --config config.json
-```
-
-启动菜单选择 **1（复用已保存登录）** 或 **2（扫码登录）**；也可直接要求重新登录：
-
-```bash
-python tests/wechat_cli.py --config config.json --login
-```
-
-进入后实时打印收到的用户、消息 ID、文字和附件保存路径。输入普通文字即可发送；默认目标是扫码用户，使用 `/to <用户ID>` 切换，`/peers` 查看已收到消息的联系人。首次发送需要对方先在微信发来一条消息，以取得发送上下文。
-
-| 命令 | 用途 |
-| --- | --- |
-| `/image "C:\\图片目录\\测试 图片.png"` | 发送图片 |
-| `/file "C:\\文件目录\\测试 文件.pdf"` | 发送文件 |
-| `/video "C:\\视频目录\\测试.mp4"` | 发送视频 |
-| `/to <用户ID>`、`/peers` | 选择目标、查看已收到消息的联系人 |
-| `/status`、`/help` | 脱敏本地状态、命令说明 |
-| `/quit` | 停止轮询并退出（EOF / Ctrl+C 也可退出） |
-
-文件路径可包含空格，Windows 反斜杠不会被当作转义符。接收到的图片、文件、视频和语音自动下载至 `data/wechat_cli/downloads/`，安全处理文件名并避免覆盖；`--download-dir <目录>` 可更换保存位置，`--to <用户ID>` 可指定初始发送目标。下载失败会提示，但不会无限重放同一条消息。控制台与桥接共享账号游标，**测试收到的消息不会再转给 Muse**。
-
-该脚本仍遵守 `-14` 冷却和发送结果未知时不自动重发的规则；重复输入属于新的发送。它提供真实协议测试入口，但本次实现只做了离线自动测试，尚未扫码或实际收发。
-
-协议与边界说明见 [微信 iLink 协议说明](docs/wechat-ilink-protocol.md)。
-
-## 安全与免责声明
-
-- 本项目为非官方工具，与 Muse、腾讯 QQ 官方无关。Muse 接入依赖对网页端协议的逆向分析，可能随服务端更新而失效，也可能违反其服务条款；请只使用自己的账号与机器人，并自行承担使用风险。
-- 仓库不包含任何真实凭据。`config.json`、`cookies.json`、`.mint.json`、`.env*`、`data/`、`logs/` 等均已加入 `.gitignore`。提交前请再次确认没有把 Cookie、Token、OpenID、QQ 号或私有服务器地址带入版本库。
-- 运行日志与 `data/` 下的状态文件可能包含聊天摘要和消息 ID，请按敏感数据处理，不要公开上传。
-- 发现安全问题时请通过 GitHub Security Advisories 私下报告，不要在公开 Issue 中附带凭据或可复现的账号信息。
-
-## 贡献
-
-欢迎提交 Issue 和 Pull Request。
-
-## 许可证
+欢迎通过 [Issues](https://github.com/Bao-qing/muse-im-bridge/issues) 反馈问题、提出建议或提交 Pull Request。
 
 本项目基于 [MIT License](LICENSE) 开源。

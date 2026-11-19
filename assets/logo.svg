@@ -1,0 +1,43 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" width="256" height="256" role="img" aria-label="Muse IM Bridge">
+  <defs>
+    <linearGradient id="bg" x1="20" y1="12" x2="236" y2="244" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#111C36" />
+      <stop offset="55%" stop-color="#0C1427" />
+      <stop offset="100%" stop-color="#070C18" />
+    </linearGradient>
+    <radialGradient id="glow" cx="50%" cy="32%" r="55%">
+      <stop offset="0%" stop-color="#38BDF8" stop-opacity="0.24" />
+      <stop offset="60%" stop-color="#6366F1" stop-opacity="0.08" />
+      <stop offset="100%" stop-color="#070C18" stop-opacity="0" />
+    </radialGradient>
+    <linearGradient id="ribbon" x1="48" y1="186" x2="208" y2="70" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#22D3EE" />
+      <stop offset="50%" stop-color="#60A5FA" />
+      <stop offset="100%" stop-color="#818CF8" />
+    </linearGradient>
+    <linearGradient id="arc" x1="60" y1="198" x2="196" y2="198" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#22D3EE" stop-opacity="0.15" />
+      <stop offset="50%" stop-color="#7DD3FC" stop-opacity="0.95" />
+      <stop offset="100%" stop-color="#818CF8" stop-opacity="0.15" />
+    </linearGradient>
+    <linearGradient id="star" x1="128" y1="40" x2="128" y2="84" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#FFFFFF" />
+      <stop offset="100%" stop-color="#BAE6FD" />
+    </linearGradient>
+  </defs>
+
+  <rect x="8" y="8" width="240" height="240" rx="56" fill="url(#bg)" />
+  <rect x="8" y="8" width="240" height="240" rx="56" fill="url(#glow)" />
+  <rect x="9" y="9" width="238" height="238" rx="55" fill="none" stroke="#94A3B8" stroke-opacity="0.22" stroke-width="2" />
+
+  <path d="M 58 198 Q 128 164 198 198" fill="none" stroke="url(#arc)" stroke-width="8" stroke-linecap="round" />
+
+  <path d="M 58 166 L 58 104 C 58 74 102 74 116 104 L 128 130 L 140 104 C 154 74 198 74 198 104 L 198 166"
+        fill="none" stroke="url(#ribbon)" stroke-width="22" stroke-linecap="round" stroke-linejoin="round" />
+
+  <circle cx="58" cy="198" r="7" fill="#22D3EE" />
+  <circle cx="198" cy="198" r="7" fill="#818CF8" />
+
+  <path d="M 128 40 C 130.5 54 136 59.5 150 62 C 136 64.5 130.5 70 128 84 C 125.5 70 120 64.5 106 62 C 120 59.5 125.5 54 128 40 Z"
+        fill="url(#star)" />
+</svg>
