@@ -73,7 +73,7 @@ def main(argv=None) -> int:
             else:
                 run_status(wechat_config)
             return 0
-        except (KeyboardInterrupt, EOFError):
+        except (KeyboardInterrupt, EOFError, asyncio.CancelledError):
             print("微信操作已取消。")
             return 1
         except Exception:

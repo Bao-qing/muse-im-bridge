@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+from contextlib import suppress
 import getpass
 import json
 
@@ -16,18 +17,27 @@ def display_qr(content: str) -> None:
     qr = qrcode.QRCode(border=2)
     qr.add_data(content)
     qr.make(fit=True)
-    print("请使用微信扫描终端二维码；不要分享二维码或验证信息。")
+    print("请使用微信扫描终端二维码；不要分享二维码或验证信息（按 Ctrl+C 可取消扫码并返回）。")
     qr.print_ascii(invert=True)
 
 
-def verify_code(*_args, **_kwargs) -> str:
+def verify_code(*_args, **_kwargs) -> str | None:
     # Never echo server prompts, tickets, URLs, or the verification value.
-    return getpass.getpass("请输入微信验证信息（隐藏输入）: ").strip()
+    try:
+        return getpass.getpass("请输入微信验证信息（隐藏输入，Ctrl+C 取消）: ").strip()
+    except EOFError:
+        return None
 
 
 def show_status(*_args, **_kwargs) -> None:
     # Auth may supply server payloads: do not print them, even on failure.
     print("微信登录状态已更新，请按终端或微信提示继续。")
+
+
+async def _sigint_wakeup() -> None:
+    """Keep the Windows ProactorEventLoop responsive to Ctrl+C during long-polling."""
+    while True:
+        await asyncio.sleep(0.25)
 
 
 async def _login(config: WeChatConfig, network=None) -> dict:
@@ -39,11 +49,15 @@ async def _login(config: WeChatConfig, network=None) -> dict:
     state = WeChatState(config.state_dir)
     client = WeChatClient(channel_version=config.channel_version, route_tag=config.route_tag,
                           timeout=config.http_timeout_s, route=route)
+    wakeup = asyncio.create_task(_sigint_wakeup())
     try:
         credentials = await WeChatAuth(client).login(
             state.accounts(), display=display_qr, verify=verify_code, on_status=show_status)
         state.save_account(credentials)
     finally:
+        wakeup.cancel()
+        with suppress(asyncio.CancelledError):
+            await wakeup
         await client.aclose()
     print("微信账号已保存并激活，可以开始个人私信对话。")
     # Only return the state-owned redacted summary, not auth credentials.

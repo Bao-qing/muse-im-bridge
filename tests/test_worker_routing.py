@@ -56,7 +56,7 @@ class NetworkConfigTests(unittest.TestCase):
         self.assertEqual(cfg.network.worker.base, "")
         self.assertTrue(cfg.network.worker.ws)
         self.assertTrue(cfg.network.worker.http)
-        self.assertEqual(cfg.muse.proxy, "worker")
+        self.assertEqual(cfg.muse.proxy, "none")
         self.assertEqual(cfg.telegram.proxy, "worker")
         self.assertEqual(cfg.qq.proxy, "none")
         self.assertEqual(cfg.onebot.proxy, "none")

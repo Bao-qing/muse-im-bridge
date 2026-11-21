@@ -113,7 +113,7 @@ class TestWeChatCLI(unittest.TestCase):
         wizard = manage.FirstRunWizard(str(Path(self.tmp.name) / "generated.json"))
         def configure():
             wizard._mark_channel_enabled("wechat", {"enabled": True, "session_bindings": {}}, "已启用")
-        with mock.patch.object(manage, "_prompt_input", side_effect=["4", "n"]), \
+        with mock.patch.object(manage, "_prompt_input", side_effect=["n", "4", "n"]), \
              mock.patch.object(wizard, "_configure_wechat", side_effect=configure), \
              mock.patch.object(wizard, "_listen_for_first_message", new_callable=mock.AsyncMock) as listen, \
              contextlib.redirect_stdout(self.output):
@@ -140,7 +140,7 @@ class TestWeChatCLI(unittest.TestCase):
             with mock.patch.object(manage, "_prompt_input", side_effect=inputs), \
                  mock.patch.object(wizard, "_configure_qq", side_effect=lambda w=wizard: w._mark_channel_enabled("qq", {"app_id": "a", "app_secret": "s"}, "ok")), \
                  mock.patch.object(wizard, "_configure_onebot", side_effect=lambda w=wizard: w._mark_channel_enabled("onebot", {"base_url": "http://127.0.0.1:3000", "access_token": "", "ws_url": "ws://127.0.0.1:3000"}, "ok")), \
-                 mock.patch.object(wizard, "_configure_telegram", side_effect=lambda w=wizard: w._mark_channel_enabled("telegram", {"bot_token": "123:abc", "proxy_url": None}, "ok")), \
+                 mock.patch.object(wizard, "_configure_telegram", side_effect=lambda w=wizard: w._mark_channel_enabled("telegram", {"bot_token": "123:abc", "proxy": "none"}, "ok")), \
                  mock.patch.object(wizard, "_configure_wechat", side_effect=lambda w=wizard: w._mark_channel_enabled("wechat", {"enabled": True}, "ok")), \
                  contextlib.redirect_stdout(self.output):
                 self.assertTrue(wizard._run_channel_setup_loop())
@@ -194,6 +194,14 @@ class TestWeChatCLI(unittest.TestCase):
         self.assertEqual(editor.data["adapters"]["wechat"], {"enabled": True})
         self.assertFalse(editor._modified)
         self.assertNotIn("SECRET", self.output.getvalue())
+
+    def test_wechat_menu_login_ctrl_c_returns_without_exiting(self):
+        editor = manage.FullConfigEditor({"adapters": {"wechat": {"enabled": True}}})
+        with mock.patch.object(manage, "_prompt_input", side_effect=["2", "0"]), mock.patch.object(cli, "run_login", side_effect=KeyboardInterrupt), contextlib.redirect_stdout(self.output):
+            editor._edit_wechat_category()
+        self.assertEqual(editor.data["adapters"]["wechat"], {"enabled": True})
+        self.assertFalse(editor._modified)
+        self.assertIn("已取消微信扫码登录", self.output.getvalue())
 
     def test_wechat_menu_numeric_validation_stays_on_selected_field(self):
         editor = manage.FullConfigEditor({"adapters": {"wechat": {"enabled": True}}})

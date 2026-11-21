@@ -43,7 +43,7 @@
 | `"worker"` | 经 `network.worker` 改写为 `{base}/{scheme}/{host}/...` 转发（未配置 `base` 时报错） |
 
 默认值：
-- `muse.proxy`：`"worker"`
+- `muse.proxy`：`"none"`
 - `adapters.telegram.proxy`：`"worker"`
 - `adapters.qq.proxy` / `adapters.onebot.proxy` / `adapters.wechat.proxy`：`"none"`
 

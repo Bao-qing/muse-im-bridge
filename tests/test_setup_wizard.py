@@ -360,8 +360,8 @@ class TestManageConsoleAndWizardV2(unittest.TestCase):
     def test_qq_instant_probe_retry_and_keep(self):
         import manage
         with mock.patch("manage._prompt_input", side_effect=[
-            "bad_id", "bad_sec", "1",  # fail -> retry
-            "good_id", "good_sec",     # succeed
+            "bad_id", "bad_sec", "", "1",  # fail -> retry
+            "good_id", "good_sec", "",     # succeed
         ]), mock.patch("manage._probe_qq", side_effect=[(False, "invalid"), (True, "ok")]), \
              mock.patch("builtins.print"):
             status, cfg, note = manage._configure_qq_interactive()
@@ -750,6 +750,7 @@ class TestManageConsoleAndWizardV2(unittest.TestCase):
                 "3000",    # base_url -> http://127.0.0.1:3000
                 "tok",     # access_token
                 "",        # default ws_url
+                "",        # default proxy mode ("none") before probe
                 "n",       # skip claiming admin for now
             ]), mock.patch("manage._probe_onebot", return_value=(True, "ok", {"bot_id": "100"})), \
                  mock.patch("builtins.print"):
@@ -795,6 +796,278 @@ class TestManageConsoleAndWizardV2(unittest.TestCase):
             self.assertEqual(manage._configure_qq_interactive(), ("cancel", None, ""))
             self.assertEqual(manage._configure_onebot_interactive(), ("cancel", None, ""))
             self.assertEqual(manage._configure_telegram_interactive(), ("cancel", None, ""))
+
+    def test_wizard_defaults_muse_proxy_none_and_prompts_network_before_channels(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out_file = os.path.join(tmp, "config.json")
+            import manage
+            from muse_bridge.config.models import ConfigLoader
+            from muse_bridge.network import validate_app_network
+
+            wizard = manage.FirstRunWizard(output_file=out_file)
+            self.assertEqual(wizard.muse_proxy, "none")
+
+            # Step 1: answer "y" to configure network before channels -> muse=http, proxy_url (worker not asked)
+            # Step 2: pick "3" (telegram) -> token, Enter (defaults to http and reuses proxy_url without re-prompting!) -> "n"
+            # Step 3: claim skipped (mocked) -> manual fallback "2" (skip)
+            with mock.patch("manage._prompt_input", side_effect=[
+                "y",                       # configure network before channels
+                "http",                    # muse proxy mode
+                "http://127.0.0.1:7890",   # network.proxy_url
+                "3",                       # select telegram
+                "123456:AAH_valid_token",  # bot_token
+                "",                        # telegram proxy mode (defaults to http and reuses proxy_url directly)
+                "n",                       # next step
+                "2",                       # skip manual admin ID
+            ]), mock.patch("manage._probe_telegram", return_value=(True, "ok", {"bot_id": "123456", "username": "bot"})) as probe_tg, \
+                 mock.patch.object(wizard, "_listen_for_first_message", new_callable=mock.AsyncMock), \
+                 mock.patch("builtins.print"):
+                self.assertTrue(wizard.run_interactive(offer_muse_login=False))
+
+            # Probe received the pre-configured NetworkConfig with proxy_url
+            self.assertEqual(probe_tg.call_args.args[1], "http")
+            self.assertEqual(probe_tg.call_args.args[2].proxy_url, "http://127.0.0.1:7890")
+
+            cfg = ConfigLoader.load(out_file)
+            self.assertEqual(cfg.muse.proxy, "http")
+            self.assertEqual(cfg.telegram.proxy, "http")
+            self.assertEqual(cfg.network.proxy_url, "http://127.0.0.1:7890")
+            validate_app_network(cfg)
+
+    def test_channel_probe_can_configure_network_for_qq_onebot_and_wechat(self):
+        import manage
+
+        # QQ: configure HTTP proxy right before probing
+        qq_net = {}
+        with mock.patch("manage._prompt_input", side_effect=[
+            "app_1", "sec_1", "http", "http://127.0.0.1:7890",
+        ]), mock.patch("manage._probe_qq", return_value=(True, "ok")) as probe_qq, \
+             mock.patch("builtins.print"):
+            status, cfg, _ = manage._configure_qq_interactive(network_data=qq_net)
+        self.assertEqual(status, "ready")
+        self.assertEqual(cfg["proxy"], "http")
+        self.assertEqual(qq_net["proxy_url"], "http://127.0.0.1:7890")
+        self.assertEqual(probe_qq.call_args.args[2], "http")
+        self.assertEqual(probe_qq.call_args.args[3].proxy_url, "http://127.0.0.1:7890")
+
+        # OneBot: configure Worker right before probing
+        ob_net = {}
+        with mock.patch("manage._prompt_input", side_effect=[
+            "https://napcat.example.com", "tok", "wss://napcat.example.com",
+            "worker", "https://worker.example.com",
+        ]), mock.patch("manage._probe_onebot", return_value=(True, "ok", {"bot_id": "100"})) as probe_ob, \
+             mock.patch("builtins.print"):
+            status, cfg, _ = manage._configure_onebot_interactive(network_data=ob_net)
+        self.assertEqual(status, "ready")
+        self.assertEqual(cfg["proxy"], "worker")
+        self.assertEqual(ob_net["worker"]["base"], "https://worker.example.com")
+        self.assertEqual(probe_ob.call_args.args[3], "worker")
+        self.assertEqual(probe_ob.call_args.args[4].worker.base, "https://worker.example.com")
+
+        # WeChat: configure HTTP proxy via option [6] then login via option [1] passes network to run_login
+        wx_net = {}
+        with mock.patch("manage._prompt_input", side_effect=[
+            "6", "http", "http://127.0.0.1:7890",
+            "1",
+        ]), mock.patch("muse_bridge.adapters.wechat.cli.run_login", return_value={"logged_in": True}) as wx_login, \
+             mock.patch("manage._wechat_local_status_text", return_value="本地未登录"), \
+             mock.patch("builtins.print"):
+            status, cfg, _ = manage._configure_wechat_guided(network_data=wx_net)
+        self.assertEqual(status, "ready")
+        self.assertEqual(cfg["proxy"], "http")
+        self.assertEqual(wx_net["proxy_url"], "http://127.0.0.1:7890")
+        wx_login.assert_called_once()
+        self.assertEqual(wx_login.call_args.kwargs["network"].proxy_url, "http://127.0.0.1:7890")
+
+    def test_wizard_validates_incomplete_network_before_leaving_channel_loop(self):
+        import manage
+
+        wizard = manage.FirstRunWizard()
+        wizard.selected_channels = ["qq"]
+        wizard.channel_configs["qq"] = {"app_id": "a", "app_secret": "s"}
+        wizard.muse_proxy = "worker"  # missing network.worker.base!
+
+        # Pressing "n" triggers validation -> answer "y" to fix network -> keep worker, supply base (proxy_url not asked) -> press "n"
+        with mock.patch("manage._prompt_input", side_effect=[
+            "n",
+            "y",
+            "worker",
+            "https://worker.example.com",
+            "n",
+        ]), mock.patch("builtins.print"):
+            self.assertTrue(wizard._run_channel_setup_loop())
+        self.assertEqual(wizard.network_data["worker"]["base"], "https://worker.example.com")
+
+    def test_proxy_mode_supports_1_2_3_selection(self):
+        import manage
+
+        # 1 -> none, 2 -> http, 3 -> worker
+        self.assertEqual(manage._parse_proxy_mode("1"), "none")
+        self.assertEqual(manage._parse_proxy_mode("2"), "http")
+        self.assertEqual(manage._parse_proxy_mode("3"), "worker")
+
+        # FullConfigEditor _prompt_edit_choice accepts 1/2/3
+        cfg = {"muse": {}}
+        editor = manage.FullConfigEditor(cfg, file_path="dummy.json")
+        with mock.patch("manage._prompt_input", side_effect=["7", "2", "0"]), mock.patch("builtins.print"):
+            editor._edit_muse_category()
+        self.assertEqual(cfg["muse"]["proxy"], "http")
+
+        # _prompt_channel_network accepts "3" for worker when missing, and reuses existing worker without re-prompting
+        net = {}
+        with mock.patch("manage._prompt_input", side_effect=["3", "https://worker.example.com"]), \
+             mock.patch("builtins.print"):
+            mode, net_cfg = manage._prompt_channel_network("Telegram ", "none", net)
+        self.assertEqual(mode, "worker")
+        self.assertEqual(net_cfg.worker.base, "https://worker.example.com")
+
+        # Already configured worker.base: only asks mode (1 prompt), does not ask worker.base again
+        with mock.patch("manage._prompt_input", side_effect=["3"]) as prompt_mock, \
+             mock.patch("builtins.print"):
+            mode, net_cfg = manage._prompt_channel_network("Telegram ", "worker", net)
+        self.assertEqual(mode, "worker")
+        self.assertEqual(net_cfg.worker.base, "https://worker.example.com")
+        self.assertEqual(prompt_mock.call_count, 1)
+
+        # On probe retry (allow_edit_existing=True), allows editing existing worker.base
+        with mock.patch("manage._prompt_input", side_effect=["3", "https://worker2.example.com"]), \
+             mock.patch("builtins.print"):
+            mode, net_cfg = manage._prompt_channel_network(
+                "Telegram ", "worker", net, allow_edit_existing=True,
+            )
+        self.assertEqual(mode, "worker")
+        self.assertEqual(net_cfg.worker.base, "https://worker2.example.com")
+
+        # FirstRunWizard._configure_muse_proxy: 2(http) only asks proxy_url; 3(worker) asks worker.base directly
+        wizard = manage.FirstRunWizard()
+        with mock.patch("manage._prompt_input", side_effect=["2", "http://127.0.0.1:7890"]), \
+             mock.patch("builtins.print"):
+            wizard._configure_muse_proxy()
+        self.assertEqual(wizard.muse_proxy, "http")
+        self.assertEqual(wizard.network_data["proxy_url"], "http://127.0.0.1:7890")
+
+        wizard_w = manage.FirstRunWizard()
+        with mock.patch("manage._prompt_input", side_effect=["3", "https://cfproxy.example.com"]), \
+             mock.patch("builtins.print"):
+            wizard_w._configure_muse_proxy()
+        self.assertEqual(wizard_w.muse_proxy, "worker")
+        self.assertEqual(wizard_w.network_data["worker"]["base"], "https://cfproxy.example.com")
+        self.assertEqual(wizard_w.network_data["proxy_url"], "")
+
+        # Switching from http to worker still lets user clear existing proxy_url
+        with mock.patch("manage._prompt_input", side_effect=["3", "https://cfproxy.example.com", "clear"]), \
+             mock.patch("builtins.print"):
+            wizard._configure_muse_proxy()
+        self.assertEqual(wizard.muse_proxy, "worker")
+        self.assertEqual(wizard.network_data["worker"]["base"], "https://cfproxy.example.com")
+        self.assertEqual(wizard.network_data["proxy_url"], "")
+
+        # Choosing 1(none) on clean wizard allows presetting worker for other channels (e.g. Telegram)
+        wizard_n = manage.FirstRunWizard()
+        with mock.patch("manage._prompt_input", side_effect=["1", "3", "https://cfproxy.example.com"]), \
+             mock.patch("builtins.print"):
+            wizard_n._configure_muse_proxy()
+        self.assertEqual(wizard_n.muse_proxy, "none")
+        self.assertEqual(wizard_n.network_data["worker"]["base"], "https://cfproxy.example.com")
+
+    def test_channel_and_network_config_can_go_back_at_any_step(self):
+        import manage
+
+        # _prompt_channel_network: pick 2(http) by mistake -> type 0 to go back to mode -> pick 3(worker)
+        net = {"worker": {"base": "https://cfproxy.example.com", "ws": True, "http": True}}
+        with mock.patch("manage._prompt_input", side_effect=["2", "0", "3"]), \
+             mock.patch("builtins.print"):
+            mode, net_cfg = manage._prompt_channel_network("Telegram ", "worker", net)
+        self.assertEqual(mode, "worker")
+        self.assertEqual(net_cfg.worker.base, "https://cfproxy.example.com")
+
+        # _prompt_channel_network: type 0 directly cancels
+        with mock.patch("manage._prompt_input", side_effect=["0"]), \
+             mock.patch("builtins.print"):
+            self.assertEqual(manage._prompt_channel_network("Telegram ", "worker", net), (None, None))
+
+        # QQ: type 0 at AppID, AppSecret, or proxy mode returns cancel
+        for seq in (["0"], ["app_1", "0"], ["app_1", "sec_1", "0"]):
+            with mock.patch("manage._prompt_input", side_effect=seq), mock.patch("builtins.print"):
+                self.assertEqual(manage._configure_qq_interactive(), ("cancel", None, ""))
+
+        # OneBot: type 0 at base_url, access_token, ws_url, or proxy mode returns cancel
+        for seq in (
+            ["0"],
+            ["127.0.0.1:3000", "0"],
+            ["127.0.0.1:3000", "", "0"],
+            ["127.0.0.1:3000", "", "", "0"],
+        ):
+            with mock.patch("manage._prompt_input", side_effect=seq), mock.patch("builtins.print"):
+                self.assertEqual(manage._configure_onebot_interactive(), ("cancel", None, ""))
+
+        # Telegram: type 0 at token or proxy mode returns cancel; Ctrl+C during probe drops to menu where 0 cancels
+        for seq in (["0"], ["123456:AAH_valid_token_1234567890", "0"]):
+            with mock.patch("manage._prompt_input", side_effect=seq), mock.patch("builtins.print"):
+                self.assertEqual(manage._configure_telegram_interactive(), ("cancel", None, ""))
+
+        with mock.patch("manage._prompt_input", side_effect=[
+            "123456:AAH_valid_token_1234567890", "1", "0",
+        ]), mock.patch("manage._probe_telegram", side_effect=KeyboardInterrupt), \
+             mock.patch("builtins.print"):
+            self.assertEqual(manage._configure_telegram_interactive(), ("cancel", None, ""))
+
+        # FirstRunWizard._configure_muse_proxy: 0 at mode or address restores previous state
+        wizard = manage.FirstRunWizard()
+        wizard.muse_proxy = "http"
+        wizard.network_data["proxy_url"] = "http://127.0.0.1:7890"
+        with mock.patch("manage._prompt_input", side_effect=["3", "0"]), mock.patch("builtins.print"):
+            wizard._configure_muse_proxy()
+        self.assertEqual(wizard.muse_proxy, "http")
+        self.assertEqual(wizard.network_data["proxy_url"], "http://127.0.0.1:7890")
+        self.assertEqual(wizard.network_data["worker"]["base"], "")
+
+    def test_wechat_qr_ctrl_c_returns_to_menu_without_enabling_or_exiting(self):
+        import manage
+
+        # User picks [1] scan QR -> presses Ctrl+C -> returns to WeChat menu -> presses [0] to go back
+        with mock.patch("manage._prompt_input", side_effect=["1", "0"]), \
+             mock.patch("muse_bridge.adapters.wechat.cli.run_login", side_effect=KeyboardInterrupt), \
+             mock.patch("manage._wechat_local_status_text", return_value="本地未登录"), \
+             mock.patch("builtins.print"):
+            status, cfg, note = manage._configure_wechat_guided(network_data={})
+        self.assertEqual((status, cfg, note), ("cancel", None, ""))
+
+        # CancelledError (e.g. EOF during verification) is also caught cleanly
+        with mock.patch("manage._prompt_input", side_effect=["1", "0"]), \
+             mock.patch("muse_bridge.adapters.wechat.cli.run_login", side_effect=asyncio.CancelledError()), \
+             mock.patch("manage._wechat_local_status_text", return_value="本地未登录"), \
+             mock.patch("builtins.print"):
+            status, cfg, note = manage._configure_wechat_guided(network_data={})
+        self.assertEqual((status, cfg, note), ("cancel", None, ""))
+
+    def test_telegram_claim_acknowledges_update_offset_as_consumed(self):
+        import manage
+
+        fake_tg = mock.MagicMock()
+        fake_tg.updates = mock.AsyncMock(side_effect=[
+            [{"update_id": 100, "message": {"message_id": 1, "from": {"id": 999}, "chat": {"id": 999, "type": "private"}}}],
+            [{"update_id": 105, "message": {"message_id": 55, "from": {"id": 424242, "is_bot": False}, "chat": {"id": 424242, "type": "private"}}}],
+            [],  # follow-up confirm call with offset=106
+        ])
+        fake_tg.call = mock.AsyncMock(return_value={})
+        fake_tg.close = mock.AsyncMock()
+
+        with mock.patch("muse_bridge.adapters.telegram.client.TelegramClient", return_value=fake_tg), \
+             mock.patch("builtins.print"):
+            captured = asyncio.run(manage._listen_and_claim_channels(
+                ["telegram"],
+                {"telegram": {"bot_token": "123456:AAH_valid_token_1234567890", "proxy": "none"}},
+            ))
+
+        self.assertEqual(captured["telegram"], ("424242", "private", "424242", "55"))
+        self.assertEqual(fake_tg.updates.await_args_list, [
+            mock.call(None, poll_timeout=0),
+            mock.call(101, poll_timeout=10),
+            mock.call(106, poll_timeout=0),
+        ])
+        fake_tg.call.assert_awaited_once()
+        fake_tg.close.assert_awaited_once()
 
 
 if __name__ == "__main__":

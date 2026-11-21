@@ -538,7 +538,7 @@ Windows 用户也可直接双击根目录下的 [`start.bat`](start.bat) 启动�
     "host": "hatch.metaaivm.com",           // Muse 网关域名
     "client_ip": "",                        // 可选出口公网 IP；留空则在首次发消息时通过 muse.ai /api/client-ip 异步缓存
     "timezone": "Asia/Shanghai",            // 时区
-    "proxy": "worker",                      // "none" | "http" | "worker"（默认 "worker"）
+    "proxy": "none",                        // "none" | "http" | "worker"（默认 "none"）
     "approval": {
       "mode": "manual",                     // "manual" | "allow_all" | "deny_all"
       "notify": true,                       // 自动审批后是否发送通知

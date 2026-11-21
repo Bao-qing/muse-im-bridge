@@ -76,7 +76,7 @@ class MuseConfig:
     host: str = constants.DEFAULT_MUSE_HOST
     client_ip: str = ""
     timezone: str = constants.DEFAULT_MUSE_TIMEZONE
-    proxy: str = "worker"
+    proxy: str = "none"
     approval: ApprovalConfig = dataclasses.field(default_factory=ApprovalConfig)
 
     def __post_init__(self):
@@ -648,7 +648,7 @@ class ConfigLoader:
             host=_get_val(m_raw, "host", os.environ.get("MUSE_HOST") or constants.DEFAULT_MUSE_HOST),
             client_ip=_get_val(m_raw, "client_ip", os.environ.get("MUSE_CLIENT_IP") or ""),
             timezone=_get_val(m_raw, "timezone", os.environ.get("MUSE_TIMEZONE") or constants.DEFAULT_MUSE_TIMEZONE),
-            proxy=m_raw.get("proxy", "worker"),
+            proxy=m_raw.get("proxy", "none"),
         )
 
         # 2. Group-capable adapters share one field set.

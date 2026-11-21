@@ -47,7 +47,7 @@ from muse_bridge.config.models import (
     WeChatConfig,
     WorkerConfig,
 )
-from muse_bridge.network import PROXY_MODES, resolve_route, validate_worker_base
+from muse_bridge.network import DIRECT_ROUTE, PROXY_MODES, NetworkRoute, resolve_route, validate_worker_base
 from muse_bridge.observability import configure_logging, get_logger, safe_error
 
 logger = get_logger("setup_wizard")
@@ -149,14 +149,36 @@ def _prompt_edit_int(
         return True, val
 
 
+_BACK_INPUTS = {"0", "b", "back", "q", "cancel", "返回", "取消"}
+
+
+def _is_back_input(raw: str) -> bool:
+    return (raw or "").strip().lower() in _BACK_INPUTS
+
+
+def _parse_proxy_mode(raw: str, default: Optional[str] = None) -> Optional[str]:
+    val = raw.strip().lower()
+    if not val:
+        return default
+    alias = {"1": "none", "2": "http", "3": "worker"}
+    val = alias.get(val, val)
+    return val if val in PROXY_MODES else None
+
+
 def _prompt_edit_choice(title: str, choices: List[str], current_disp: str) -> Tuple[bool, Optional[str]]:
-    disp_choices = "/".join(c if c else "clear清空" for c in choices)
+    indexed = all(c and not c.isdigit() for c in choices)
+    disp_choices = "/".join(
+        f"{idx}:{c}" if indexed else (c if c else "clear清空")
+        for idx, c in enumerate(choices, 1)
+    )
     while True:
         raw = _prompt_input(f"{title} ({disp_choices}，当前: {current_disp}，直接回车不修改)", default="").strip()
         if not raw:
             return False, None
         if raw in choices:
             return True, raw
+        if indexed and raw.isdigit() and 1 <= int(raw) <= len(choices):
+            return True, choices[int(raw) - 1]
         if "" in choices and raw.lower() in ("none", "clear", "留空"):
             return True, ""
         print(f"❌ 请在选项目录中选择: {disp_choices}（直接回车不修改）")
@@ -631,16 +653,23 @@ def get_registered_config_fields() -> Dict[str, set]:
 # 渠道连通性即时探针（向导校验与日常一键体检共用）
 # ----------------------------------------------------------------------
 
-def _probe_qq(app_id: str, app_secret: str) -> Tuple[bool, str]:
+def _probe_qq(
+    app_id: str,
+    app_secret: str,
+    proxy_mode: str = "none",
+    network: Optional[NetworkConfig] = None,
+) -> Tuple[bool, str]:
     if not app_id or not app_secret:
         return False, "缺少 AppID 或 AppSecret"
     try:
         from muse_bridge.adapters.qq.client import QQClient
 
+        route = resolve_route(proxy_mode, network or NetworkConfig(), section="adapters.qq")
         client = QQClient(
             app_id=app_id,
             app_secret=app_secret,
             user_agent=constants.DEFAULT_USER_AGENT,
+            route=route,
         )
         client.get_access_token()
         return True, "QQ 凭证校验通过"
@@ -648,7 +677,13 @@ def _probe_qq(app_id: str, app_secret: str) -> Tuple[bool, str]:
         return False, f"QQ 校验失败: {safe_error(exc)}"
 
 
-async def _probe_onebot_ws_async(ws_url: str, access_token: str, timeout_s: float = 5.0) -> Tuple[bool, str]:
+async def _probe_onebot_ws_async(
+    ws_url: str,
+    access_token: str,
+    timeout_s: float = 5.0,
+    *,
+    route: Optional[NetworkRoute] = None,
+) -> Tuple[bool, str]:
     try:
         import websockets
     except ImportError:
@@ -656,29 +691,40 @@ async def _probe_onebot_ws_async(ws_url: str, access_token: str, timeout_s: floa
 
     from muse_bridge.adapters.onebot.gateway import connect_url
 
-    url = connect_url(ws_url, access_token)
+    active_route = route or DIRECT_ROUTE
+    url = active_route.ws_url(connect_url(ws_url, access_token))
     ssl_ctx = None
     if url.startswith("wss://"):
         ssl_ctx = ssl.create_default_context()
         ssl_ctx.check_hostname = False
         ssl_ctx.verify_mode = ssl.CERT_NONE
     try:
-        async with websockets.connect(url, ssl=ssl_ctx, open_timeout=timeout_s):
+        async with websockets.connect(url, ssl=ssl_ctx, proxy=active_route.ws_proxy, open_timeout=timeout_s):
             return True, "WS 握手成功"
     except Exception as exc:
         return False, safe_error(exc)
 
 
-def _probe_onebot(base_url: str, access_token: str, ws_url: str) -> Tuple[bool, str, dict]:
+def _probe_onebot(
+    base_url: str,
+    access_token: str,
+    ws_url: str,
+    proxy_mode: str = "none",
+    network: Optional[NetworkConfig] = None,
+) -> Tuple[bool, str, dict]:
     if not base_url:
         return False, "缺少 OneBot HTTP Base URL", {}
+    try:
+        route = resolve_route(proxy_mode, network or NetworkConfig(), section="adapters.onebot")
+    except Exception as exc:
+        return False, f"OneBot 网络配置无效: {safe_error(exc)}", {}
     info: dict = {}
     http_ok = False
     http_msg = ""
     try:
         from muse_bridge.adapters.onebot.client import OneBotClient
 
-        client = OneBotClient(base_url=base_url, access_token=access_token)
+        client = OneBotClient(base_url=base_url, access_token=access_token, route=route)
         login_info = client.get_login_info()
         bot_id = str(login_info.get("user_id") or "")
         nickname = str(login_info.get("nickname") or "")
@@ -692,7 +738,7 @@ def _probe_onebot(base_url: str, access_token: str, ws_url: str) -> Tuple[bool, 
     ws_msg = ""
     if ws_url:
         try:
-            ws_ok, ws_msg = asyncio.run(_probe_onebot_ws_async(ws_url, access_token))
+            ws_ok, ws_msg = asyncio.run(_probe_onebot_ws_async(ws_url, access_token, route=route))
         except Exception as exc:
             ws_ok, ws_msg = False, safe_error(exc)
     else:
@@ -781,6 +827,7 @@ async def _listen_and_claim_channels(
     all_done = asyncio.Event()
     gateways: List[Any] = []
     tasks: List[asyncio.Task] = []
+    ack_tasks: List[asyncio.Task] = []
     clients: Dict[str, Any] = {}
     tg_clients: List[Any] = []
     active_channels: List[str] = []
@@ -839,7 +886,7 @@ async def _listen_and_claim_channels(
             return
         captured[ch] = (user_id, chat_type, target_id, msg_id)
         print(f"\n🎉 [{CHANNEL_LABELS[ch]}] 捕获消息！用户: {user_id} ({chat_type}: {target_id})")
-        asyncio.create_task(_send_claim_ack(ch, user_id, chat_type, target_id, msg_id))
+        ack_tasks.append(asyncio.create_task(_send_claim_ack(ch, user_id, chat_type, target_id, msg_id)))
         _print_progress()
         if all(c in captured for c in active_channels):
             all_done.set()
@@ -851,10 +898,12 @@ async def _listen_and_claim_channels(
             from muse_bridge.adapters.qq.gateway import QQGateway
 
             qq_cfg = channel_configs.get("qq", {})
+            qq_route = resolve_route(qq_cfg.get("proxy", "none"), network or NetworkConfig(), section="adapters.qq")
             qq_client = QQClient(
                 app_id=qq_cfg.get("app_id", ""),
                 app_secret=qq_cfg.get("app_secret", ""),
                 user_agent=constants.DEFAULT_USER_AGENT,
+                route=qq_route,
             )
             clients["qq"] = qq_client
             loop = asyncio.get_running_loop()
@@ -896,9 +945,11 @@ async def _listen_and_claim_channels(
             from muse_bridge.adapters.onebot.gateway import OneBotGateway
 
             ob_cfg = channel_configs.get("onebot", {})
+            ob_route = resolve_route(ob_cfg.get("proxy", "none"), network or NetworkConfig(), section="adapters.onebot")
             ob_client = OneBotClient(
                 base_url=ob_cfg.get("base_url", ""),
                 access_token=ob_cfg.get("access_token", ""),
+                route=ob_route,
             )
             clients["onebot"] = ob_client
             loop = asyncio.get_running_loop()
@@ -925,6 +976,7 @@ async def _listen_and_claim_channels(
                 ws_url=ob_cfg.get("ws_url", ""),
                 access_token=ob_cfg.get("access_token", ""),
                 on_message=_on_ob_message,
+                route=ob_route,
             )
             gateways.append(ob_gw)
             active_channels.append("onebot")
@@ -980,6 +1032,11 @@ async def _listen_and_claim_channels(
                         chat_type = "private" if raw_chat_type == "private" else "group"
                         msg_id = str(msg.get("message_id") or "")
                         if user_id and chat_id:
+                            # 向 Telegram 服务端确认消费该认领消息，避免首次启动网桥时重放
+                            try:
+                                await tg_client.updates(offset, poll_timeout=0)
+                            except Exception:
+                                pass
                             _record_claim("telegram", user_id, chat_type, chat_id, msg_id)
                             return
 
@@ -1000,8 +1057,9 @@ async def _listen_and_claim_channels(
 
     try:
         await all_done.wait()
-        # 给确认回执一小段发出时间
-        await asyncio.sleep(0.3)
+        # 等待认领确认回执发完再关闭客户端
+        if ack_tasks:
+            await asyncio.wait(ack_tasks, timeout=5.0)
     except (asyncio.CancelledError, KeyboardInterrupt):
         print("\n[!] 已结束实时等待，将继续处理未认领的渠道。")
     finally:
@@ -1014,6 +1072,11 @@ async def _listen_and_claim_channels(
             t.cancel()
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
+        for t in ack_tasks:
+            if not t.done():
+                t.cancel()
+        if ack_tasks:
+            await asyncio.gather(*ack_tasks, return_exceptions=True)
         for tg_c in tg_clients:
             try:
                 await tg_c.close()
@@ -1924,7 +1987,13 @@ class FullConfigEditor:
                 from muse_bridge.adapters.wechat.cli import run_login, run_status
                 try:
                     config = ConfigLoader._wechat_from_raw({"adapters": {"wechat": current}})
-                    (run_login if choice == "2" else run_status)(config)
+                    if choice == "2":
+                        net_cfg = ConfigLoader._network_from_raw(self.data)
+                        run_login(config, network=net_cfg)
+                    else:
+                        run_status(config)
+                except (KeyboardInterrupt, asyncio.CancelledError):
+                    print("\nℹ️  已取消微信扫码登录，返回菜单。")
                 except Exception:
                     print("微信操作失败；请检查配置或稍后重试，未输出认证详情。")
                 continue
@@ -2372,168 +2441,303 @@ class FullConfigEditor:
 # 单渠道引导配置组件（向导与日常渠道管理复用）
 # ----------------------------------------------------------------------
 
-def _configure_qq_interactive(existing: Optional[dict] = None) -> Tuple[str, Optional[dict], str]:
-    """引导配置 QQ 并即时校验。返回 (status: 'ready'|'unverified'|'cancel', cfg, note)。"""
-    prev = existing or {}
+def _format_network_brief(net: Optional[dict]) -> str:
+    if not isinstance(net, dict):
+        return ""
+    parts = []
+    http_proxy = str(net.get("proxy_url") or "")
+    worker = net.get("worker") if isinstance(net.get("worker"), dict) else {}
+    worker_base = str(worker.get("base") or "")
+    if http_proxy:
+        parts.append(f"HTTP={http_proxy}")
+    if worker_base:
+        parts.append(f"Worker={worker_base}")
+    return " | ".join(parts)
+
+
+def _prompt_channel_network(
+    channel_label: str,
+    default_mode: str,
+    net: dict,
+    *,
+    allow_edit_existing: bool = False,
+) -> Tuple[Optional[str], Optional[NetworkConfig]]:
+    """探测/登录前引导选择渠道代理模式；对应顶层代理已配置时直接复用，缺省或重试时再提示填写。"""
+    if default_mode not in PROXY_MODES:
+        default_mode = "none"
+    brief = _format_network_brief(net)
+    if brief:
+        print(f"当前已配置全局网络: {brief}")
     while True:
-        print("\n--- 配置 QQ 官方机器人 ---")
-        if prev.get("app_id"):
-            print(f"当前 AppID: {prev['app_id']}")
-        app_id = _prompt_input("请输入 QQ Bot AppID（直接回车取消）", default="").strip()
-        if not app_id:
-            print("已取消配置 QQ 官方机器人。")
-            return "cancel", None, ""
-
-        if prev.get("app_secret"):
-            app_secret = _prompt_input("请输入 QQ Bot AppSecret（直接回车保持原值）", default="").strip() or prev["app_secret"]
-        else:
-            app_secret = _prompt_input("请输入 QQ Bot AppSecret（直接回车取消）", default="").strip()
-            if not app_secret:
-                print("已取消配置 QQ 官方机器人。")
-                return "cancel", None, ""
-
-        print("🔍 正在校验 QQ AppID 与 AppSecret...")
-        ok, msg = _probe_qq(app_id, app_secret)
-        if ok:
-            print(f"✅ {msg}")
-            return "ready", {"app_id": app_id, "app_secret": app_secret}, f"AppID: {app_id}"
-
-        print(f"❌ {msg}")
-        print("  [1] 重新输入凭据")
-        print("  [2] 暂不校验，先保留配置")
-        print("  [3] 放弃并返回")
-        action = _prompt_input("请选择后续操作 (1/2/3)", default="1").strip()
-        if action == "2":
-            return "unverified", {"app_id": app_id, "app_secret": app_secret}, f"AppID: {app_id} (未校验)"
-        if action == "3":
-            return "cancel", None, ""
-        prev = {"app_id": app_id, "app_secret": app_secret}
-
-
-def _configure_onebot_interactive(existing: Optional[dict] = None) -> Tuple[str, Optional[dict], str]:
-    """引导配置 OneBot (NapCat) 并即时探测 HTTP + WS。"""
-    prev = existing or {}
-    while True:
-        print("\n--- 配置 OneBot v11 (NapCat / LLOneBot) ---")
-        if prev.get("base_url"):
-            print(f"当前 HTTP 地址: {prev['base_url']}")
-        raw_base = _prompt_input(
-            "请输入 OneBot HTTP 地址（如 3000 或 127.0.0.1:3000，直接回车取消）",
-            default="",
-        ).strip()
-        if not raw_base:
-            print("已取消配置 OneBot。")
-            return "cancel", None, ""
-        base_url = _normalize_http_url(raw_base)
-
-        access_token = _prompt_str(
-            "请输入 OneBot Access Token（未设置鉴权直接回车留空）",
-            prev.get("access_token", ""),
-        ).strip()
-        default_ws = prev.get("ws_url") or _default_ws_url(base_url)
-        ws_url = _prompt_str("请输入 OneBot 正向 WebSocket URL", default_ws).strip()
-        if not ws_url:
-            ws_url = _default_ws_url(base_url)
-
-        print(f"🔍 正在探测 OneBot HTTP ({base_url}) 与 WebSocket ({ws_url})...")
-        ok, msg, info = _probe_onebot(base_url, access_token, ws_url)
-        cfg = {
-            "base_url": base_url,
-            "access_token": access_token,
-            "ws_url": ws_url,
-        }
-        if ok:
-            print(f"✅ {msg}")
-            bot_tag = f"账号 {info.get('bot_id')}" if info.get("bot_id") else base_url
-            return "ready", cfg, bot_tag
-
-        print(f"⚠️  {msg}")
-        print("  [1] 重新输入地址或 Token")
-        print("  [2] 暂不校验，先保留配置（稍后启动 NapCat 后可用）")
-        print("  [3] 放弃并返回")
-        action = _prompt_input("请选择后续操作 (1/2/3)", default="1").strip()
-        if action == "2":
-            return "unverified", cfg, f"{base_url} (未校验)"
-        if action == "3":
-            return "cancel", None, ""
-        prev = cfg
-
-
-def _configure_telegram_interactive(
-    existing: Optional[dict] = None,
-    network_data: Optional[dict] = None,
-) -> Tuple[str, Optional[dict], str]:
-    """引导配置 Telegram Bot（含代理模式询问与 getMe 即时校验）。"""
-    prev = existing or {}
-    net = network_data if isinstance(network_data, dict) else {}
-    while True:
-        print("\n--- 配置 Telegram Bot ---")
-        if prev.get("bot_token"):
-            print(f"当前 Bot Token: {_mask_secret(prev['bot_token'])}")
-        token = _prompt_input(
-            "请输入 @BotFather 颁发的 Bot Token（直接回车取消）",
-            default="",
-        ).strip()
-        if not token:
-            print("已取消配置 Telegram。")
-            return "cancel", None, ""
-        if not _validate_telegram_token(token):
-            print("❌ Token 格式不正确，应类似 123456789:AAHxxx...")
-            continue
-
-        default_mode = prev.get("proxy", "worker")
-        if default_mode not in PROXY_MODES:
-            default_mode = "worker"
-        mode = _prompt_input(
-            "Telegram 代理模式 [none/http/worker]",
+        raw_mode = _prompt_input(
+            f"{channel_label}代理模式 [1:none / 2:http / 3:worker / 0:返回]",
             default=default_mode,
-        ).strip().lower()
-        if mode not in PROXY_MODES:
-            print("❌ 代理模式必须是 none、http 或 worker。")
+        )
+        if _is_back_input(raw_mode):
+            return None, None
+        mode = _parse_proxy_mode(raw_mode, default=default_mode)
+        if mode is None:
+            print("❌ 代理模式必须是 1(none)、2(http)、3(worker) 或 0(返回)。")
             continue
 
+        back_to_mode = False
         if mode == "http":
-            suggested_proxy = str(net.get("proxy_url") or "")
-            while True:
-                raw_proxy = _prompt_str(
-                    "全局 HTTP(S) 代理地址 (network.proxy_url，如 http://127.0.0.1:7890)",
-                    suggested_proxy,
-                )
+            suggested_proxy = str(net.get("proxy_url") or "").strip()
+            valid_proxy = ""
+            if suggested_proxy:
                 try:
-                    proxy_url = _validate_proxy_url(raw_proxy) or ""
-                    if not proxy_url:
-                        print("❌ http 模式必须填写代理地址。")
-                        continue
-                    net["proxy_url"] = proxy_url
-                    break
-                except ValueError as exc:
-                    print(f"❌ {exc}")
+                    valid_proxy = _validate_proxy_url(suggested_proxy) or ""
+                except ValueError:
+                    valid_proxy = ""
+            if valid_proxy and not allow_edit_existing:
+                net["proxy_url"] = valid_proxy
+                print(f"ℹ️  复用已配置的全局 HTTP 代理: {valid_proxy}")
+            else:
+                while True:
+                    raw_proxy = _prompt_str(
+                        "全局 HTTP(S) 代理地址 (network.proxy_url，如 http://127.0.0.1:7890，输入 0 返回重选模式)",
+                        valid_proxy or suggested_proxy,
+                    )
+                    if _is_back_input(raw_proxy):
+                        back_to_mode = True
+                        break
+                    try:
+                        proxy_url = _validate_proxy_url(raw_proxy) or ""
+                        if not proxy_url:
+                            print("❌ http 模式必须填写代理地址（输入 0 返回重选模式）。")
+                            continue
+                        net["proxy_url"] = proxy_url
+                        break
+                    except ValueError as exc:
+                        print(f"❌ {exc}")
         elif mode == "worker":
-            worker_raw = net.setdefault("worker", {"base": "", "ws": True, "http": True})
-            suggested_base = str(worker_raw.get("base") or "")
-            while True:
-                raw_base = _prompt_str(
-                    "Cloudflare Worker HTTPS 域名 (network.worker.base，如 https://worker.example.com)",
-                    suggested_base,
-                )
+            worker_raw = net.get("worker")
+            if not isinstance(worker_raw, dict):
+                worker_raw = {"base": "", "ws": True, "http": True}
+                net["worker"] = worker_raw
+            suggested_base = str(worker_raw.get("base") or "").strip()
+            valid_base = ""
+            if suggested_base:
                 try:
-                    base = validate_worker_base(raw_base)
-                    if not base:
-                        print("❌ worker 模式必须填写 Worker HTTPS 域名。")
-                        continue
-                    worker_raw["base"] = base
-                    break
-                except ValueError as exc:
-                    print(f"❌ {exc}")
+                    valid_base = validate_worker_base(suggested_base)
+                except ValueError:
+                    valid_base = ""
+            if valid_base and not allow_edit_existing:
+                worker_raw["base"] = valid_base
+                print(f"ℹ️  复用已配置的 Cloudflare Worker: {valid_base}")
+            else:
+                while True:
+                    raw_base = _prompt_str(
+                        "Cloudflare Worker HTTPS 域名 (network.worker.base，如 https://worker.example.com，输入 0 返回重选模式)",
+                        valid_base or suggested_base,
+                    )
+                    if _is_back_input(raw_base):
+                        back_to_mode = True
+                        break
+                    try:
+                        base = validate_worker_base(raw_base)
+                        if not base:
+                            print("❌ worker 模式必须填写 Worker HTTPS 域名（输入 0 返回重选模式）。")
+                            continue
+                        worker_raw["base"] = base
+                        break
+                    except ValueError as exc:
+                        print(f"❌ {exc}")
+
+        if back_to_mode:
+            continue
 
         try:
             net_cfg = ConfigLoader._network_from_raw({"network": net})
         except ValueError as exc:
             print(f"❌ 网络配置无效: {exc}")
             continue
+        return mode, net_cfg
 
-        print("🔍 正在调用 Telegram getMe 校验连接...")
-        ok, msg, info = _probe_telegram(token, mode, net_cfg)
+
+def _configure_qq_interactive(
+    existing: Optional[dict] = None,
+    network_data: Optional[dict] = None,
+) -> Tuple[str, Optional[dict], str]:
+    """引导配置 QQ 并即时校验（探测前可配置网络/代理）。返回 (status: 'ready'|'unverified'|'cancel', cfg, note)。"""
+    prev = existing or {}
+    net = network_data if isinstance(network_data, dict) else {}
+    retrying = False
+    while True:
+        print("\n--- 配置 QQ 官方机器人（任一步输入 0 可返回）---")
+        if prev.get("app_id"):
+            print(f"当前 AppID: {prev['app_id']}")
+        app_id = _prompt_input("请输入 QQ Bot AppID（直接回车或输入 0 返回）", default="").strip()
+        if not app_id or _is_back_input(app_id):
+            print("已取消配置 QQ 官方机器人，返回上级。")
+            return "cancel", None, ""
+
+        if prev.get("app_secret"):
+            raw_secret = _prompt_input("请输入 QQ Bot AppSecret（直接回车保持原值，输入 0 返回）", default="").strip()
+            if _is_back_input(raw_secret):
+                print("已取消配置 QQ 官方机器人，返回上级。")
+                return "cancel", None, ""
+            app_secret = raw_secret or prev["app_secret"]
+        else:
+            app_secret = _prompt_input("请输入 QQ Bot AppSecret（直接回车或输入 0 返回）", default="").strip()
+            if not app_secret or _is_back_input(app_secret):
+                print("已取消配置 QQ 官方机器人，返回上级。")
+                return "cancel", None, ""
+
+        mode, net_cfg = _prompt_channel_network(
+            "QQ ", prev.get("proxy", "none"), net, allow_edit_existing=retrying,
+        )
+        if mode is None or net_cfg is None:
+            print("已取消配置 QQ 官方机器人，返回上级。")
+            return "cancel", None, ""
+
+        cfg: Dict[str, Any] = {"app_id": app_id, "app_secret": app_secret}
+        if mode != "none" or "proxy" in prev:
+            cfg["proxy"] = mode
+
+        print("🔍 正在校验 QQ AppID 与 AppSecret（按 Ctrl+C 可中止校验）...")
+        try:
+            ok, msg = _probe_qq(app_id, app_secret, mode, net_cfg)
+        except KeyboardInterrupt:
+            ok, msg = False, "已手动中止校验"
+        if ok:
+            print(f"✅ {msg}")
+            return "ready", cfg, f"AppID: {app_id}"
+
+        print(f"❌ {msg}")
+        print("  [1] 重新输入凭据或修改网络/代理")
+        print("  [2] 暂不校验，先保留配置")
+        print("  [3] 放弃并返回")
+        action = _prompt_input("请选择后续操作 (1/2/3)", default="1").strip()
+        if action == "2":
+            return "unverified", cfg, f"AppID: {app_id} (未校验)"
+        if action == "3" or _is_back_input(action):
+            return "cancel", None, ""
+        prev = cfg
+        retrying = True
+
+
+def _configure_onebot_interactive(
+    existing: Optional[dict] = None,
+    network_data: Optional[dict] = None,
+) -> Tuple[str, Optional[dict], str]:
+    """引导配置 OneBot (NapCat) 并即时探测 HTTP + WS（探测前可配置网络/代理）。"""
+    prev = existing or {}
+    net = network_data if isinstance(network_data, dict) else {}
+    retrying = False
+    while True:
+        print("\n--- 配置 OneBot v11 (NapCat / LLOneBot)（任一步输入 0 可返回）---")
+        if prev.get("base_url"):
+            print(f"当前 HTTP 地址: {prev['base_url']}")
+        raw_base = _prompt_input(
+            "请输入 OneBot HTTP 地址（如 3000 或 127.0.0.1:3000，直接回车或输入 0 返回）",
+            default="",
+        ).strip()
+        if not raw_base or _is_back_input(raw_base):
+            print("已取消配置 OneBot，返回上级。")
+            return "cancel", None, ""
+        base_url = _normalize_http_url(raw_base)
+
+        access_token = _prompt_str(
+            "请输入 OneBot Access Token（未设置鉴权直接回车留空，输入 0 返回）",
+            prev.get("access_token", ""),
+        ).strip()
+        if _is_back_input(access_token):
+            print("已取消配置 OneBot，返回上级。")
+            return "cancel", None, ""
+
+        default_ws = prev.get("ws_url") or _default_ws_url(base_url)
+        ws_url = _prompt_str("请输入 OneBot 正向 WebSocket URL（输入 0 返回）", default_ws).strip()
+        if _is_back_input(ws_url):
+            print("已取消配置 OneBot，返回上级。")
+            return "cancel", None, ""
+        if not ws_url:
+            ws_url = _default_ws_url(base_url)
+
+        mode, net_cfg = _prompt_channel_network(
+            "OneBot ", prev.get("proxy", "none"), net, allow_edit_existing=retrying,
+        )
+        if mode is None or net_cfg is None:
+            print("已取消配置 OneBot，返回上级。")
+            return "cancel", None, ""
+
+        cfg: Dict[str, Any] = {
+            "base_url": base_url,
+            "access_token": access_token,
+            "ws_url": ws_url,
+        }
+        if mode != "none" or "proxy" in prev:
+            cfg["proxy"] = mode
+
+        print(f"🔍 正在探测 OneBot HTTP ({base_url}) 与 WebSocket ({ws_url})（按 Ctrl+C 可中止校验）...")
+        try:
+            ok, msg, info = _probe_onebot(base_url, access_token, ws_url, mode, net_cfg)
+        except KeyboardInterrupt:
+            ok, msg, info = False, "已手动中止校验", {}
+        if ok:
+            print(f"✅ {msg}")
+            bot_tag = f"账号 {info.get('bot_id')}" if info.get("bot_id") else base_url
+            return "ready", cfg, bot_tag
+
+        print(f"⚠️  {msg}")
+        print("  [1] 重新输入地址、Token 或修改网络/代理")
+        print("  [2] 暂不校验，先保留配置（稍后启动 NapCat 后可用）")
+        print("  [3] 放弃并返回")
+        action = _prompt_input("请选择后续操作 (1/2/3)", default="1").strip()
+        if action == "2":
+            return "unverified", cfg, f"{base_url} (未校验)"
+        if action == "3" or _is_back_input(action):
+            return "cancel", None, ""
+        prev = cfg
+        retrying = True
+
+
+def _configure_telegram_interactive(
+    existing: Optional[dict] = None,
+    network_data: Optional[dict] = None,
+) -> Tuple[str, Optional[dict], str]:
+    """引导配置 Telegram Bot（含探测前代理/网络配置与 getMe 即时校验）。"""
+    prev = existing or {}
+    net = network_data if isinstance(network_data, dict) else {}
+    retrying = False
+    while True:
+        print("\n--- 配置 Telegram Bot（任一步输入 0 可返回）---")
+        if prev.get("bot_token"):
+            print(f"当前 Bot Token: {_mask_secret(prev['bot_token'])}")
+        token = _prompt_input(
+            "请输入 @BotFather 颁发的 Bot Token（直接回车或输入 0 返回）",
+            default="",
+        ).strip()
+        if not token or _is_back_input(token):
+            print("已取消配置 Telegram，返回上级。")
+            return "cancel", None, ""
+        if not _validate_telegram_token(token):
+            print("❌ Token 格式不正确，应类似 123456789:AAHxxx...")
+            continue
+
+        if prev.get("proxy") in PROXY_MODES:
+            default_mode = prev["proxy"]
+        else:
+            worker_base = (net.get("worker") or {}).get("base") if isinstance(net.get("worker"), dict) else ""
+            if worker_base:
+                default_mode = "worker"
+            elif net.get("proxy_url"):
+                default_mode = "http"
+            else:
+                default_mode = "worker"
+
+        mode, net_cfg = _prompt_channel_network(
+            "Telegram ", default_mode, net, allow_edit_existing=retrying,
+        )
+        if mode is None or net_cfg is None:
+            print("已取消配置 Telegram，返回上级。")
+            return "cancel", None, ""
+
+        print("🔍 正在调用 Telegram getMe 校验连接（按 Ctrl+C 可中止校验）...")
+        try:
+            ok, msg, info = _probe_telegram(token, mode, net_cfg)
+        except KeyboardInterrupt:
+            ok, msg, info = False, "已手动中止校验", {}
         cfg = {
             "bot_token": token,
             "proxy": mode,
@@ -2545,35 +2749,42 @@ def _configure_telegram_interactive(
             return "ready", cfg, (f"@{username}" if username else "已连接")
 
         print(f"❌ {msg}")
-        print("  [1] 重新修改 Token 或代理")
+        print("  [1] 重新修改 Token 或网络/代理")
         print("  [2] 暂不校验，先保留配置")
         print("  [3] 放弃并返回")
         action = _prompt_input("请选择后续操作 (1/2/3)", default="1").strip()
         if action == "2":
             return "unverified", cfg, "已填写 (未校验)"
-        if action == "3":
+        if action == "3" or _is_back_input(action):
             return "cancel", None, ""
         prev = cfg
+        retrying = True
 
 
-def _configure_wechat_guided(existing: Optional[dict] = None) -> Tuple[str, Optional[dict], str]:
-    """微信精简引导子菜单：直接扫码或进入精简设置，不直接展示 13 项底层参数。"""
+def _configure_wechat_guided(
+    existing: Optional[dict] = None,
+    network_data: Optional[dict] = None,
+) -> Tuple[str, Optional[dict], str]:
+    """微信精简引导子菜单：直接扫码或进入精简设置，扫码前可配置网络/代理。"""
     current = copy.deepcopy(existing) if isinstance(existing, dict) else {}
+    net = network_data if isinstance(network_data, dict) else {}
     logged_in = False
     while True:
         enabled = bool(current.get("enabled", False))
         local_status = "本次已登录" if logged_in else _wechat_local_status_text(current)
+        proxy_mode = current.get("proxy", "none")
         print("\n--- 配置微信 iLink（个人私信）---")
-        print(f"当前状态: {'已启用' if enabled else '未启用'} | 账号: {local_status}")
-        print("  [1] 立即扫码登录微信（推荐，扫码后自动启用）")
+        print(f"当前状态: {'已启用' if enabled else '未启用'} | 账号: {local_status} | 代理: {proxy_mode}")
+        print("  [1] 立即扫码登录微信（推荐，扫码中按 Ctrl+C 可取消返回）")
         print("  [2] 引导式基础设置（输入状态提示 / 离线消息补发）")
         print("  [3] 查看本地登录状态（不连接微信）")
         print("  [4] 仅启用微信，稍后再扫码")
         print("  [5] 进入完整微信高级参数（分块 / 超时 / 路由标签等）")
-        print("  [0] 完成并返回")
+        print("  [6] 配置微信代理与网络 (none/http/worker)")
+        print(f"  [0] {'完成并返回' if enabled else '返回上级'}")
 
-        choice = _prompt_input("请选择操作 (0-5)", default="1" if not logged_in and not enabled else "0").strip()
-        if choice == "0":
+        choice = _prompt_input("请选择操作 (0-6)", default="1" if not logged_in and not enabled else "0").strip()
+        if choice == "0" or _is_back_input(choice):
             if not current.get("enabled"):
                 return "cancel", None, ""
             note = "已扫码登录" if (logged_in or local_status == "本地已登录") else "已启用（待扫码）"
@@ -2581,13 +2792,28 @@ def _configure_wechat_guided(existing: Optional[dict] = None) -> Tuple[str, Opti
         elif choice == "1":
             from muse_bridge.adapters.wechat.cli import run_login
 
-            current["enabled"] = True
             try:
-                cfg = ConfigLoader._wechat_from_raw({"adapters": {"wechat": current}})
-                run_login(cfg)
+                candidate = {**current, "enabled": True}
+                cfg = ConfigLoader._wechat_from_raw({"adapters": {"wechat": candidate}})
+                net_cfg = ConfigLoader._network_from_raw({"network": net})
+                try:
+                    resolve_route(cfg.proxy, net_cfg, section="adapters.wechat")
+                except ValueError as exc:
+                    print(f"⚠️  微信当前网络配置未补全: {exc}")
+                    mode, updated_net = _prompt_channel_network("微信 iLink ", cfg.proxy, net)
+                    if mode is None or updated_net is None:
+                        continue
+                    current["proxy"] = mode
+                    candidate["proxy"] = mode
+                    cfg = ConfigLoader._wechat_from_raw({"adapters": {"wechat": candidate}})
+                    net_cfg = updated_net
+                run_login(cfg, network=net_cfg)
+                current["enabled"] = True
                 logged_in = True
                 print("✅ 微信扫码登录完成并已启用。")
                 return "ready", current, "已扫码登录"
+            except (KeyboardInterrupt, asyncio.CancelledError):
+                print("\nℹ️  已取消微信扫码登录，返回微信菜单。")
             except Exception:
                 print("❌ 微信登录失败；请检查网络或稍后重试，未输出认证详情。")
         elif choice == "2":
@@ -2619,8 +2845,13 @@ def _configure_wechat_guided(existing: Optional[dict] = None) -> Tuple[str, Opti
             editor = FullConfigEditor({"adapters": {"wechat": current}})
             editor._edit_wechat_category()
             current = editor.data["adapters"].get("wechat", current)
+        elif choice == "6":
+            mode, _ = _prompt_channel_network("微信 iLink ", current.get("proxy", "none"), net)
+            if mode is not None:
+                current["proxy"] = mode
+                print(f"✅ 微信代理模式已更新为: {mode}")
         else:
-            print("❌ 请输入 0-5 之间的编号。")
+            print("❌ 请输入 0-6 之间的编号。")
 
 
 # ----------------------------------------------------------------------
@@ -2657,7 +2888,7 @@ class FirstRunWizard:
             },
         }
         existing_muse_proxy = self.existing_data.get("muse", {}).get("proxy") if preserve_muse else None
-        self.muse_proxy: str = existing_muse_proxy if existing_muse_proxy in PROXY_MODES else "worker"
+        self.muse_proxy: str = existing_muse_proxy if existing_muse_proxy in PROXY_MODES else "none"
         self.completed: bool = False
         self._captured_event = asyncio.Event()
 
@@ -2665,34 +2896,58 @@ class FirstRunWizard:
         print("\n" + "=" * 60)
         print("     🚀 Muse IM Bridge 引导配置向导")
         print("=" * 60)
-        print("接下来只需 3 步即可完成基础配置：")
-        print("  1. 在渠道列表中自由选择并配置需要启用的平台（当场测通）")
-        print("  2. 为需要管理员权限的平台发一条消息认领身份（可跳过或手填）")
-        print("  3. 生成干净配置并衔接 Muse 账号登录\n")
+        print("接下来只需 4 步即可完成基础配置：")
+        print("  1. （可选）先配置全局网络与代理（HTTP 代理 / Worker / Muse 代理模式）")
+        print("  2. 在渠道列表中自由选择并配置需要启用的平台（探测前可调整网络并当场测通）")
+        print("  3. 为需要管理员权限的平台发一条消息认领身份（可跳过或手填）")
+        print("  4. 生成干净配置并衔接 Muse 账号登录\n")
 
-        # 1. 自由渠道配置列表（选哪个进哪个，配完回到列表，最后选下一步）
+        # 1. 配置渠道前询问是否先配置网络
+        self._prompt_initial_network()
+
+        # 2. 自由渠道配置列表（选哪个进哪个，配完回到列表，最后选下一步）
         if not self._run_channel_setup_loop():
             print("已取消引导向导，未写入任何修改。")
             return False
 
-        # 2. 逐渠道认领管理员（仅 QQ / OneBot / Telegram 需要，微信不进入监听）
+        # 3. 逐渠道认领管理员（仅 QQ / OneBot / Telegram 需要，微信不进入监听）
         claimable = [ch for ch in self.selected_channels if ch in CLAIMABLE_CHANNELS]
         if claimable:
             print("\n" + "=" * 60)
-            print("步骤 2/3：逐渠道认领管理员身份")
+            print("步骤 3/4：逐渠道认领管理员身份")
             print("=" * 60)
             asyncio.run(self._listen_for_first_message())
             self._handle_unclaimed_and_group_options(claimable)
 
-        # 3. 生成并写入配置文件 + 可读摘要
+        # 4. 生成并写入配置文件 + 可读摘要
         self._generate_and_save_config()
         self.completed = True
 
-        # 4. 无缝衔接 Muse 登录（仅当尚未登录时询问）
+        # 5. 无缝衔接 Muse 登录（仅当尚未登录时询问）
         if offer_muse_login:
             self._offer_muse_login()
 
         return True
+
+    def _prompt_initial_network(self) -> None:
+        print("--- 步骤 1/4：网络与代理预设（可选）---")
+        brief = _format_network_brief(self.network_data)
+        summary = f"Muse={self.muse_proxy}" + (f" | {brief}" if brief else " | 直连（未配置代理/Worker）")
+        print(f"当前网络设置：{summary}")
+        if _prompt_bool("是否先配置全局网络与代理（HTTP 代理 / Cloudflare Worker / Muse 代理模式）", False):
+            self._configure_muse_proxy()
+
+    def _validate_wizard_network(self) -> Optional[str]:
+        try:
+            net_cfg = ConfigLoader._network_from_raw({"network": self.network_data})
+            resolve_route(self.muse_proxy, net_cfg, section="muse")
+            for ch in self.selected_channels:
+                default_mode = "worker" if ch == "telegram" else "none"
+                ch_mode = self.channel_configs.get(ch, {}).get("proxy", default_mode)
+                resolve_route(ch_mode, net_cfg, section=f"adapters.{ch}")
+        except ValueError as exc:
+            return str(exc)
+        return None
 
     def _channel_status_badge(self, ch: str) -> str:
         if ch not in self.selected_channels:
@@ -2703,7 +2958,7 @@ class FirstRunWizard:
     def _run_channel_setup_loop(self) -> bool:
         """交互式渠道配置列表：用户选哪个进哪个，配完返回列表，最后按 n 进入下一步。"""
         while True:
-            print("\n--- 步骤 1/3：渠道配置列表（可多选，配好后输入 n 进入下一步）---")
+            print("\n--- 步骤 2/4：渠道配置列表（可多选，配好后输入 n 进入下一步）---")
             for idx, ch in enumerate(CHANNEL_ORDER, 1):
                 print(_format_channel_row(str(idx), CHANNEL_LABELS[ch], self._channel_status_badge(ch)))
             worker_base = self.network_data.get("worker", {}).get("base") or ""
@@ -2729,6 +2984,12 @@ class FirstRunWizard:
                 if not self.selected_channels:
                     print("⚠️  请至少先配置并启用 1 个聊天渠道。")
                     continue
+                net_err = self._validate_wizard_network()
+                if net_err:
+                    print(f"⚠️  当前网络配置不完整：{net_err}")
+                    if _prompt_bool("是否立即补全全局网络与代理设置", True):
+                        self._configure_muse_proxy()
+                    continue
                 return True
 
             tokens = [t for t in re.split(r"[,，\s]+", raw) if t]
@@ -2745,43 +3006,133 @@ class FirstRunWizard:
                 else:
                     self._configure_single_channel_in_list(target)
 
-    def _configure_muse_proxy(self) -> None:
-        print("\n--- 全局网络与 Muse 代理设置 (network) ---")
-        mode = _prompt_input(
-            "Muse 代理模式 [none/http/worker]",
-            default=self.muse_proxy,
-        ).strip().lower()
-        if mode in PROXY_MODES:
-            self.muse_proxy = mode
-        else:
-            print("❌ 无效模式，保持原值。")
-
+    def _prompt_network_http_proxy(self, *, required_for_muse: bool) -> bool:
         while True:
             raw_proxy = _prompt_str(
-                "全局 HTTP(S) 代理地址 (network.proxy_url，如 http://127.0.0.1:7890，输入 clear 清空)",
+                "全局 HTTP(S) 代理地址 (network.proxy_url，如 http://127.0.0.1:7890，输入 clear 清空，0 返回)",
                 self.network_data.get("proxy_url") or "",
             )
+            if _is_back_input(raw_proxy):
+                return False
             try:
-                self.network_data["proxy_url"] = _validate_proxy_url(raw_proxy) or ""
-                break
+                proxy_url = _validate_proxy_url(raw_proxy) or ""
+                if required_for_muse and not proxy_url:
+                    print("⚠️  Muse 当前为 http 模式，需要填写全局 HTTP(S) 代理地址。")
+                    if _prompt_bool("未填写代理地址，是否将 Muse 代理模式改回 none（直连）", True):
+                        self.muse_proxy = "none"
+                        self.network_data["proxy_url"] = ""
+                        return True
+                    continue
+                self.network_data["proxy_url"] = proxy_url
+                return True
             except ValueError as exc:
                 print(f"❌ {exc}")
 
+    def _prompt_network_worker_base(self, *, required_for_muse: bool) -> bool:
         worker_raw = self.network_data.setdefault("worker", {"base": "", "ws": True, "http": True})
         while True:
             raw_base = _prompt_str(
-                "Cloudflare Worker HTTPS 域名 (network.worker.base，如 https://worker.example.com，输入 clear 清空)",
+                "Cloudflare Worker HTTPS 域名 (network.worker.base，如 https://worker.example.com，输入 clear 清空，0 返回)",
                 worker_raw.get("base") or "",
             )
+            if _is_back_input(raw_base):
+                return False
             if raw_base.strip().lower() in ("clear", "none", "null"):
-                worker_raw["base"] = ""
+                base = ""
+            else:
+                try:
+                    base = validate_worker_base(raw_base)
+                except ValueError as exc:
+                    print(f"❌ {exc}")
+                    continue
+            if required_for_muse and not base:
+                print("⚠️  Muse 当前为 worker 模式，需要填写 Cloudflare Worker HTTPS 域名。")
+                if _prompt_bool("未填写 Worker 域名，是否将 Muse 代理模式改回 none（直连）", True):
+                    self.muse_proxy = "none"
+                    worker_raw["base"] = ""
+                    return True
+                continue
+            worker_raw["base"] = base
+            return True
+
+    def _configure_muse_proxy(self) -> None:
+        print("\n--- 全局网络与 Muse 代理设置 (network) ---")
+        prev_muse_proxy = self.muse_proxy
+        prev_network = copy.deepcopy(self.network_data)
+        while True:
+            raw_mode = _prompt_input(
+                "Muse 代理模式 [1:none / 2:http / 3:worker / 0:返回]",
+                default=self.muse_proxy,
+            )
+            if _is_back_input(raw_mode):
+                print("已返回，未修改网络设置。")
+                return
+            mode = _parse_proxy_mode(raw_mode, default=self.muse_proxy)
+            if mode is not None:
+                self.muse_proxy = mode
                 break
-            try:
-                worker_raw["base"] = validate_worker_base(raw_base)
-                break
-            except ValueError as exc:
-                print(f"❌ {exc}")
-        print(f"✅ 网络设置已更新：Muse={self.muse_proxy}, proxy_url={self.network_data['proxy_url'] or '无'}, worker={worker_raw['base'] or '无'}")
+            print("❌ 代理模式必须是 1(none)、2(http)、3(worker) 或 0(返回)。")
+
+        worker_raw = self.network_data.setdefault("worker", {"base": "", "ws": True, "http": True})
+        has_http = bool(self.network_data.get("proxy_url"))
+        has_worker = bool(worker_raw.get("base"))
+
+        def _abort_changes() -> None:
+            self.muse_proxy = prev_muse_proxy
+            self.network_data = prev_network
+            print("已返回，未修改网络设置。")
+
+        if self.muse_proxy == "http":
+            if not self._prompt_network_http_proxy(required_for_muse=True):
+                _abort_changes()
+                return
+            if has_worker:
+                if not self._prompt_network_worker_base(required_for_muse=False):
+                    _abort_changes()
+                    return
+        elif self.muse_proxy == "worker":
+            if not self._prompt_network_worker_base(required_for_muse=True):
+                _abort_changes()
+                return
+            if has_http:
+                if not self._prompt_network_http_proxy(required_for_muse=False):
+                    _abort_changes()
+                    return
+        else:
+            # Muse 直连：已有配置则允许修改或清空；均未配置时可选为其他渠道预设
+            if has_http:
+                if not self._prompt_network_http_proxy(required_for_muse=False):
+                    _abort_changes()
+                    return
+            if has_worker:
+                if not self._prompt_network_worker_base(required_for_muse=False):
+                    _abort_changes()
+                    return
+            if not has_http and not has_worker:
+                while True:
+                    raw_extra = _prompt_input(
+                        "是否顺便为其他渠道（如 Telegram）预设代理 [1:跳过 / 2:http / 3:worker]",
+                        default="1",
+                    )
+                    if _is_back_input(raw_extra):
+                        extra = "none"
+                        break
+                    extra = _parse_proxy_mode(raw_extra, default="none")
+                    if extra is not None:
+                        break
+                    print("❌ 请输入 1(跳过)、2(http) 或 3(worker)。")
+                if extra == "http":
+                    if not self._prompt_network_http_proxy(required_for_muse=False):
+                        _abort_changes()
+                        return
+                elif extra == "worker":
+                    if not self._prompt_network_worker_base(required_for_muse=False):
+                        _abort_changes()
+                        return
+
+        brief = _format_network_brief(self.network_data)
+        detail = f" | {brief}" if brief else " | 直连"
+        print(f"✅ 网络设置已更新：Muse={self.muse_proxy}{detail}")
 
     def _configure_single_channel_in_list(self, ch: str) -> None:
         # 如果已经配置过，允许用户选择修改或移除
@@ -2816,12 +3167,18 @@ class FirstRunWizard:
         self.channel_notes[ch] = note
 
     def _configure_qq(self) -> None:
-        status, cfg, note = _configure_qq_interactive(self.channel_configs.get("qq"))
+        status, cfg, note = _configure_qq_interactive(
+            self.channel_configs.get("qq"),
+            network_data=self.network_data,
+        )
         if status in ("ready", "unverified") and cfg is not None:
             self._mark_channel_enabled("qq", cfg, note)
 
     def _configure_onebot(self) -> None:
-        status, cfg, note = _configure_onebot_interactive(self.channel_configs.get("onebot"))
+        status, cfg, note = _configure_onebot_interactive(
+            self.channel_configs.get("onebot"),
+            network_data=self.network_data,
+        )
         if status in ("ready", "unverified") and cfg is not None:
             self._mark_channel_enabled("onebot", cfg, note)
 
@@ -2834,7 +3191,10 @@ class FirstRunWizard:
             self._mark_channel_enabled("telegram", cfg, note)
 
     def _configure_wechat(self) -> None:
-        status, cfg, note = _configure_wechat_guided(self.channel_configs.get("wechat"))
+        status, cfg, note = _configure_wechat_guided(
+            self.channel_configs.get("wechat"),
+            network_data=self.network_data,
+        )
         if status in ("ready", "unverified") and cfg is not None:
             self._mark_channel_enabled("wechat", cfg, note)
 
@@ -2992,6 +3352,8 @@ class FirstRunWizard:
                 "user_agent": constants.DEFAULT_USER_AGENT,
                 "credentials_in_place": True,
             }
+            if "proxy" in qq_raw:
+                qq_entry["proxy"] = qq_raw["proxy"]
             if qq_bindings:
                 qq_entry["session_bindings"] = qq_bindings
             config_data["adapters"]["qq"] = qq_entry
@@ -3016,6 +3378,8 @@ class FirstRunWizard:
                 "admin_id": [],
                 "qzone_feed": asdict(QzoneFeedConfig()),
             }
+            if "proxy" in ob_raw:
+                ob_entry["proxy"] = ob_raw["proxy"]
 
             if claim:
                 uid, ctype, tid, _ = claim
@@ -3093,7 +3457,7 @@ class FirstRunWizard:
         print("=" * 60)
         muse = config_data.get("muse", {})
         print(f"  • Muse 主会话 : {muse.get('session_id')}")
-        print(f"  • Muse 代理   : {muse.get('proxy', 'worker')}")
+        print(f"  • Muse 代理   : {muse.get('proxy', 'none')}")
         adapters = config_data.get("adapters", {})
         for ch in self.selected_channels:
             entry = adapters.get(ch, {})
@@ -3115,7 +3479,7 @@ class FirstRunWizard:
         if os.path.exists(cookies_file):
             print(f"\n✅ 已检测到现有 Muse 登录凭据: {cookies_file}")
             return
-        print(f"\n--- 步骤 3/3：登录 Muse 账号 ---")
+        print(f"\n--- 步骤 4/4：登录 Muse 账号 ---")
         if not _prompt_bool(f"未检测到 {cookies_file}，是否现在通过邮箱验证码登录 Muse", True):
             print("ℹ️  已跳过 Muse 登录；稍后可随时在控制台的「账号登录」或执行 python main.py --login 完成。")
             return
@@ -3125,6 +3489,8 @@ class FirstRunWizard:
             net_cfg = ConfigLoader._network_from_raw({"network": self.network_data})
             muse_route = resolve_route(self.muse_proxy, net_cfg, section="muse")
             run_protocol_login(output_path=cookies_file, route=muse_route)
+        except KeyboardInterrupt:
+            print("\nℹ️  已取消 Muse 登录；配置已保存，稍后可在控制台「账号登录」完成。")
         except Exception as exc:
             print(f"❌ Muse 登录失败: {safe_error(exc)}")
             print("ℹ️  配置已保存，稍后可在控制台「账号登录」重试。")
@@ -3247,7 +3613,7 @@ class BridgeConsole:
         muse = self.data.get("muse", {}) if isinstance(self.data.get("muse"), dict) else {}
         cookies_file = muse.get("cookies_file") or "cookies.json"
         cookie_state = "✅ 已登录" if os.path.exists(cookies_file) else "⚠️ 未登录"
-        proxy_state = muse.get("proxy", "worker")
+        proxy_state = muse.get("proxy", "none")
         dirty = " *未保存*" if self._modified else ""
 
         print("\n" + "=" * 68)
@@ -3341,10 +3707,11 @@ class BridgeConsole:
         missing = _missing_required_credentials(ch, entry)
 
         if ch == "wechat":
+            net_data = self.data.setdefault("network", {})
             if missing:
                 print("⚠️  微信尚未检测到本地登录账号。")
                 if _prompt_bool("是否现在进入微信配置 / 扫码登录？（选 N 取消启用）", True):
-                    status, cfg, _ = _configure_wechat_guided(entry)
+                    status, cfg, _ = _configure_wechat_guided(entry, network_data=net_data)
                     if status in ("ready", "unverified") and cfg is not None:
                         adapters["wechat"] = cfg
                         self._ensure_qq_explicit_state()
@@ -3356,7 +3723,7 @@ class BridgeConsole:
                     print("已取消启用微信适配器。")
                 return
             if _prompt_bool("已检测到微信本地登录态，启用前是否需要重新配置或重新扫码", False):
-                status, cfg, _ = _configure_wechat_guided(entry)
+                status, cfg, _ = _configure_wechat_guided(entry, network_data=net_data)
                 if status in ("ready", "unverified") and cfg is not None:
                     adapters["wechat"] = cfg
                     self._ensure_qq_explicit_state()
@@ -3422,11 +3789,14 @@ class BridgeConsole:
                     wx = adapters.setdefault("wechat", {})
                     try:
                         cfg = ConfigLoader._wechat_from_raw({"adapters": {"wechat": wx}})
-                        run_login(cfg)
+                        net_cfg = ConfigLoader._network_from_raw(self.data)
+                        run_login(cfg, network=net_cfg)
                         if not wx.get("enabled"):
                             wx["enabled"] = True
                             self._ensure_qq_explicit_state()
                             self._modified = True
+                    except (KeyboardInterrupt, asyncio.CancelledError):
+                        print("\nℹ️  已取消微信扫码登录，返回微信管理菜单。")
                     except Exception:
                         print("❌ 微信扫码登录失败；未输出认证详情。")
                 elif act == "3":
@@ -3438,7 +3808,8 @@ class BridgeConsole:
                     except Exception:
                         print("❌ 无法读取本地微信状态。")
                 elif act == "4":
-                    status, cfg, _ = _configure_wechat_guided(entry)
+                    net_data = self.data.setdefault("network", {})
+                    status, cfg, _ = _configure_wechat_guided(entry, network_data=net_data)
                     if status in ("ready", "unverified") and cfg is not None:
                         adapters["wechat"] = cfg
                         self._ensure_qq_explicit_state()
@@ -3491,12 +3862,12 @@ class BridgeConsole:
     def _guided_update_channel(self, ch: str) -> None:
         adapters = self.data.setdefault("adapters", {})
         existing = adapters.get(ch, {}) if isinstance(adapters.get(ch), dict) else {}
+        net_data = self.data.setdefault("network", {})
         if ch == "qq":
-            status, cfg, _ = _configure_qq_interactive(existing)
+            status, cfg, _ = _configure_qq_interactive(existing, network_data=net_data)
         elif ch == "onebot":
-            status, cfg, _ = _configure_onebot_interactive(existing)
+            status, cfg, _ = _configure_onebot_interactive(existing, network_data=net_data)
         elif ch == "telegram":
-            net_data = self.data.setdefault("network", {})
             status, cfg, _ = _configure_telegram_interactive(existing, network_data=net_data)
         else:
             return
@@ -3562,12 +3933,16 @@ class BridgeConsole:
         adapters = self.data.get("adapters", {})
         entry = adapters.get(ch, {}) if isinstance(adapters, dict) else {}
         if ch == "qq":
-            ok, msg = _probe_qq(entry.get("app_id", ""), entry.get("app_secret", ""))
+            net_cfg = ConfigLoader._network_from_raw(self.data)
+            ok, msg = _probe_qq(entry.get("app_id", ""), entry.get("app_secret", ""), entry.get("proxy", "none"), net_cfg)
         elif ch == "onebot":
+            net_cfg = ConfigLoader._network_from_raw(self.data)
             ok, msg, _ = _probe_onebot(
                 entry.get("base_url", ""),
                 entry.get("access_token", ""),
                 entry.get("ws_url", ""),
+                entry.get("proxy", "none"),
+                net_cfg,
             )
         elif ch == "telegram":
             net_cfg = ConfigLoader._network_from_raw(self.data)
@@ -3602,11 +3977,13 @@ class BridgeConsole:
 
                 try:
                     net_cfg = ConfigLoader._network_from_raw(self.data)
-                    muse_route = resolve_route(muse.get("proxy", "worker"), net_cfg, section="muse")
+                    muse_route = resolve_route(muse.get("proxy", "none"), net_cfg, section="muse")
                     run_protocol_login(
                         output_path=cookies_file,
                         route=muse_route,
                     )
+                except KeyboardInterrupt:
+                    print("\nℹ️  已取消 Muse 登录，返回账号登录菜单。")
                 except Exception as exc:
                     print(f"❌ Muse 登录失败: {safe_error(exc)}")
             elif act == "2":
@@ -3616,6 +3993,8 @@ class BridgeConsole:
                     cfg = ConfigLoader._wechat_from_raw({"adapters": {"wechat": wx_entry}})
                     net_cfg = ConfigLoader._network_from_raw(self.data)
                     run_login(cfg, network=net_cfg)
+                except (KeyboardInterrupt, asyncio.CancelledError):
+                    print("\nℹ️  已取消微信扫码登录，返回账号登录菜单。")
                 except Exception:
                     print("❌ 微信扫码登录失败；未输出认证详情。")
             elif act == "3":

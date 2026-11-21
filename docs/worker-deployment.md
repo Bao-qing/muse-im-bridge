@@ -141,7 +141,7 @@ curl -i https://your-worker.example.com/https/api.telegram.org/bot0:invalid/getM
 
 配置规则说明：
 - `network.worker.base` 必须是 **HTTPS 443 端口的纯 origin**（例如 `https://your-worker.example.com`），不能包含路径、查询参数、用户名密码或非 443 端口。
-- `muse.proxy` 与 `adapters.telegram.proxy` 默认即为 `"worker"`；国内直连渠道（`qq`、`onebot`、`wechat`）默认 `"none"`。
+- `muse.proxy` 与国内直连渠道（`qq`、`onebot`、`wechat`）默认 `"none"`（直连）；需要经 Worker 转发时将对应 `proxy` 设为 `"worker"`；`adapters.telegram.proxy` 默认即为 `"worker"`。
 - 修改后可先运行本地校验：
   ```bash
   python main.py --check
